@@ -1,4 +1,49 @@
+# ===== 通用 =====
 .DS_Store
 *.log
 .env
+.env.local
+*.swp
+Thumbs.db
 
+# ===== 密钥（禁止提交 API Key）=====
+*.key
+.env*
+secrets.json
+config.secret.*
+
+# ===== Python（desktop / analysis / experiment_engine）=====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+*.spec
+
+# ===== 固件（ESP32 / PlatformIO / Arduino）=====
+.pio/
+.pioenvs/
+.piolibdeps/
+build/
+sdkconfig.old
+*.bin
+*.elf
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.code-workspace
+
+# ===== 实验数据（可选择性提交，默认忽略原始采集）=====
+experiments/**/raw.csv
+experiments/**/processed.csv
+experiments/**/chart.png
+experiments/**/photo.jpg
+
+# ===== PCB / CAD 临时文件 =====
+hardware/**/*.zip
+mechanical/**/*.zip
+*.bck
+*-backups/
