@@ -3,6 +3,7 @@ package com.labcapsule.remote;
 import android.Manifest;
 import android.animation.ValueAnimator;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.app.DownloadManager;
 import android.bluetooth.*;
 import android.bluetooth.le.*;
@@ -39,7 +40,7 @@ import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
 
 public class MainActivity extends Activity {
-    private static final String APP_VERSION = "0.3.0";
+    private static final String APP_VERSION = "0.3.1";
     private static final String REPOSITORY = "81823650800wzy-sketch/LabCapsule";
     private static final int REQUEST_FIRMWARE = 1001, REQUEST_MEDIA = 1002,
             REQUEST_BLE_PERMISSIONS = 1003;
@@ -61,7 +62,8 @@ public class MainActivity extends Activity {
     private SharedPreferences preferences;
     private SecureStore secureStore;
     private FrameLayout content;
-    private TextView globalStatus, mediaInfo, firmwareInfo, updateInfo, aiResult;
+    private TextView globalStatus, mediaInfo, firmwareInfo, updateInfo, aiResult,
+            externalWifiState, externalWifiIp, externalWifiHint;
     private ProgressBar globalProgress;
     private EditText deviceUrlInput, wifiSsid, wifiPassword, mqttUri, mqttUser, mqttPassword,
             mqttTopic, brightnessInput, aiEndpoint, aiModel, aiKey, aiQuestion;
@@ -70,7 +72,12 @@ public class MainActivity extends Activity {
     private ImageView mediaPreview;
     private byte[] selectedFirmware;
     private Bitmap selectedPreview;
+    private Bitmap selectedCropSource;
     private Movie selectedMovie;
+    private RectF selectedCropRect;
+    private String selectedMediaName;
+    private byte[] lastGifComparisonFrame;
+    private String lastStationIp;
     private volatile boolean gifStreaming;
     private String latestApkUrl, latestFirmwareUrl;
     private String currentProtocol;
@@ -182,6 +189,24 @@ public class MainActivity extends Activity {
         connection.addView(row(button("Wi‑Fi 系统设置", false,
                         v -> startActivity(new Intent(Settings.ACTION_WIFI_SETTINGS))),
                 button("读取传感器", false, v -> fetchSensors())));
+        LinearLayout wifiStatus = card(root, null);
+        section(wifiStatus, "外部 Wi‑Fi 状态", "这里直接显示连接结果，不需要查找原始 JSON");
+        externalWifiState = label("● 尚未读取设备状态", 17, MUTED, true);
+        externalWifiIp = label("局域网 IP：尚未获取", 15, INK, false);
+        externalWifiHint = label("先连接恢复热点并点击“检测设备”", 13, MUTED, false);
+        externalWifiState.setPadding(0, 0, 0, dp(5));
+        externalWifiIp.setTextIsSelectable(true);
+        externalWifiHint.setPadding(0, dp(5), 0, dp(7));
+        wifiStatus.addView(externalWifiState);
+        wifiStatus.addView(externalWifiIp);
+        wifiStatus.addView(externalWifiHint);
+        wifiStatus.addView(row(button("刷新 Wi‑Fi 状态", true, v -> fetchStatus()),
+                button("使用此局域网 IP", false, v -> useStationIp())));
+        renderExternalWifi(preferences.getBoolean("sta_configured", false),
+                preferences.getBoolean("sta_connected", false),
+                preferences.getString("sta_ip", "0.0.0.0"),
+                preferences.getString("recovery_ap", "LabCapsule"));
+        mainHandler.postDelayed(this::fetchStatus, 350);
         LinearLayout quick = card(root, null);
         section(quick, "快捷控制", "常用状态一触即达");
         quick.addView(row(button("主页", true, v -> sendAction("home")),
@@ -194,21 +219,22 @@ public class MainActivity extends Activity {
         ScrollView page = page("屏幕与媒体", "静态壁纸、无落盘图片与 GIF 流式播放");
         LinearLayout root = pageRoot(page);
         LinearLayout media = card(root, null);
-        section(media, "媒体工作台", "GIF 保存在手机中，设备只接收当前帧");
+        section(media, "媒体工作台", "先触控裁剪；GIF 在手机端量化、差分和压缩");
         mediaPreview = new ImageView(this);
         mediaPreview.setScaleType(ImageView.ScaleType.CENTER_CROP);
         mediaPreview.setBackground(roundRect(Color.rgb(225, 232, 244), 18, Color.TRANSPARENT));
         media.addView(mediaPreview, new LinearLayout.LayoutParams(-1, dp(230)));
-        mediaInfo = label("选择 JPG、PNG、WebP 或 GIF", 13, MUTED, false);
+        mediaInfo = label("选择媒体后必须确认 3:4 裁剪区域", 13, MUTED, false);
         mediaInfo.setPadding(0, dp(9), 0, dp(4));
         media.addView(mediaInfo);
         transportSpinner = spinner(new String[]{"局域网 / Wi‑Fi", "Bluetooth LE"});
         transportSpinner.setSelection(preferences.getInt("transport", 0));
         media.addView(transportSpinner, matchWrap(dp(4)));
-        media.addView(row(button("选择媒体", false, v -> chooseMedia()),
-                button("显示单帧", true, v -> sendSelectedFrame()),
-                button("保存壁纸", false, v -> saveWallpaper())));
-        media.addView(row(button("播放 GIF", true, v -> startGifStream()),
+        media.addView(row(button("选择并裁剪", true, v -> chooseMedia()),
+                button("重新裁剪", false, v -> reopenCropEditor()),
+                button("显示单帧", false, v -> sendSelectedFrame())));
+        media.addView(row(button("保存壁纸", false, v -> saveWallpaper()),
+                button("播放 GIF", true, v -> startGifStream()),
                 button("停止播放", false, v -> stopGifStream())));
         LinearLayout remote = card(root, null);
         section(remote, "屏幕遥控", "双缓冲切换不会先清黑屏");
@@ -506,8 +532,64 @@ public class MainActivity extends Activity {
 
     private void fetchStatus() {
         status("正在连接设备…", true);
-        http("GET", "/api/status", null, null,
-                result -> status("设备在线\n" + result, true));
+        http("GET", "/api/status", null, null, result -> {
+            try {
+                JSONObject root = new JSONObject(result);
+                JSONObject network = root.getJSONObject("network");
+                renderExternalWifi(network.optBoolean("staConfigured"),
+                        network.optBoolean("staConnected"),
+                        network.optString("staIp", "0.0.0.0"),
+                        network.optString("recoveryAp", "LabCapsule"));
+                status("设备在线 · 网络状态已刷新", true);
+            } catch (Exception error) {
+                status("设备在线，但状态格式无法解析：" + error.getMessage(), false);
+            }
+        });
+    }
+    private void renderExternalWifi(boolean configured, boolean connected, String ip,
+                                    String recoveryAp) {
+        preferences.edit().putBoolean("sta_configured", configured)
+                .putBoolean("sta_connected", connected)
+                .putString("sta_ip", ip == null ? "0.0.0.0" : ip)
+                .putString("recovery_ap", recoveryAp == null ? "LabCapsule" : recoveryAp)
+                .apply();
+        if (connected && ip != null && !ip.isEmpty() && !"0.0.0.0".equals(ip)) {
+            lastStationIp = ip;
+            if (externalWifiState != null) {
+                externalWifiState.setText("● 已连接外部 Wi‑Fi");
+                externalWifiState.setTextColor(GREEN);
+            }
+            if (externalWifiIp != null) externalWifiIp.setText("局域网 IP：http://" + ip);
+            if (externalWifiHint != null) externalWifiHint.setText(
+                    "手机现在可以切回正常联网 Wi‑Fi，再点击“使用此局域网 IP”。");
+        } else if (configured) {
+            lastStationIp = null;
+            if (externalWifiState != null) {
+                externalWifiState.setText("● 已保存配置，正在连接或连接失败");
+                externalWifiState.setTextColor(Color.rgb(213, 132, 24));
+            }
+            if (externalWifiIp != null) externalWifiIp.setText("局域网 IP：尚未获取");
+            if (externalWifiHint != null) externalWifiHint.setText(
+                    "请确认是 2.4 GHz Wi‑Fi、密码正确，并保持连接 " + recoveryAp + " 后重试。");
+        } else {
+            lastStationIp = null;
+            if (externalWifiState != null) {
+                externalWifiState.setText("● 尚未配置外部 Wi‑Fi");
+                externalWifiState.setTextColor(MUTED);
+            }
+            if (externalWifiIp != null) externalWifiIp.setText("局域网 IP：尚未获取");
+            if (externalWifiHint != null) externalWifiHint.setText(
+                    "进入“设置”填写路由器 SSID 与密码，然后返回这里刷新。");
+        }
+    }
+    private void useStationIp() {
+        if (lastStationIp == null || lastStationIp.isEmpty()) {
+            toast("设备还没有获得外部 Wi‑Fi IP"); return;
+        }
+        String url = "http://" + lastStationIp;
+        preferences.edit().putString("device_url", url).apply();
+        if (deviceUrlInput != null) deviceUrlInput.setText(url);
+        status("设备地址已切换为 " + url, true);
     }
     private void fetchSensors() {
         status("正在扫描扩展总线…", true);
@@ -551,17 +633,11 @@ public class MainActivity extends Activity {
                     });
                 } else {
                     Movie movie = Movie.decodeByteArray(bytes, 0, bytes.length);
-                    Bitmap bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+                    Bitmap bitmap = decodeStaticForCrop(bytes);
                     if (movie == null && bitmap == null) throw new Exception("不支持的图片格式");
-                    Bitmap preview = bitmap != null ? cropBitmap(bitmap, 240, 320)
-                            : renderMovieFrame(movie, 0);
-                    runOnUiThread(() -> {
-                        selectedMovie = movie != null && movie.duration() > 0 ? movie : null;
-                        selectedPreview = preview;
-                        if (mediaPreview != null) mediaPreview.setImageBitmap(preview);
-                        if (mediaInfo != null) mediaInfo.setText(name +
-                                (selectedMovie == null ? " · 静态图片" : " · GIF 流式媒体"));
-                    });
+                    Movie animated = movie != null && movie.duration() > 0 ? movie : null;
+                    Bitmap cropSource = animated == null ? bitmap : renderMovieSourceFrame(animated, 0);
+                    runOnUiThread(() -> showCropEditor(cropSource, animated, name));
                 }
             } catch (Exception error) {
                 runOnUiThread(() -> status("文件处理失败：" + error.getMessage(), false));
@@ -576,32 +652,83 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) { }
         return uri.getLastPathSegment() == null ? "file" : uri.getLastPathSegment();
     }
-    private static Bitmap cropBitmap(Bitmap source, int width, int height) {
+    private static Bitmap decodeStaticForCrop(byte[] bytes) {
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.length, bounds);
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        int largest = Math.max(bounds.outWidth, bounds.outHeight);
+        while (largest / options.inSampleSize > 2048) options.inSampleSize *= 2;
+        options.inPreferredConfig = Bitmap.Config.ARGB_8888;
+        return BitmapFactory.decodeByteArray(bytes, 0, bytes.length, options);
+    }
+    private void showCropEditor(Bitmap source, Movie movie, String name) {
+        if (source == null) { status("无法生成裁剪预览", false); return; }
+        stopGifStreamSilently();
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(dp(16), dp(8), dp(16), 0);
+        TextView guide = label("拖动调整位置，双指缩放。白色框就是设备最终显示区域。", 13,
+                MUTED, false);
+        guide.setPadding(0, 0, 0, dp(8));
+        layout.addView(guide);
+        CropImageView editor = new CropImageView(this);
+        editor.setImage(source);
+        layout.addView(editor, new LinearLayout.LayoutParams(-1, dp(430)));
+        AlertDialog cropDialog = new AlertDialog.Builder(this).setTitle("裁剪为 240 × 320")
+                .setView(layout).setNegativeButton("取消", null)
+                .setNeutralButton("复位", null)
+                .setPositiveButton("确认裁剪", (dialog, which) -> {
+                    RectF crop = editor.getSourceCrop();
+                    Bitmap preview = cropBitmap(source, crop, 240, 320);
+                    selectedCropSource = source;
+                    selectedCropRect = new RectF(crop);
+                    selectedMovie = movie;
+                    selectedMediaName = name;
+                    selectedPreview = preview;
+                    lastGifComparisonFrame = null;
+                    if (mediaPreview != null) mediaPreview.setImageBitmap(preview);
+                    if (mediaInfo != null) mediaInfo.setText(name + " · 已裁剪 240×320 · " +
+                            (movie == null ? "静态高质量" : "GIF 智能压缩"));
+                    status("裁剪已确认，现在可以传输", true);
+                }).create();
+        cropDialog.setOnShowListener(dialog -> cropDialog.getButton(AlertDialog.BUTTON_NEUTRAL)
+                .setOnClickListener(v -> editor.resetImage()));
+        cropDialog.show();
+    }
+    private void reopenCropEditor() {
+        if (selectedCropSource == null) { toast("请先选择媒体"); return; }
+        showCropEditor(selectedCropSource, selectedMovie,
+                selectedMediaName == null ? "媒体" : selectedMediaName);
+    }
+    private static Bitmap cropBitmap(Bitmap source, RectF crop, int width, int height) {
         Bitmap result = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
         Canvas canvas = new Canvas(result);
-        float scale = Math.max((float) width / source.getWidth(),
-                (float) height / source.getHeight());
-        Matrix matrix = new Matrix();
-        matrix.setScale(scale, scale);
-        matrix.postTranslate((width - source.getWidth() * scale) * .5f,
-                (height - source.getHeight() * scale) * .5f);
-        canvas.drawBitmap(source, matrix,
+        Rect sourceRect = new Rect(Math.max(0, (int) Math.floor(crop.left)),
+                Math.max(0, (int) Math.floor(crop.top)),
+                Math.min(source.getWidth(), (int) Math.ceil(crop.right)),
+                Math.min(source.getHeight(), (int) Math.ceil(crop.bottom)));
+        canvas.drawBitmap(source, sourceRect, new RectF(0, 0, width, height),
                 new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG));
         return result;
     }
-    private static Bitmap renderMovieFrame(Movie movie, int timeMs) {
-        Bitmap result = Bitmap.createBitmap(240, 320, Bitmap.Config.ARGB_8888);
+    private static Bitmap renderMovieSourceFrame(Movie movie, int timeMs) {
+        Bitmap result = Bitmap.createBitmap(Math.max(1, movie.width()),
+                Math.max(1, movie.height()), Bitmap.Config.ARGB_8888);
         Canvas canvas = new Canvas(result);
         canvas.drawColor(Color.BLACK);
         movie.setTime(timeMs);
-        float scale = Math.max(240f / movie.width(), 320f / movie.height());
-        canvas.save();
-        canvas.translate((240 - movie.width() * scale) / 2f,
-                (320 - movie.height() * scale) / 2f);
-        canvas.scale(scale, scale);
         movie.draw(canvas, 0, 0, new Paint(Paint.ANTI_ALIAS_FLAG |
                 Paint.FILTER_BITMAP_FLAG));
-        canvas.restore();
+        return result;
+    }
+    private Bitmap renderCroppedMovieFrame(Movie movie, int timeMs) {
+        Bitmap source = renderMovieSourceFrame(movie, timeMs);
+        RectF crop = selectedCropRect == null
+                ? new RectF(0, 0, source.getWidth(), source.getHeight())
+                : new RectF(selectedCropRect);
+        Bitmap result = cropBitmap(source, crop, 240, 320);
+        source.recycle();
         return result;
     }
     private static byte[] bitmapToRgb565(Bitmap bitmap) {
@@ -618,18 +745,154 @@ public class MainActivity extends Activity {
         return output;
     }
 
+    private static byte[] bitmapToRgb332(Bitmap bitmap) {
+        int[] pixels = new int[240 * 320];
+        bitmap.getPixels(pixels, 0, 240, 0, 0, 240, 320);
+        byte[] output = new byte[pixels.length];
+        for (int i = 0; i < pixels.length; ++i) {
+            int pixel = pixels[i];
+            output[i] = (byte) ((Color.red(pixel) & 0xE0) |
+                    ((Color.green(pixel) & 0xE0) >> 3) | (Color.blue(pixel) >> 6));
+        }
+        return output;
+    }
+
+    private static final class MediaPacket {
+        byte[] data;
+        byte[] comparisonFrame;
+        String encoding;
+        int x, y, width, height;
+        boolean unchanged;
+        String description() {
+            if (unchanged) return "画面未变化，跳过传输";
+            int saved = 100 - data.length * 100 / (240 * 320 * 2);
+            return String.format(Locale.US, "%s · %dx%d · %,d B · 比整帧减少 %d%%",
+                    encoding.toUpperCase(Locale.ROOT), width, height, data.length, saved);
+        }
+        String httpPath(int duration) {
+            return String.format(Locale.US,
+                    "/api/media/frame?duration=%d&enc=%s&x=%d&y=%d&w=%d&h=%d",
+                    duration, encoding, x, y, width, height);
+        }
+    }
+
+    private static MediaPacket encodeMediaPacket(Bitmap bitmap, byte[] previous,
+                                                 boolean gifOptimized) {
+        int bytesPerPixel = gifOptimized ? 1 : 2;
+        byte[] full = gifOptimized ? bitmapToRgb332(bitmap) : bitmapToRgb565(bitmap);
+        MediaPacket packet = new MediaPacket();
+        packet.comparisonFrame = full;
+        int minX = 240, minY = 320, maxX = -1, maxY = -1;
+        if (previous == null || previous.length != full.length) {
+            minX = 0; minY = 0; maxX = 239; maxY = 319;
+        } else {
+            for (int pixel = 0; pixel < 240 * 320; ++pixel) {
+                int offset = pixel * bytesPerPixel;
+                boolean changed = false;
+                for (int byteIndex = 0; byteIndex < bytesPerPixel; ++byteIndex) {
+                    if (full[offset + byteIndex] != previous[offset + byteIndex]) {
+                        changed = true; break;
+                    }
+                }
+                if (changed) {
+                    int x = pixel % 240, y = pixel / 240;
+                    if (x < minX) minX = x;
+                    if (x > maxX) maxX = x;
+                    if (y < minY) minY = y;
+                    if (y > maxY) maxY = y;
+                }
+            }
+        }
+        if (maxX < minX || maxY < minY) {
+            packet.unchanged = true;
+            packet.data = new byte[0];
+            return packet;
+        }
+        packet.x = minX;
+        packet.y = minY;
+        packet.width = maxX - minX + 1;
+        packet.height = maxY - minY + 1;
+        byte[] raw = new byte[packet.width * packet.height * bytesPerPixel];
+        int destination = 0;
+        for (int y = minY; y <= maxY; ++y) {
+            int source = (y * 240 + minX) * bytesPerPixel;
+            int count = packet.width * bytesPerPixel;
+            System.arraycopy(full, source, raw, destination, count);
+            destination += count;
+        }
+        ByteArrayOutputStream encoded = new ByteArrayOutputStream(raw.length);
+        int pixels = packet.width * packet.height;
+        int pixel = 0;
+        while (pixel < pixels) {
+            int run = 1;
+            int offset = pixel * bytesPerPixel;
+            while (pixel + run < pixels && run < 255) {
+                int candidate = (pixel + run) * bytesPerPixel;
+                boolean same = true;
+                for (int byteIndex = 0; byteIndex < bytesPerPixel; ++byteIndex) {
+                    if (raw[offset + byteIndex] != raw[candidate + byteIndex]) {
+                        same = false; break;
+                    }
+                }
+                if (!same) break;
+                ++run;
+            }
+            encoded.write(run);
+            encoded.write(raw, offset, bytesPerPixel);
+            pixel += run;
+        }
+        byte[] rle = encoded.toByteArray();
+        if (rle.length < raw.length) {
+            packet.data = rle;
+            packet.encoding = gifOptimized ? "rle332" : "rle565";
+        } else {
+            packet.data = raw;
+            packet.encoding = gifOptimized ? "rgb332" : "raw565";
+        }
+        return packet;
+    }
+
     private void sendSelectedFrame() {
         if (selectedPreview == null) { toast("请先选择媒体"); return; }
-        byte[] frame = bitmapToRgb565(selectedPreview);
-        if (selectedTransport() == 1) startBleFile("FRAME", frame, 100, null);
-        else uploadBytes("/api/media/frame?duration=100", frame,
-                "图片已显示，未写入设备 Flash");
+        int transport = selectedTransport();
+        Bitmap frame = selectedPreview;
+        String endpoint = baseUrl();
+        status("正在手机端压缩图片…", true);
+        worker.execute(() -> {
+            MediaPacket packet = encodeMediaPacket(frame, null, false);
+            if (transport == 1) runOnUiThread(() -> startBleMedia(packet, 100, null));
+            else {
+                try {
+                    String response = httpBlocking("POST", endpoint + packet.httpPath(100),
+                            packet.data, "application/octet-stream", 30000);
+                    runOnUiThread(() -> status("图片已显示，未写 Flash\n" +
+                            packet.description() + "\n" + response, true));
+                } catch (Exception error) {
+                    runOnUiThread(() -> status("图片上传失败：" + error.getMessage(), false));
+                }
+            }
+        });
     }
     private void saveWallpaper() {
         if (selectedPreview == null) { toast("请先选择媒体"); return; }
-        byte[] frame = bitmapToRgb565(selectedPreview);
-        if (selectedTransport() == 1) startBleFile("WALLPAPER", frame, 0, null);
-        else uploadBytes("/api/wallpaper", frame, "壁纸已保存");
+        int transport = selectedTransport();
+        Bitmap frame = selectedPreview;
+        String endpoint = baseUrl();
+        status("正在手机端生成高质量壁纸…", true);
+        worker.execute(() -> {
+            byte[] data = bitmapToRgb565(frame);
+            if (transport == 1) runOnUiThread(() ->
+                    startBleFile("WALLPAPER", data, 0, null));
+            else {
+                try {
+                    String response = httpBlocking("POST", endpoint + "/api/wallpaper",
+                            data, "application/octet-stream", 45000);
+                    runOnUiThread(() -> status("壁纸已保存\n" + response, true));
+                } catch (Exception error) {
+                    runOnUiThread(() -> status("壁纸上传失败：" + error.getMessage(), false));
+                }
+            }
+        });
     }
     private void uploadBytes(String path, byte[] data, String message) {
         showProgress(0);
@@ -645,13 +908,16 @@ public class MainActivity extends Activity {
         });
     }
     private void startGifStream() {
-        if (selectedMovie == null) { toast("请选择 GIF 图片"); return; }
+        if (selectedMovie == null || selectedCropRect == null) {
+            toast("请选择 GIF 并先确认裁剪"); return;
+        }
         if (gifStreaming) return;
         gifStreaming = true;
-        status("GIF 流式播放中；原文件只保存在手机", true);
+        lastGifComparisonFrame = null;
+        status("GIF 智能流式播放：手机裁剪 + RGB332 + 差分 + RLE", true);
         if (selectedTransport() == 1) streamNextGifFrameBle(0);
         else {
-            String endpoint = baseUrl() + "/api/media/frame?duration=100";
+            String endpoint = baseUrl();
             worker.execute(() -> streamGifWifi(selectedMovie, endpoint));
         }
     }
@@ -659,28 +925,57 @@ public class MainActivity extends Activity {
         int duration = Math.max(1000, movie.duration());
         long started = System.currentTimeMillis();
         while (gifStreaming) {
+            long frameStarted = System.currentTimeMillis();
             int time = (int) ((System.currentTimeMillis() - started) % duration);
-            Bitmap frame = renderMovieFrame(movie, time);
+            Bitmap frame = renderCroppedMovieFrame(movie, time);
+            MediaPacket packet = encodeMediaPacket(frame, lastGifComparisonFrame, true);
+            lastGifComparisonFrame = packet.comparisonFrame;
             try {
-                httpBlocking("POST", endpoint,
-                        bitmapToRgb565(frame), "application/octet-stream", 20000);
-                runOnUiThread(() -> { if (mediaPreview != null) mediaPreview.setImageBitmap(frame); });
+                if (!packet.unchanged) httpBlocking("POST", endpoint + packet.httpPath(125),
+                        packet.data, "application/octet-stream", 20000);
+                runOnUiThread(() -> {
+                    if (mediaPreview != null) mediaPreview.setImageBitmap(frame);
+                    if (mediaInfo != null) mediaInfo.setText("GIF Wi‑Fi · " + packet.description());
+                });
             } catch (Exception error) {
                 gifStreaming = false;
                 runOnUiThread(() -> status("GIF 流中断：" + error.getMessage(), false));
             }
+            long remaining = 125 - (System.currentTimeMillis() - frameStarted);
+            if (remaining > 0) try { Thread.sleep(remaining); }
+            catch (InterruptedException ignored) { Thread.currentThread().interrupt(); break; }
         }
     }
     private void streamNextGifFrameBle(int time) {
         if (!gifStreaming || selectedMovie == null) return;
         int duration = Math.max(1000, selectedMovie.duration());
-        int nextTime = (time + 120) % duration;
-        Bitmap frame = renderMovieFrame(selectedMovie, time);
-        if (mediaPreview != null) mediaPreview.setImageBitmap(frame);
-        startBleFile("FRAME", bitmapToRgb565(frame), 120,
-                () -> mainHandler.postDelayed(() -> streamNextGifFrameBle(nextTime), 20));
+        int nextTime = (time + 350) % duration;
+        worker.execute(() -> {
+            Bitmap frame = renderCroppedMovieFrame(selectedMovie, time);
+            MediaPacket packet = encodeMediaPacket(frame, lastGifComparisonFrame, true);
+            lastGifComparisonFrame = packet.comparisonFrame;
+            runOnUiThread(() -> {
+                if (!gifStreaming) return;
+                if (mediaPreview != null) mediaPreview.setImageBitmap(frame);
+                if (mediaInfo != null) mediaInfo.setText("GIF BLE · " + packet.description());
+                if (packet.unchanged) {
+                    mainHandler.postDelayed(() -> streamNextGifFrameBle(nextTime), 80);
+                } else {
+                    startBleMedia(packet, 350,
+                            () -> mainHandler.postDelayed(
+                                    () -> streamNextGifFrameBle(nextTime), 40));
+                }
+            });
+        });
     }
-    private void stopGifStream() { gifStreaming = false; status("GIF 播放已停止", true); }
+    private void stopGifStreamSilently() {
+        gifStreaming = false;
+        lastGifComparisonFrame = null;
+    }
+    private void stopGifStream() {
+        stopGifStreamSilently();
+        status("GIF 播放已停止", true);
+    }
     private void startFirmwareUpdate() {
         if (selectedFirmware == null) { toast("请先选择固件"); return; }
         if (selectedTransport() == 1) startBleOta();
@@ -712,7 +1007,12 @@ public class MainActivity extends Activity {
                     .put("locale", "zh-CN");
             http("POST", "/api/network", config.toString().getBytes(StandardCharsets.UTF_8),
                     "application/json",
-                    result -> status("网络设置已保存，设备正在接入外部 Wi‑Fi。\n" + result, true));
+                    result -> {
+                        status("网络设置已保存，正在等待设备获得局域网 IP…", true);
+                        mainHandler.postDelayed(this::fetchStatus, 1800);
+                        mainHandler.postDelayed(this::fetchStatus, 4200);
+                        mainHandler.postDelayed(this::fetchStatus, 8000);
+                    });
         } catch (Exception error) { status("配置失败：" + error.getMessage(), false); }
     }
     private void saveAiSettings() {
@@ -1025,6 +1325,14 @@ public class MainActivity extends Activity {
     }
     private void startBleFile(String kind, byte[] data, int duration,
                               Runnable completion) {
+        startBleFile(kind, data, duration, "raw565", 0, 0, 240, 320, completion);
+    }
+    private void startBleMedia(MediaPacket packet, int duration, Runnable completion) {
+        startBleFile("FRAME", packet.data, duration, packet.encoding, packet.x, packet.y,
+                packet.width, packet.height, completion);
+    }
+    private void startBleFile(String kind, byte[] data, int duration, String encoding,
+                              int x, int y, int width, int height, Runnable completion) {
         if (!bleReady || !"idle".equals(bleTransferPhase)) {
             status("请先连接 BLE，或等待当前传输结束", false); return;
         }
@@ -1036,8 +1344,9 @@ public class MainActivity extends Activity {
         bleTransferCompletion = completion;
         bleTransferPhase = "file_begin";
         showProgress(0);
-        String begin = String.format(Locale.US, "BEGIN:%s:%d:%d:%08X", kind,
-                data.length, duration, crc.getValue());
+        String begin = String.format(Locale.US,
+                "BEGIN:%s:%d:%d:%08X:%s:%d:%d:%d:%d", kind, data.length,
+                duration, crc.getValue(), encoding, x, y, width, height);
         if (!writeCharacteristic(fileControlCharacteristic,
                 begin.getBytes(StandardCharsets.UTF_8))) {
             bleTransferPhase = "idle";
@@ -1120,6 +1429,129 @@ public class MainActivity extends Activity {
             bluetoothGatt.close();
         }
         super.onDestroy();
+    }
+
+    private static final class CropImageView extends View {
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG |
+                Paint.FILTER_BITMAP_FLAG);
+        private final RectF cropWindow = new RectF();
+        private Bitmap image;
+        private float scale = 1f, minimumScale = 1f, offsetX, offsetY;
+        private float lastX, lastY, pinchDistance;
+        private boolean pinching;
+
+        CropImageView(Context context) {
+            super(context);
+            setBackgroundColor(Color.rgb(18, 22, 31));
+        }
+        void setImage(Bitmap value) {
+            image = value;
+            if (getWidth() > 0) resetImage();
+        }
+        @Override protected void onSizeChanged(int width, int height, int oldWidth,
+                                               int oldHeight) {
+            float cropWidth = Math.min(width, height * .75f);
+            float cropHeight = cropWidth * 4f / 3f;
+            if (cropHeight > height) {
+                cropHeight = height;
+                cropWidth = cropHeight * .75f;
+            }
+            cropWindow.set((width - cropWidth) / 2f, (height - cropHeight) / 2f,
+                    (width + cropWidth) / 2f, (height + cropHeight) / 2f);
+            resetImage();
+        }
+        void resetImage() {
+            if (image == null || cropWindow.width() <= 0) return;
+            minimumScale = Math.max(cropWindow.width() / image.getWidth(),
+                    cropWindow.height() / image.getHeight());
+            scale = minimumScale;
+            offsetX = cropWindow.centerX() - image.getWidth() * scale / 2f;
+            offsetY = cropWindow.centerY() - image.getHeight() * scale / 2f;
+            clamp();
+            invalidate();
+        }
+        RectF getSourceCrop() {
+            if (image == null) return new RectF();
+            return new RectF(
+                    Math.max(0, (cropWindow.left - offsetX) / scale),
+                    Math.max(0, (cropWindow.top - offsetY) / scale),
+                    Math.min(image.getWidth(), (cropWindow.right - offsetX) / scale),
+                    Math.min(image.getHeight(), (cropWindow.bottom - offsetY) / scale));
+        }
+        private void clamp() {
+            if (image == null) return;
+            float width = image.getWidth() * scale;
+            float height = image.getHeight() * scale;
+            offsetX = Math.min(cropWindow.left,
+                    Math.max(cropWindow.right - width, offsetX));
+            offsetY = Math.min(cropWindow.top,
+                    Math.max(cropWindow.bottom - height, offsetY));
+        }
+        @Override protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            if (image == null) return;
+            canvas.save();
+            canvas.clipRect(cropWindow);
+            Matrix matrix = new Matrix();
+            matrix.setScale(scale, scale);
+            matrix.postTranslate(offsetX, offsetY);
+            canvas.drawBitmap(image, matrix, paint);
+            canvas.restore();
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(4f);
+            paint.setColor(Color.WHITE);
+            canvas.drawRoundRect(cropWindow, 14f, 14f, paint);
+            paint.setStyle(Paint.Style.FILL);
+        }
+        private static float distance(MotionEvent event) {
+            if (event.getPointerCount() < 2) return 0;
+            float dx = event.getX(0) - event.getX(1);
+            float dy = event.getY(0) - event.getY(1);
+            return (float) Math.sqrt(dx * dx + dy * dy);
+        }
+        @Override public boolean onTouchEvent(MotionEvent event) {
+            if (image == null) return true;
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    lastX = event.getX(); lastY = event.getY(); pinching = false; break;
+                case MotionEvent.ACTION_POINTER_DOWN:
+                    pinchDistance = distance(event); pinching = true; break;
+                case MotionEvent.ACTION_MOVE:
+                    if (event.getPointerCount() >= 2) {
+                        float nextDistance = distance(event);
+                        if (pinchDistance > 0 && nextDistance > 0) {
+                            float focusX = (event.getX(0) + event.getX(1)) / 2f;
+                            float focusY = (event.getY(0) + event.getY(1)) / 2f;
+                            float sourceX = (focusX - offsetX) / scale;
+                            float sourceY = (focusY - offsetY) / scale;
+                            float nextScale = Math.max(minimumScale,
+                                    Math.min(minimumScale * 5f,
+                                            scale * nextDistance / pinchDistance));
+                            offsetX = focusX - sourceX * nextScale;
+                            offsetY = focusY - sourceY * nextScale;
+                            scale = nextScale;
+                            pinchDistance = nextDistance;
+                        }
+                    } else if (!pinching) {
+                        offsetX += event.getX() - lastX;
+                        offsetY += event.getY() - lastY;
+                        lastX = event.getX(); lastY = event.getY();
+                    }
+                    clamp(); invalidate(); break;
+                case MotionEvent.ACTION_POINTER_UP:
+                    pinching = false;
+                    if (event.getPointerCount() > 1) {
+                        int remaining = event.getActionIndex() == 0 ? 1 : 0;
+                        lastX = event.getX(remaining); lastY = event.getY(remaining);
+                    }
+                    break;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    pinching = false; break;
+                default: break;
+            }
+            return true;
+        }
     }
 
     private final class SecureStore {

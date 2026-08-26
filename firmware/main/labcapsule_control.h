@@ -5,7 +5,14 @@
 
 #include "esp_err.h"
 
-#define LABCAPSULE_VERSION "0.3.0-alpha"
+#define LABCAPSULE_VERSION "0.3.1-alpha"
+
+typedef enum {
+    LABCAPSULE_MEDIA_RAW565 = 0,
+    LABCAPSULE_MEDIA_RLE565,
+    LABCAPSULE_MEDIA_RGB332,
+    LABCAPSULE_MEDIA_RLE332,
+} labcapsule_media_encoding_t;
 
 /** Apply an APK/BLE/HTTP screen action such as HOME, TEST, UP or BL_ON. */
 esp_err_t labcapsule_remote_action(const char *action, char *response, size_t response_size);
@@ -18,6 +25,9 @@ void labcapsule_show_wallpaper(void);
 
 /** Receive one transient RGB565 frame. GIF animation is decoded by the controller. */
 esp_err_t labcapsule_media_frame_begin(size_t payload_size);
+esp_err_t labcapsule_media_region_begin(size_t payload_size, uint16_t x, uint16_t y,
+                                        uint16_t width, uint16_t height,
+                                        labcapsule_media_encoding_t encoding);
 esp_err_t labcapsule_media_frame_write(const uint8_t *data, size_t length);
 esp_err_t labcapsule_media_frame_finish(uint32_t duration_ms);
 void labcapsule_media_frame_abort(void);

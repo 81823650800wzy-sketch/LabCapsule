@@ -47,8 +47,8 @@ $ResourceFiles = @(Get-ChildItem -LiteralPath $CompiledResources.FullName -Filte
     --manifest (Join-Path $ProjectRoot 'AndroidManifest.xml') `
     --min-sdk-version 26 `
     --target-sdk-version 35 `
-    --version-code 3 `
-    --version-name '0.3.0' `
+    --version-code 4 `
+    --version-name '0.3.1' `
     $ResourceFiles
 if ($LASTEXITCODE -ne 0) { throw 'aapt2 link failed' }
 
@@ -95,7 +95,7 @@ if (-not (Test-Path -LiteralPath $KeyStore)) {
     if ($LASTEXITCODE -ne 0) { throw 'keytool failed' }
 }
 
-$OutputApk = Join-Path $DistRoot 'LabCapsule-0.3.0.apk'
+$OutputApk = Join-Path $DistRoot 'LabCapsule-0.3.1.apk'
 & (Join-Path $BuildTools 'apksigner.bat') sign `
     --ks $KeyStore `
     --ks-pass 'pass:labcapsule' `

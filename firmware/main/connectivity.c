@@ -40,7 +40,7 @@
 #define WIFI_AP_PASSWORD "labcapsule"
 #define HTTP_BUFFER_SIZE 4096U
 #define BLE_VALUE_MAX 512U
-#define MEDIA_CONTROL_MAX 96U
+#define MEDIA_CONTROL_MAX 128U
 
 static const char *TAG = "Connectivity";
 static char s_device_name[24] = "LabCapsule";
@@ -123,13 +123,19 @@ static void file_transfer_abort(void)
 }
 
 static esp_err_t file_transfer_begin(file_transfer_kind_t kind, size_t size,
-                                     uint32_t duration_ms, uint32_t crc)
+                                     uint32_t duration_ms, uint32_t crc,
+                                     labcapsule_media_encoding_t encoding,
+                                     uint16_t x, uint16_t y, uint16_t width,
+                                     uint16_t height)
 {
-    if (s_file_kind != FILE_TRANSFER_NONE || size != WALLPAPER_PAYLOAD_BYTES) {
+    if (s_file_kind != FILE_TRANSFER_NONE || size == 0 ||
+        size > WALLPAPER_PAYLOAD_BYTES ||
+        (kind == FILE_TRANSFER_WALLPAPER && size != WALLPAPER_PAYLOAD_BYTES)) {
         return ESP_ERR_INVALID_STATE;
     }
     esp_err_t result = kind == FILE_TRANSFER_FRAME
-        ? labcapsule_media_frame_begin(size) : wallpaper_upload_begin(size);
+        ? labcapsule_media_region_begin(size, x, y, width, height, encoding)
+        : wallpaper_upload_begin(size);
     if (result != ESP_OK) return result;
     s_file_kind = kind;
     s_file_expected = size;
@@ -422,17 +428,33 @@ static esp_err_t sensors_handler(httpd_req_t *request)
 
 static esp_err_t media_frame_handler(httpd_req_t *request)
 {
-    if ((size_t)request->content_len != WALLPAPER_PAYLOAD_BYTES ||
-        labcapsule_media_frame_begin(request->content_len) != ESP_OK) {
-        return http_json(request, "409 Conflict",
-                         "{\"ok\":false,\"error\":\"frame must be 240x320 RGB565\"}");
-    }
     uint32_t duration = 100;
-    char query[96];
+    unsigned x = 0;
+    unsigned y = 0;
+    unsigned width = 240;
+    unsigned height = 320;
+    labcapsule_media_encoding_t encoding = LABCAPSULE_MEDIA_RAW565;
+    char query[192];
     char value[24];
-    if (httpd_req_get_url_query_str(request, query, sizeof(query)) == ESP_OK &&
-        query_value(query, "duration", value, sizeof(value))) {
-        duration = (uint32_t)strtoul(value, NULL, 10);
+    if (httpd_req_get_url_query_str(request, query, sizeof(query)) == ESP_OK) {
+        if (query_value(query, "duration", value, sizeof(value)))
+            duration = (uint32_t)strtoul(value, NULL, 10);
+        if (query_value(query, "x", value, sizeof(value))) x = strtoul(value, NULL, 10);
+        if (query_value(query, "y", value, sizeof(value))) y = strtoul(value, NULL, 10);
+        if (query_value(query, "w", value, sizeof(value))) width = strtoul(value, NULL, 10);
+        if (query_value(query, "h", value, sizeof(value))) height = strtoul(value, NULL, 10);
+        if (query_value(query, "enc", value, sizeof(value))) {
+            if (strcmp(value, "rle565") == 0) encoding = LABCAPSULE_MEDIA_RLE565;
+            else if (strcmp(value, "rgb332") == 0) encoding = LABCAPSULE_MEDIA_RGB332;
+            else if (strcmp(value, "rle332") == 0) encoding = LABCAPSULE_MEDIA_RLE332;
+        }
+    }
+    if (request->content_len <= 0 || request->content_len > WALLPAPER_PAYLOAD_BYTES ||
+        x > UINT16_MAX || y > UINT16_MAX || width > UINT16_MAX || height > UINT16_MAX ||
+        labcapsule_media_region_begin(request->content_len, x, y, width, height,
+                                      encoding) != ESP_OK) {
+        return http_json(request, "409 Conflict",
+                         "{\"ok\":false,\"error\":\"invalid media region\"}");
     }
     uint8_t *buffer = malloc(HTTP_BUFFER_SIZE);
     if (!buffer) {
@@ -457,8 +479,12 @@ static esp_err_t media_frame_handler(httpd_req_t *request)
         return http_json(request, "500 Internal Server Error",
                          "{\"ok\":false,\"error\":\"frame rejected\"}");
     }
-    return http_json(request, NULL,
-                     "{\"ok\":true,\"message\":\"frame displayed without flash write\"}");
+    char response[192];
+    snprintf(response, sizeof(response),
+             "{\"ok\":true,\"bytes\":%d,\"region\":\"%ux%u@%u,%u\",\"encoding\":%u}",
+             request->content_len, width, height, x, y,
+             (unsigned)encoding);
+    return http_json(request, NULL, response);
 }
 
 static esp_err_t control_handler(httpd_req_t *request)
@@ -880,14 +906,28 @@ static int ble_access(uint16_t connection_handle, uint16_t attribute_handle,
         esp_err_t result = ESP_ERR_NOT_SUPPORTED;
         if (strncmp(command, "BEGIN:", 6) == 0) {
             char kind[16] = {0};
+            char encoding_name[16] = "raw565";
             unsigned size = 0;
             unsigned duration = 100;
             unsigned crc = 0;
-            if (sscanf(command + 6, "%15[^:]:%u:%u:%x", kind, &size, &duration, &crc) >= 2) {
+            unsigned x = 0, y = 0, width = 240, height = 320;
+            int fields = sscanf(command + 6,
+                                "%15[^:]:%u:%u:%x:%15[^:]:%u:%u:%u:%u",
+                                kind, &size, &duration, &crc, encoding_name,
+                                &x, &y, &width, &height);
+            labcapsule_media_encoding_t encoding = LABCAPSULE_MEDIA_RAW565;
+            if (strcmp(encoding_name, "rle565") == 0) encoding = LABCAPSULE_MEDIA_RLE565;
+            else if (strcmp(encoding_name, "rgb332") == 0) encoding = LABCAPSULE_MEDIA_RGB332;
+            else if (strcmp(encoding_name, "rle332") == 0) encoding = LABCAPSULE_MEDIA_RLE332;
+            if (fields >= 2 && x <= UINT16_MAX && y <= UINT16_MAX &&
+                width <= UINT16_MAX && height <= UINT16_MAX) {
                 if (strcmp(kind, "FRAME") == 0) {
-                    result = file_transfer_begin(FILE_TRANSFER_FRAME, size, duration, crc);
+                    result = file_transfer_begin(FILE_TRANSFER_FRAME, size, duration, crc,
+                                                 encoding, x, y, width, height);
                 } else if (strcmp(kind, "WALLPAPER") == 0) {
-                    result = file_transfer_begin(FILE_TRANSFER_WALLPAPER, size, 0, crc);
+                    result = file_transfer_begin(FILE_TRANSFER_WALLPAPER, size, 0, crc,
+                                                 LABCAPSULE_MEDIA_RAW565,
+                                                 0, 0, 240, 320);
                 }
             }
         } else if (strcmp(command, "END") == 0) {

@@ -144,6 +144,11 @@ static uint8_t *s_media_receive_buffer;
 static size_t s_media_received;
 static bool s_media_receive_active;
 static uint32_t s_media_frame_duration_ms;
+static uint16_t s_media_x;
+static uint16_t s_media_y;
+static uint16_t s_media_width;
+static uint16_t s_media_height;
+static labcapsule_media_encoding_t s_media_encoding;
 
 static const uint8_t FONT_ALPHA[26][5] = {
     {0x7e,0x11,0x11,0x11,0x7e}, {0x7f,0x49,0x49,0x49,0x36},
@@ -1212,9 +1217,35 @@ void labcapsule_show_wallpaper(void)
 
 esp_err_t labcapsule_media_frame_begin(size_t payload_size)
 {
-    if (!s_media_receive_buffer || payload_size != WALLPAPER_PAYLOAD_BYTES ||
-        s_media_receive_active) return ESP_ERR_INVALID_STATE;
+    return labcapsule_media_region_begin(payload_size, 0, 0, TFT_WIDTH, TFT_HEIGHT,
+                                         LABCAPSULE_MEDIA_RAW565);
+}
+
+esp_err_t labcapsule_media_region_begin(size_t payload_size, uint16_t x, uint16_t y,
+                                        uint16_t width, uint16_t height,
+                                        labcapsule_media_encoding_t encoding)
+{
+    if (!s_media_receive_buffer || s_media_receive_active || payload_size == 0 ||
+        payload_size > WALLPAPER_PAYLOAD_BYTES || width == 0 || height == 0 ||
+        x + width > TFT_WIDTH || y + height > TFT_HEIGHT ||
+        encoding > LABCAPSULE_MEDIA_RLE332) return ESP_ERR_INVALID_ARG;
+    size_t pixels = (size_t)width * height;
+    if ((encoding == LABCAPSULE_MEDIA_RAW565 && payload_size != pixels * 2U) ||
+        (encoding == LABCAPSULE_MEDIA_RGB332 && payload_size != pixels) ||
+        ((encoding == LABCAPSULE_MEDIA_RLE565 ||
+          encoding == LABCAPSULE_MEDIA_RLE332) && payload_size < 2U)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (s_display_view != DISPLAY_VIEW_MEDIA &&
+        (x != 0 || y != 0 || width != TFT_WIDTH || height != TFT_HEIGHT)) {
+        return ESP_ERR_INVALID_STATE;
+    }
     s_media_received = 0;
+    s_media_x = x;
+    s_media_y = y;
+    s_media_width = width;
+    s_media_height = height;
+    s_media_encoding = encoding;
     s_media_receive_active = true;
     return ESP_OK;
 }
@@ -1230,20 +1261,72 @@ esp_err_t labcapsule_media_frame_write(const uint8_t *data, size_t length)
 
 esp_err_t labcapsule_media_frame_finish(uint32_t duration_ms)
 {
-    if (!s_media_receive_active || s_media_received != WALLPAPER_PAYLOAD_BYTES) {
+    if (!s_media_receive_active) {
         labcapsule_media_frame_abort();
-        return ESP_ERR_INVALID_SIZE;
+        return ESP_ERR_INVALID_STATE;
     }
+    const size_t payload_bytes = s_media_received;
     xSemaphoreTake(s_display_mutex, portMAX_DELAY);
-    memcpy(s_framebuffers[s_render_buffer], s_media_receive_buffer,
-           WALLPAPER_PAYLOAD_BYTES);
+    size_t source = 0;
+    size_t pixel = 0;
+    const size_t pixels = (size_t)s_media_width * s_media_height;
+    esp_err_t decode_result = ESP_OK;
+    while (pixel < pixels) {
+        uint16_t color = 0;
+        size_t run = 1;
+        if (s_media_encoding == LABCAPSULE_MEDIA_RAW565) {
+            if (source + 2 > s_media_received) { decode_result = ESP_ERR_INVALID_SIZE; break; }
+            color = (uint16_t)(s_media_receive_buffer[source] |
+                               ((uint16_t)s_media_receive_buffer[source + 1] << 8));
+            source += 2;
+        } else if (s_media_encoding == LABCAPSULE_MEDIA_RGB332) {
+            if (source >= s_media_received) { decode_result = ESP_ERR_INVALID_SIZE; break; }
+            uint8_t packed = s_media_receive_buffer[source++];
+            uint8_t red = (uint8_t)(((packed >> 5) & 0x07U) * 255U / 7U);
+            uint8_t green = (uint8_t)(((packed >> 2) & 0x07U) * 255U / 7U);
+            uint8_t blue = (uint8_t)((packed & 0x03U) * 255U / 3U);
+            color = rgb565(red, green, blue);
+        } else if (s_media_encoding == LABCAPSULE_MEDIA_RLE565) {
+            if (source + 3 > s_media_received) { decode_result = ESP_ERR_INVALID_SIZE; break; }
+            run = s_media_receive_buffer[source++];
+            color = (uint16_t)(s_media_receive_buffer[source] |
+                               ((uint16_t)s_media_receive_buffer[source + 1] << 8));
+            source += 2;
+        } else {
+            if (source + 2 > s_media_received) { decode_result = ESP_ERR_INVALID_SIZE; break; }
+            run = s_media_receive_buffer[source++];
+            uint8_t packed = s_media_receive_buffer[source++];
+            uint8_t red = (uint8_t)(((packed >> 5) & 0x07U) * 255U / 7U);
+            uint8_t green = (uint8_t)(((packed >> 2) & 0x07U) * 255U / 7U);
+            uint8_t blue = (uint8_t)((packed & 0x03U) * 255U / 3U);
+            color = rgb565(red, green, blue);
+        }
+        if (run == 0 || pixel + run > pixels) { decode_result = ESP_ERR_INVALID_SIZE; break; }
+        for (size_t count = 0; count < run; ++count, ++pixel) {
+            size_t row = pixel / s_media_width;
+            size_t column = pixel % s_media_width;
+            size_t target = ((size_t)s_media_y + row) * TFT_WIDTH + s_media_x + column;
+            s_framebuffers[0][target] = color;
+            s_framebuffers[1][target] = color;
+        }
+    }
+    if (source != s_media_received || pixel != pixels) decode_result = ESP_ERR_INVALID_SIZE;
+    if (decode_result != ESP_OK) {
+        xSemaphoreGive(s_display_mutex);
+        labcapsule_media_frame_abort();
+        return decode_result;
+    }
     s_display_view = DISPLAY_VIEW_MEDIA;
     s_media_frame_duration_ms = duration_ms < 20 ? 20 : duration_ms;
     esp_err_t result = display_present();
     xSemaphoreGive(s_display_mutex);
     s_media_receive_active = false;
     s_media_received = 0;
-    serial_emit("MEDIA,FRAME,DURATION=%lu", (unsigned long)s_media_frame_duration_ms);
+    serial_emit("MEDIA,FRAME,%ux%u@%u,%u,ENC=%u,BYTES=%u,DURATION=%lu",
+                (unsigned)s_media_width, (unsigned)s_media_height,
+                (unsigned)s_media_x, (unsigned)s_media_y,
+                (unsigned)s_media_encoding, (unsigned)payload_bytes,
+                (unsigned long)s_media_frame_duration_ms);
     return result;
 }
 
@@ -1251,6 +1334,8 @@ void labcapsule_media_frame_abort(void)
 {
     s_media_receive_active = false;
     s_media_received = 0;
+    s_media_x = s_media_y = s_media_width = s_media_height = 0;
+    s_media_encoding = LABCAPSULE_MEDIA_RAW565;
 }
 
 esp_err_t labcapsule_set_brightness(uint8_t percent)
