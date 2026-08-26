@@ -8,6 +8,7 @@ Thumbs.db
 
 # ===== 密钥（禁止提交 API Key）=====
 *.key
+*.jks
 .env*
 secrets.json
 config.secret.*
@@ -30,6 +31,7 @@ build/
 sdkconfig.old
 *.bin
 *.elf
+release/*.apk
 
 # ===== IDE =====
 .vscode/

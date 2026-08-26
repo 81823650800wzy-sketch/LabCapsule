@@ -1,0 +1,29 @@
+idf_component_register(
+    SRCS
+        "labcapsule_main.c"
+        "connectivity.c"
+        "device_config.c"
+        "sensor_hub.c"
+        "wallpaper.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        esp_driver_gpio
+        esp_driver_i2c
+        esp_driver_ledc
+        esp_driver_spi
+        esp_driver_uart
+        esp_driver_usb_serial_jtag
+        app_update
+        bt
+        esp_event
+        esp_http_server
+        esp_lcd
+        json
+        mbedtls
+        esp_netif
+        esp_partition
+        esp_timer
+        esp_wifi
+        mqtt
+        nvs_flash
+)
