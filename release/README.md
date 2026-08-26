@@ -3,7 +3,7 @@
 ## 发布文件
 
 - `LabCapsule-0.3.0.apk` — Android 8.0+ 中文控制器，45,463 字节。
-- `LabCapsule-0.3.0-ota.bin` — ESP32-S3 应用 OTA 镜像，1,318,320 字节。
+- `LabCapsule-0.3.0-ota.bin` — ESP32-S3 应用 OTA 镜像，1,318,336 字节。
 
 ## SHA-256
 
