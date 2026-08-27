@@ -47,18 +47,19 @@ $ResourceFiles = @(Get-ChildItem -LiteralPath $CompiledResources.FullName -Filte
     --manifest (Join-Path $ProjectRoot 'AndroidManifest.xml') `
     --min-sdk-version 26 `
     --target-sdk-version 35 `
-    --version-code 6 `
-    --version-name '0.3.3' `
+    --version-code 7 `
+    --version-name '0.4.0' `
     $ResourceFiles
 if ($LASTEXITCODE -ne 0) { throw 'aapt2 link failed' }
 
-$Source = Join-Path $ProjectRoot 'src\com\labcapsule\remote\MainActivity.java'
+$Sources = @(Get-ChildItem -LiteralPath (Join-Path $ProjectRoot 'src\com\labcapsule\remote') `
+    -Filter '*.java' | ForEach-Object { $_.FullName })
 & (Join-Path $env:JAVA_HOME 'bin\javac.exe') `
     -encoding UTF-8 `
     --release 8 `
     -classpath $AndroidJar `
     -d $Classes.FullName `
-    $Source
+    $Sources
 if ($LASTEXITCODE -ne 0) { throw 'javac failed' }
 
 $ClassesJar = Join-Path $BuildRoot 'classes.jar'
@@ -95,7 +96,7 @@ if (-not (Test-Path -LiteralPath $KeyStore)) {
     if ($LASTEXITCODE -ne 0) { throw 'keytool failed' }
 }
 
-$OutputApk = Join-Path $DistRoot 'LabCapsule-0.3.3.apk'
+$OutputApk = Join-Path $DistRoot 'LabCapsule-0.4.0.apk'
 & (Join-Path $BuildTools 'apksigner.bat') sign `
     --ks $KeyStore `
     --ks-pass 'pass:labcapsule' `

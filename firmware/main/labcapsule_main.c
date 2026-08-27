@@ -1353,12 +1353,13 @@ esp_err_t labcapsule_media_region_begin(size_t payload_size, uint16_t x, uint16_
     if (!s_media_receive_buffer || s_media_receive_active || payload_size == 0 ||
         payload_size > WALLPAPER_PAYLOAD_BYTES || width == 0 || height == 0 ||
         x + width > TFT_WIDTH || y + height > TFT_HEIGHT ||
-        encoding > LABCAPSULE_MEDIA_RLE332) return ESP_ERR_INVALID_ARG;
+        encoding > LABCAPSULE_MEDIA_DELTA332) return ESP_ERR_INVALID_ARG;
     size_t pixels = (size_t)width * height;
     if ((encoding == LABCAPSULE_MEDIA_RAW565 && payload_size != pixels * 2U) ||
         (encoding == LABCAPSULE_MEDIA_RGB332 && payload_size != pixels) ||
         ((encoding == LABCAPSULE_MEDIA_RLE565 ||
-          encoding == LABCAPSULE_MEDIA_RLE332) && payload_size < 2U)) {
+          encoding == LABCAPSULE_MEDIA_RLE332) && payload_size < 2U) ||
+        (encoding == LABCAPSULE_MEDIA_DELTA332 && payload_size < 4U)) {
         return ESP_ERR_INVALID_SIZE;
     }
     if (s_display_view != DISPLAY_VIEW_MEDIA &&
@@ -1396,6 +1397,35 @@ esp_err_t labcapsule_media_frame_finish(uint32_t duration_ms)
     size_t pixel = 0;
     const size_t pixels = (size_t)s_media_width * s_media_height;
     esp_err_t decode_result = ESP_OK;
+    if (s_media_encoding == LABCAPSULE_MEDIA_DELTA332) {
+        while (source < s_media_received) {
+            if (source + 3 > s_media_received) {
+                decode_result = ESP_ERR_INVALID_SIZE;
+                break;
+            }
+            size_t skip = (size_t)s_media_receive_buffer[source] |
+                    ((size_t)s_media_receive_buffer[source + 1] << 8);
+            source += 2;
+            size_t run = s_media_receive_buffer[source++];
+            if (pixel + skip > pixels || source + run > s_media_received ||
+                pixel + skip + run > pixels) {
+                decode_result = ESP_ERR_INVALID_SIZE;
+                break;
+            }
+            pixel += skip;
+            for (size_t count = 0; count < run; ++count, ++pixel) {
+                uint8_t packed = s_media_receive_buffer[source++];
+                uint8_t red = (uint8_t)(((packed >> 5) & 0x07U) * 255U / 7U);
+                uint8_t green = (uint8_t)(((packed >> 2) & 0x07U) * 255U / 7U);
+                uint8_t blue = (uint8_t)((packed & 0x03U) * 255U / 3U);
+                size_t row = pixel / s_media_width;
+                size_t column = pixel % s_media_width;
+                size_t target = ((size_t)s_media_y + row) * TFT_WIDTH +
+                        s_media_x + column;
+                s_media_canvas[target] = rgb565(red, green, blue);
+            }
+        }
+    } else {
     while (pixel < pixels) {
         uint16_t color = 0;
         size_t run = 1;
@@ -1435,6 +1465,7 @@ esp_err_t labcapsule_media_frame_finish(uint32_t duration_ms)
         }
     }
     if (source != s_media_received || pixel != pixels) decode_result = ESP_ERR_INVALID_SIZE;
+    }
     if (decode_result != ESP_OK) {
         xSemaphoreGive(s_display_mutex);
         labcapsule_media_frame_abort();

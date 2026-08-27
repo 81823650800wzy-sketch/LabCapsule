@@ -42,12 +42,15 @@ import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
 
 public class MainActivity extends Activity {
-    private static final String APP_VERSION = "0.3.3";
+    private static final String APP_VERSION = "0.4.0";
     private static final String REPOSITORY = "81823650800wzy-sketch/LabCapsule";
     private static final String WIFI_GUIDE_URL = "https://github.com/" + REPOSITORY +
             "/blob/main/docs/V0.3.3_BLE_WIFI_QUICKSTART_ZH.md";
+    private static final String V040_GUIDE_URL = "https://github.com/" + REPOSITORY +
+            "/blob/main/docs/V0.4.0_EXPERIMENT_GIF_GUIDE_ZH.md";
     private static final int REQUEST_FIRMWARE = 1001, REQUEST_MEDIA = 1002,
-            REQUEST_BLE_PERMISSIONS = 1003;
+            REQUEST_BLE_PERMISSIONS = 1003, REQUEST_NOTIFICATION_PERMISSION = 1004,
+            REQUEST_CSV = 1005;
 
     private static final UUID SERVICE_UUID = uuid(1), COMMAND_UUID = uuid(2),
             STATUS_UUID = uuid(3), OTA_CONTROL_UUID = uuid(4), OTA_DATA_UUID = uuid(5),
@@ -72,10 +75,12 @@ public class MainActivity extends Activity {
     private final ArrayList<LinearLayout> themedCards = new ArrayList<>();
     private TextView globalStatus, mediaInfo, firmwareInfo, updateInfo, aiResult,
             externalWifiState, externalWifiIp, externalWifiHint, sensorResult,
-            screenMonitorState;
+            screenMonitorState, historyView, activeProtocolView, gifServiceState,
+            analysisResultView;
     private ProgressBar globalProgress;
     private EditText deviceUrlInput, wifiSsid, wifiPassword, mqttUri, mqttUser, mqttPassword,
-            mqttTopic, brightnessInput, aiEndpoint, aiModel, aiKey, aiQuestion;
+            mqttTopic, brightnessInput, aiEndpoint, aiModel, aiKey, aiQuestion,
+            experimentRateInput, experimentDurationInput;
     private CheckBox keepRecoveryAp, remoteEnabled;
     private Spinner transportSpinner;
     private ImageView mediaPreview;
@@ -108,7 +113,7 @@ public class MainActivity extends Activity {
     private Runnable bleTransferCompletion;
     private final Runnable screenMonitorRunnable = new Runnable() {
         @Override public void run() {
-            if (!screenMonitorActive || currentSection != 1) return;
+            if (!screenMonitorActive || currentSection != 4) return;
             requestDeviceStatus(true);
             mainHandler.postDelayed(this, 1000);
         }
@@ -146,7 +151,7 @@ public class MainActivity extends Activity {
         cp.bottomMargin = dp(102);
         root.addView(content, cp);
         navigationBar = new LiquidNavBar(this);
-        navigationBar.setItems(new String[]{"设备", "屏幕", "实验", "AI", "设置"});
+        navigationBar.setItems(new String[]{"首页", "实验", "数据", "AI", "设置"});
         navigationBar.listener = this::showSection;
         FrameLayout.LayoutParams np = new FrameLayout.LayoutParams(-1, dp(82), Gravity.BOTTOM);
         np.setMargins(dp(14), 0, dp(14), dp(14));
@@ -155,12 +160,11 @@ public class MainActivity extends Activity {
     }
 
     private void showSection(int index) {
-        gifStreaming = false;
-        if (index != 1) stopScreenMonitorSilently();
+        if (index != 4) stopScreenMonitorSilently();
         currentSection = index;
         themedCards.clear();
-        View page = index == 0 ? buildDevicePage() : index == 1 ? buildScreenPage()
-                : index == 2 ? buildExperimentPage() : index == 3 ? buildAiPage()
+        View page = index == 0 ? buildHomePage() : index == 1 ? buildExperimentPage()
+                : index == 2 ? buildDataPage() : index == 3 ? buildAiPage()
                 : buildSettingsPage();
         page.setAlpha(0f);
         page.setTranslationY(dp(18));
@@ -227,6 +231,49 @@ public class MainActivity extends Activity {
 
     private LinearLayout pageRoot(ScrollView page) { return (LinearLayout) page.getTag(); }
 
+    private View buildHomePage() {
+        ScrollView page = page("实验中枢", "从问题、采集到结果，而不是一组设备设置");
+        LinearLayout root = pageRoot(page);
+        LinearLayout hero = card(root, new int[]{BLUE, SECONDARY});
+        hero.addView(label("LAB / RUN CONSOLE", 12, Color.rgb(18, 18, 18), true));
+        hero.addView(label("今天要验证什么？", 25, Color.rgb(18, 18, 18), true));
+        TextView connection = label(preferences.getBoolean("sta_connected", false)
+                ? "● 设备已在局域网在线 · " + preferences.getString("sta_ip", "")
+                : bleReady ? "● BLE 在线，可直接开始实验" : "○ 等待设备连接",
+                13, Color.rgb(30, 30, 30), true);
+        connection.setPadding(0, dp(8), 0, 0);
+        hero.addView(connection);
+
+        LinearLayout quick = card(root, null);
+        section(quick, "快速实验", "预设会生成真实 Experiment Protocol 并立即下发");
+        quick.addView(button("桌面振动 · 200 Hz / 20 s", true,
+                v -> startPresetExperiment("桌面振动记录", 200, 20)), matchWrap(0));
+        quick.addView(row(button("碰撞冲击 · 500 Hz", false,
+                        v -> startPresetExperiment("碰撞冲击响应", 500, 8)),
+                button("姿态变化 · 100 Hz", false,
+                        v -> startPresetExperiment("姿态变化轨迹", 100, 30))), matchWrap(dp(7)));
+        quick.addView(row(button("设计实验", false, v -> navigateSection(1)),
+                button("AI 生成协议", false, v -> navigateSection(3)),
+                button("查看记录", false, v -> navigateSection(2))), matchWrap(dp(7)));
+
+        LinearLayout now = card(root, null);
+        section(now, "当前任务", "后台任务不会因离开页面而消失");
+        String protocol = preferences.getString("last_protocol_name", "尚未开始实验");
+        now.addView(label("实验：" + protocol + "\n最近样本数：" +
+                preferences.getLong("last_sample_count", 0), 15, INK, true));
+        String gifState = preferences.getBoolean("gif_service_running", false)
+                ? preferences.getString("gif_service_message", "GIF 后台播放中")
+                : "GIF 后台播放器未运行";
+        gifServiceState = label(gifState, 13,
+                preferences.getBoolean("gif_service_running", false) ? GREEN : MUTED, false);
+        gifServiceState.setPadding(0, dp(8), 0, 0);
+        now.addView(gifServiceState);
+        now.addView(row(button("刷新设备", true, v -> fetchStatus()),
+                button("停止实验", false, v -> sendAction("stop")),
+                button("中止全部", false, v -> sendAction("abort"))), matchWrap(dp(7)));
+        return page;
+    }
+
     private View buildDevicePage() {
         ScrollView page = page("LabCapsule", "一个可扩展、可联网的实验实体小组件");
         LinearLayout root = pageRoot(page);
@@ -241,8 +288,7 @@ public class MainActivity extends Activity {
         deviceUrlInput = input(preferences.getString("device_url", "http://192.168.4.1"),
                 "设备 IP 或 URL", false);
         connection.addView(deviceUrlInput, matchWrap(0));
-        transportSpinner = spinner(new String[]{"局域网 / Wi‑Fi", "Bluetooth LE"});
-        transportSpinner.setSelection(preferences.getInt("transport", 0));
+        transportSpinner = transportSelector();
         connection.addView(transportSpinner, matchWrap(dp(6)));
         connection.addView(row(button("检测设备", true, v -> fetchStatus()),
                 button("扫描 BLE", false, v -> startBleScan())));
@@ -294,8 +340,7 @@ public class MainActivity extends Activity {
                 MUTED, false);
         mediaInfo.setPadding(0, dp(9), 0, dp(4));
         media.addView(mediaInfo);
-        transportSpinner = spinner(new String[]{"局域网 / Wi‑Fi", "Bluetooth LE"});
-        transportSpinner.setSelection(preferences.getInt("transport", 0));
+        transportSpinner = transportSelector();
         media.addView(transportSpinner, matchWrap(dp(4)));
         media.addView(row(button("选择并裁剪", false, v -> chooseMedia()),
                 button("重新裁剪", false, v -> reopenCropEditor()),
@@ -375,8 +420,21 @@ public class MainActivity extends Activity {
     }
 
     private View buildExperimentPage() {
-        ScrollView page = page("实验", "传感器发现、实验协议与固件生命周期");
+        ScrollView page = page("实验设计", "选择参数、确认传感器并运行可复现实验");
         LinearLayout root = pageRoot(page);
+        LinearLayout runner = card(root, new int[]{BLUE, SECONDARY});
+        section(runner, "自定义采集", "采样率 10–500 Hz，时长 1–3600 秒");
+        experimentRateInput = input("200", "采样率 Hz", false);
+        experimentDurationInput = input("20", "时长 秒", false);
+        runner.addView(row(experimentRateInput, experimentDurationInput));
+        runner.addView(row(button("开始采集", true, v -> startCustomExperiment()),
+                button("停止", false, v -> sendAction("stop")),
+                button("中止", false, v -> sendAction("abort"))), matchWrap(dp(7)));
+        activeProtocolView = label(preferences.getString("last_protocol_json",
+                "尚未下发实验协议"), 12, Color.rgb(28, 28, 28), false);
+        activeProtocolView.setTextIsSelectable(true);
+        activeProtocolView.setPadding(0, dp(8), 0, 0);
+        runner.addView(activeProtocolView);
         LinearLayout sensors = card(root, null);
         section(sensors, "传感器扩展", "运动、环境、电气、测距与模拟量驱动注册表");
         sensors.addView(label("GPIO8 / GPIO9 是扩展 I²C 总线。固件可发现 MPU6050、BME280、SHT3x、INA219、ADS1115、VL53L0X，并继续注册 SPI、UART、ADC、OneWire 驱动。", 14, INK, false));
@@ -386,19 +444,152 @@ public class MainActivity extends Activity {
         sensorResult.setTextIsSelectable(true);
         sensorResult.setPadding(0, dp(8), 0, 0);
         sensors.addView(sensorResult);
-        LinearLayout firmware = card(root, null);
-        section(firmware, "固件更新", "双 OTA 分区，校验成功后才切换启动槽");
-        transportSpinner = spinner(new String[]{"局域网 / Wi‑Fi", "Bluetooth LE"});
-        transportSpinner.setSelection(preferences.getInt("transport", 0));
-        firmware.addView(transportSpinner, matchWrap(0));
-        firmwareInfo = label("尚未选择 .bin 固件", 13, MUTED, false);
-        firmwareInfo.setPadding(0, dp(8), 0, dp(5));
-        firmware.addView(firmwareInfo);
-        firmware.addView(row(button("选择固件", false, v -> chooseFirmware()),
-                button("开始 OTA", true, v -> startFirmwareUpdate())));
-        firmware.addView(row(button("在线查找固件", false, v -> checkForUpdates(false)),
-                button("下载最新固件", false, v -> downloadLatestFirmware())));
         return page;
+    }
+
+    private View buildDataPage() {
+        ScrollView page = page("实验记录", "本机保存实验协议和运行时间，可直接分享");
+        LinearLayout root = pageRoot(page);
+        LinearLayout summary = card(root, null);
+        section(summary, "记录库", "每次从首页、实验页或 AI 页启动都会自动登记");
+        historyView = label(buildHistoryText(), 13, INK, false);
+        historyView.setTextIsSelectable(true);
+        summary.addView(historyView);
+        summary.addView(row(button("分享 CSV 摘要", true, v -> shareHistory()),
+                button("清空记录", false, v -> clearHistory())), matchWrap(dp(8)));
+        LinearLayout analysis = card(root, null);
+        section(analysis, "六轴 CSV 分析", "在手机端计算 RMS、绝对峰值、FFT 主频");
+        analysisResultView = label(preferences.getString("last_analysis",
+                "尚未导入 CSV。支持 timestamp_us + AX/AY/AZ/GX/GY/GZ。"),
+                13, MUTED, false);
+        analysisResultView.setTextIsSelectable(true);
+        analysis.addView(analysisResultView);
+        analysis.addView(row(button("导入 CSV 并分析", true, v -> chooseCsv()),
+                button("分享分析", false, v -> shareAnalysis())), matchWrap(dp(7)));
+        analysis.addView(row(button("开始新实验", false, v -> navigateSection(1)),
+                button("AI 设计", false, v -> navigateSection(3))), matchWrap(dp(7)));
+        return page;
+    }
+
+    private void navigateSection(int index) {
+        if (navigationBar != null) navigationBar.select(index);
+        showSection(index);
+    }
+
+    private void startPresetExperiment(String name, int rate, int duration) {
+        try {
+            currentProtocol = new JSONObject().put("name", name)
+                    .put("sample_rate_hz", rate).put("duration_seconds", duration)
+                    .put("groups", new JSONArray().put("当前实验组"))
+                    .put("analysis", new JSONArray().put("RMS").put("Peak").put("FFT"))
+                    .put("source", "apk_preset").toString(2);
+            executeProtocol(currentProtocol);
+        } catch (Exception error) { status("预设无法启动：" + error.getMessage(), false); }
+    }
+
+    private void startCustomExperiment() {
+        try {
+            int rate = Integer.parseInt(experimentRateInput.getText().toString().trim());
+            int duration = Integer.parseInt(experimentDurationInput.getText().toString().trim());
+            if (rate < 10 || rate > 500 || duration < 1 || duration > 3600) {
+                status("采样率需为 10–500 Hz，时长需为 1–3600 秒", false); return;
+            }
+            currentProtocol = new JSONObject().put("name", "自定义运动实验")
+                    .put("sample_rate_hz", rate).put("duration_seconds", duration)
+                    .put("groups", new JSONArray().put("当前实验组"))
+                    .put("analysis", new JSONArray().put("RMS").put("Peak").put("FFT"))
+                    .put("source", "apk_custom").toString(2);
+            executeProtocol(currentProtocol);
+        } catch (Exception error) { status("实验参数无效：" + error.getMessage(), false); }
+    }
+
+    private void executeProtocol(String protocolText) {
+        try {
+            JSONObject protocol = new JSONObject(protocolText);
+            int rate = protocol.getInt("sample_rate_hz");
+            int duration = protocol.getInt("duration_seconds");
+            String name = protocol.optString("name", "未命名实验");
+            if (rate < 10 || rate > 500 || duration < 1 || duration > 3600)
+                throw new Exception("协议采样率或时长超出安全范围");
+            recordExperiment(protocol);
+            preferences.edit().putString("last_protocol_name", name)
+                    .putString("last_protocol_json", protocol.toString(2)).apply();
+            if (activeProtocolView != null) activeProtocolView.setText(protocol.toString(2));
+            status("正在下发实验协议：" + name, true);
+            if (selectedTransport() == 1) {
+                writeBleCommand("START:" + rate + ":" + duration);
+            } else {
+                http("POST", "/api/experiment?rate=" + rate + "&duration=" + duration,
+                        new byte[0], "application/octet-stream",
+                        result -> status("实验已启动：" + name, true));
+            }
+        } catch (Exception error) { status("协议无法执行：" + error.getMessage(), false); }
+    }
+
+    private void recordExperiment(JSONObject protocol) {
+        try {
+            JSONArray history = new JSONArray(preferences.getString("experiment_history", "[]"));
+            JSONArray updated = new JSONArray();
+            updated.put(new JSONObject().put("startedAt", System.currentTimeMillis())
+                    .put("name", protocol.optString("name", "未命名实验"))
+                    .put("rate", protocol.optInt("sample_rate_hz"))
+                    .put("duration", protocol.optInt("duration_seconds"))
+                    .put("transport", selectedTransport() == 1 ? "BLE" : "Wi-Fi"));
+            for (int index = 0; index < history.length() && index < 49; ++index)
+                updated.put(history.getJSONObject(index));
+            preferences.edit().putString("experiment_history", updated.toString()).apply();
+        } catch (Exception ignored) { }
+    }
+
+    private String buildHistoryText() {
+        try {
+            JSONArray history = new JSONArray(preferences.getString("experiment_history", "[]"));
+            if (history.length() == 0) return "尚无实验记录。";
+            StringBuilder output = new StringBuilder();
+            java.text.SimpleDateFormat format = new java.text.SimpleDateFormat(
+                    "MM-dd HH:mm", Locale.getDefault());
+            for (int index = 0; index < history.length(); ++index) {
+                JSONObject item = history.getJSONObject(index);
+                if (index > 0) output.append("\n\n");
+                output.append(index + 1).append(". ").append(item.optString("name"))
+                        .append("\n   ").append(format.format(new java.util.Date(
+                                item.optLong("startedAt"))))
+                        .append(" · ").append(item.optInt("rate")).append(" Hz · ")
+                        .append(item.optInt("duration")).append(" s · ")
+                        .append(item.optString("transport"));
+            }
+            return output.toString();
+        } catch (Exception error) { return "记录读取失败：" + error.getMessage(); }
+    }
+
+    private void shareHistory() {
+        try {
+            JSONArray history = new JSONArray(preferences.getString("experiment_history", "[]"));
+            StringBuilder csv = new StringBuilder("started_at,name,sample_rate_hz,duration_seconds,transport\n");
+            for (int index = 0; index < history.length(); ++index) {
+                JSONObject item = history.getJSONObject(index);
+                csv.append(item.optLong("startedAt")).append(',').append('"')
+                        .append(item.optString("name").replace("\"", "\"\""))
+                        .append("\",").append(item.optInt("rate")).append(',')
+                        .append(item.optInt("duration")).append(',')
+                        .append(item.optString("transport")).append('\n');
+            }
+            Intent share = new Intent(Intent.ACTION_SEND).setType("text/csv")
+                    .putExtra(Intent.EXTRA_SUBJECT, "LabCapsule 实验记录")
+                    .putExtra(Intent.EXTRA_TEXT, csv.toString());
+            startActivity(Intent.createChooser(share, "分享实验记录"));
+        } catch (Exception error) { status("记录分享失败：" + error.getMessage(), false); }
+    }
+
+    private void clearHistory() {
+        new AlertDialog.Builder(this).setTitle("清空实验记录？")
+                .setMessage("只会删除 APK 中的实验元数据，不会删除 PC 上的 CSV。")
+                .setNegativeButton("取消", null)
+                .setPositiveButton("清空", (dialog, which) -> {
+                    preferences.edit().remove("experiment_history").apply();
+                    if (historyView != null) historyView.setText("尚无实验记录。");
+                    status("实验记录已清空", true);
+                }).show();
     }
 
     private View buildAiPage() {
@@ -432,10 +623,12 @@ public class MainActivity extends Activity {
     private View buildSettingsPage() {
         ScrollView page = page("设置", "网络、远程连接、更新与本地偏好");
         LinearLayout root = pageRoot(page);
+        addDeviceSettingsGroup(root);
+        addDisplaySettingsGroup(root);
+        addFirmwareSettingsGroup(root);
         LinearLayout network = card(root, null);
         section(network, "外部 Wi‑Fi", "推荐连接 BLE 后直接保存；手机全程保持正常联网");
-        transportSpinner = spinner(new String[]{"局域网 / Wi‑Fi", "Bluetooth LE"});
-        transportSpinner.setSelection(preferences.getInt("transport", 0));
+        transportSpinner = transportSelector();
         network.addView(transportSpinner, matchWrap(0));
         wifiSsid = input(preferences.getString("wifi_ssid", ""), "路由器 SSID", false);
         wifiPassword = input(secureStore.get("wifi_password"), "路由器密码", true);
@@ -473,9 +666,150 @@ public class MainActivity extends Activity {
         updates.addView(row(button("检查更新", false, v -> checkForUpdates(false)),
                 button("下载新版 APK", true, v -> downloadLatestApk())));
         LinearLayout about = card(root, null);
-        section(about, "关于", "LabCapsule V0.3.3 · Motion Experiment Prototype");
+        section(about, "关于", "LabCapsule V0.4.0 · Motion Experiment Prototype");
         about.addView(label("默认语言：简体中文\n协议：HTTP + MQTT + BLE GATT\n屏幕：240×320 RGB565 双缓冲\n仓库：github.com/" + REPOSITORY, 13, MUTED, false));
+        about.addView(button("查看 V0.4 实验与后台 GIF 指南", false,
+                v -> openUrl(V040_GUIDE_URL)), matchWrap(dp(7)));
         return page;
+    }
+
+    private LinearLayout collapsedGroup(LinearLayout root, String title, String subtitle) {
+        LinearLayout shell = card(root, null);
+        TextView header = label("＋  " + title, 18, INK, true);
+        header.setPadding(0, dp(2), 0, dp(4));
+        TextView hint = label(subtitle, 12, MUTED, false);
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        body.setVisibility(View.GONE);
+        shell.addView(header);
+        shell.addView(hint);
+        shell.addView(body, matchWrap(dp(8)));
+        header.setOnClickListener(v -> {
+            boolean opening = body.getVisibility() != View.VISIBLE;
+            body.setVisibility(opening ? View.VISIBLE : View.GONE);
+            header.setText((opening ? "－  " : "＋  ") + title);
+            if (opening) {
+                body.setAlpha(0f);
+                body.animate().alpha(1f).setDuration(180).start();
+            }
+        });
+        hint.setOnClickListener(v -> header.performClick());
+        return body;
+    }
+
+    private void addDeviceSettingsGroup(LinearLayout root) {
+        LinearLayout body = collapsedGroup(root, "设备与连接",
+                "BLE、局域网地址、恢复热点和设备遥控（默认折叠）");
+        deviceUrlInput = input(preferences.getString("device_url", "http://192.168.4.1"),
+                "设备 IP 或 URL", false);
+        body.addView(deviceUrlInput, matchWrap(0));
+        transportSpinner = transportSelector();
+        body.addView(transportSpinner, matchWrap(dp(6)));
+        body.addView(row(button("检测设备", true, v -> fetchStatus()),
+                button("扫描 BLE", false, v -> startBleScan())), matchWrap(dp(6)));
+        body.addView(row(button("蓝牙一键配网", true, v -> showBleWifiDialog()),
+                button("恢复设备热点", false, v -> restoreRecoveryAp())), matchWrap(dp(6)));
+        externalWifiState = label("● 尚未读取设备状态", 16, MUTED, true);
+        externalWifiIp = label("局域网 IP：尚未获取", 14, INK, false);
+        externalWifiHint = label("展开后点击检测设备，或只用 BLE 配网", 12, MUTED, false);
+        body.addView(externalWifiState, matchWrap(dp(8)));
+        body.addView(externalWifiIp);
+        body.addView(externalWifiHint);
+        body.addView(row(button("使用局域网 IP", false, v -> useStationIp()),
+                button("扫描 I²C", false, v -> fetchSensors())), matchWrap(dp(6)));
+        body.addView(row(button("主页", false, v -> sendAction("home")),
+                button("设置页", false, v -> sendAction("settings")),
+                button("开发诊断", false, v -> sendAction("developer"))), matchWrap(dp(6)));
+        renderExternalWifi(preferences.getBoolean("sta_configured", false),
+                preferences.getBoolean("sta_connected", false),
+                preferences.getString("sta_ip", "0.0.0.0"),
+                preferences.getString("recovery_ap", "LabCapsule"));
+    }
+
+    private void addDisplaySettingsGroup(LinearLayout root) {
+        LinearLayout body = collapsedGroup(root, "屏幕、壁纸与 GIF",
+                "媒体、实时镜像、透明度和屏幕遥控（默认折叠）");
+        mediaPreview = new WallpaperPreview(this);
+        mediaPreview.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        ((WallpaperPreview) mediaPreview).setStyle(visualPreset, wallpaperOpacity,
+                panelOpacity, hudOpacity);
+        mediaPreview.setBackground(roundRect(CANVAS, 10, BLUE));
+        body.addView(mediaPreview, new LinearLayout.LayoutParams(-1, -2));
+        mediaInfo = label(preferences.getBoolean("gif_service_running", false)
+                ? preferences.getString("gif_service_message", "GIF 后台播放中")
+                : "选择图片或 GIF，确认 240×320 裁剪后再发送", 13, MUTED, false);
+        mediaInfo.setPadding(0, dp(8), 0, dp(5));
+        body.addView(mediaInfo);
+        transportSpinner = transportSelector();
+        body.addView(transportSpinner, matchWrap(dp(4)));
+        body.addView(row(button("选择并裁剪", false, v -> chooseMedia()),
+                button("重新裁剪", false, v -> reopenCropEditor()),
+                button("保存壁纸", true, v -> saveWallpaper())), matchWrap(dp(6)));
+        body.addView(row(button("临时单帧", false, v -> sendSelectedFrame()),
+                button("后台播放 GIF", true, v -> startGifStream()),
+                button("停止 GIF", false, v -> stopGifStream())), matchWrap(dp(6)));
+
+        screenMonitorState = label(screenMonitorActive ? "● 实时同步中" : "● 屏幕镜像未启动",
+                13, screenMonitorActive ? GREEN : MUTED, true);
+        body.addView(screenMonitorState, matchWrap(dp(9)));
+        body.addView(row(button("开始实时镜像", false, v -> startScreenMonitor()),
+                button("停止镜像", false, v -> stopScreenMonitor())), matchWrap(dp(5)));
+
+        Spinner preset = spinner(new String[]{"街机黄黑", "信号红灰", "冷蓝录像"});
+        preset.setSelection(visualPreset);
+        preset.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(AdapterView<?> parent, View view,
+                                                  int position, long id) {
+                if (position == visualPreset) return;
+                applyThemePalette(position);
+                preferences.edit().putInt("visual_preset", visualPreset).apply();
+                scheduleVisualStyleSync();
+                mainHandler.post(() -> showSection(4));
+            }
+            @Override public void onNothingSelected(AdapterView<?> parent) { }
+        });
+        body.addView(preset, matchWrap(dp(9)));
+        addOpacitySlider(body, "壁纸可见度", wallpaperOpacity, value -> {
+            wallpaperOpacity = value;
+            preferences.edit().putInt("wallpaper_opacity", value).apply();
+            refreshThemeSurfaces(); scheduleVisualStyleSync();
+        });
+        addOpacitySlider(body, "设备面板遮罩", panelOpacity, value -> {
+            panelOpacity = value;
+            preferences.edit().putInt("panel_opacity", value).apply();
+            refreshThemeSurfaces(); scheduleVisualStyleSync();
+        });
+        addOpacitySlider(body, "设备 HUD / 文字", hudOpacity, value -> {
+            hudOpacity = value;
+            preferences.edit().putInt("hud_opacity", value).apply();
+            refreshThemeSurfaces(); scheduleVisualStyleSync();
+        });
+        addOpacitySlider(body, "APK 面板 / 导航玻璃", appGlassOpacity, value -> {
+            appGlassOpacity = value;
+            preferences.edit().putInt("app_glass_opacity", value).apply();
+            refreshThemeSurfaces();
+        });
+        body.addView(row(button("同步外观", true, v -> sendVisualStyle(true)),
+                button("彩条", false, v -> sendAction("test")),
+                button("反色", false, v -> sendAction("invert"))), matchWrap(dp(7)));
+        body.addView(row(button("↑", false, v -> sendAction("up")),
+                button("←", false, v -> sendAction("left")),
+                button("OK", true, v -> sendAction("ok")),
+                button("→", false, v -> sendAction("right")),
+                button("↓", false, v -> sendAction("down"))), matchWrap(dp(6)));
+    }
+
+    private void addFirmwareSettingsGroup(LinearLayout root) {
+        LinearLayout body = collapsedGroup(root, "固件与维护",
+                "OTA、在线版本和诊断工具（默认折叠）");
+        transportSpinner = transportSelector();
+        body.addView(transportSpinner, matchWrap(0));
+        firmwareInfo = label("尚未选择 .bin 固件", 13, MUTED, false);
+        body.addView(firmwareInfo, matchWrap(dp(6)));
+        body.addView(row(button("选择固件", false, v -> chooseFirmware()),
+                button("开始 OTA", true, v -> startFirmwareUpdate())), matchWrap(dp(6)));
+        body.addView(row(button("查找新版", false, v -> checkForUpdates(false)),
+                button("下载固件", false, v -> downloadLatestFirmware())), matchWrap(dp(6)));
     }
 
     private void addOpacitySlider(LinearLayout parent, String title, int initial,
@@ -599,6 +933,18 @@ public class MainActivity extends Activity {
                 Color.argb(190, Color.red(BLUE), Color.green(BLUE), Color.blue(BLUE))));
         return spinner;
     }
+    private Spinner transportSelector() {
+        Spinner selector = spinner(new String[]{"局域网 / Wi‑Fi", "Bluetooth LE"});
+        selector.setSelection(preferences.getInt("transport", 0));
+        selector.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(AdapterView<?> parent, View view,
+                                                  int position, long id) {
+                preferences.edit().putInt("transport", position).apply();
+            }
+            @Override public void onNothingSelected(AdapterView<?> parent) { }
+        });
+        return selector;
+    }
 
     private CheckBox check(String text, boolean checked) {
         CheckBox box = new CheckBox(this);
@@ -671,10 +1017,7 @@ public class MainActivity extends Activity {
         }
     }
     private int selectedTransport() {
-        int selected = transportSpinner == null ? preferences.getInt("transport", 0)
-                : transportSpinner.getSelectedItemPosition();
-        preferences.edit().putInt("transport", selected).apply();
-        return selected;
+        return preferences.getInt("transport", 0);
     }
     private String baseUrl() {
         String value = deviceUrlInput == null ? preferences.getString("device_url",
@@ -769,6 +1112,8 @@ public class MainActivity extends Activity {
                         network.optInt("lastDisconnectReason", 0)));
             }
             JSONObject device = root.optJSONObject("device");
+            if (device != null) preferences.edit().putLong("last_sample_count",
+                    device.optLong("samples", preferences.getLong("last_sample_count", 0))).apply();
             JSONObject style = device == null ? null : device.optJSONObject("style");
             if (style != null) {
                 int previousPreset = visualPreset;
@@ -927,6 +1272,12 @@ public class MainActivity extends Activity {
         intent.setType("image/*");
         startActivityForResult(intent, REQUEST_MEDIA);
     }
+    private void chooseCsv() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("text/*");
+        startActivityForResult(intent, REQUEST_CSV);
+    }
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
@@ -941,6 +1292,16 @@ public class MainActivity extends Activity {
                         selectedFirmware = bytes;
                         if (firmwareInfo != null) firmwareInfo.setText(name + " · " + bytes.length + " bytes");
                     });
+                } else if (requestCode == REQUEST_CSV) {
+                    String analysis = analyzeCsv(new String(bytes, StandardCharsets.UTF_8), name);
+                    preferences.edit().putString("last_analysis", analysis).apply();
+                    runOnUiThread(() -> {
+                        if (analysisResultView != null) {
+                            analysisResultView.setText(analysis);
+                            analysisResultView.setTextColor(INK);
+                        }
+                        status("CSV 分析完成", true);
+                    });
                 } else {
                     Movie movie = Movie.decodeByteArray(bytes, 0, bytes.length);
                     Bitmap bitmap = decodeStaticForCrop(bytes);
@@ -953,6 +1314,112 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> status("文件处理失败：" + error.getMessage(), false));
             }
         });
+    }
+
+    private String analyzeCsv(String text, String name) throws Exception {
+        String[] lines = text.replace("\r", "").split("\n");
+        ArrayList<double[]> rows = new ArrayList<>();
+        for (String line : lines) {
+            if (line.trim().isEmpty()) continue;
+            String[] fields = line.split(",");
+            int offset = fields.length > 0 && "DATA".equalsIgnoreCase(fields[0].trim()) ? 1 : 0;
+            if (fields.length - offset < 7) continue;
+            try {
+                double[] row = new double[7];
+                for (int column = 0; column < 7; ++column)
+                    row[column] = Double.parseDouble(fields[offset + column].trim());
+                rows.add(row);
+                if (rows.size() >= 100000) break;
+            } catch (NumberFormatException ignored) { }
+        }
+        if (rows.size() < 16) throw new Exception("有效六轴样本少于 16 条");
+        double[] sumSquares = new double[6];
+        double[] peaks = new double[6];
+        for (double[] row : rows) for (int channel = 0; channel < 6; ++channel) {
+            double value = row[channel + 1];
+            sumSquares[channel] += value * value;
+            peaks[channel] = Math.max(peaks[channel], Math.abs(value));
+        }
+        int fftSize = 1;
+        while (fftSize * 2 <= rows.size() && fftSize < 4096) fftSize *= 2;
+        double[] real = new double[fftSize], imaginary = new double[fftSize];
+        double mean = 0;
+        for (int index = 0; index < fftSize; ++index) {
+            double[] row = rows.get(index);
+            real[index] = Math.sqrt(row[1] * row[1] + row[2] * row[2] + row[3] * row[3]);
+            mean += real[index];
+        }
+        mean /= fftSize;
+        for (int index = 0; index < fftSize; ++index) {
+            real[index] = (real[index] - mean) *
+                    (.5 - .5 * Math.cos(2 * Math.PI * index / (fftSize - 1)));
+        }
+        fft(real, imaginary);
+        int dominantBin = 1;
+        double dominantPower = 0;
+        for (int bin = 1; bin < fftSize / 2; ++bin) {
+            double power = real[bin] * real[bin] + imaginary[bin] * imaginary[bin];
+            if (power > dominantPower) { dominantPower = power; dominantBin = bin; }
+        }
+        double elapsedUs = rows.get(fftSize - 1)[0] - rows.get(0)[0];
+        double sampleRate = elapsedUs > 0 ? (fftSize - 1) * 1000000.0 / elapsedUs : 0;
+        double dominantFrequency = sampleRate * dominantBin / fftSize;
+        String[] channels = {"AX", "AY", "AZ", "GX", "GY", "GZ"};
+        StringBuilder result = new StringBuilder();
+        result.append(name).append("\n样本：").append(rows.size())
+                .append(" · 估算采样率：").append(String.format(Locale.US, "%.1f Hz", sampleRate))
+                .append("\n加速度合量主频：")
+                .append(String.format(Locale.US, "%.2f Hz", dominantFrequency));
+        for (int channel = 0; channel < 6; ++channel) {
+            result.append("\n").append(channels[channel]).append("  RMS=")
+                    .append(String.format(Locale.US, "%.4f", Math.sqrt(
+                            sumSquares[channel] / rows.size())))
+                    .append("  Peak=").append(String.format(Locale.US, "%.4f",
+                            peaks[channel]));
+        }
+        return result.toString();
+    }
+
+    private static void fft(double[] real, double[] imaginary) {
+        int size = real.length;
+        for (int index = 1, reverse = 0; index < size; ++index) {
+            int bit = size >> 1;
+            while ((reverse & bit) != 0) { reverse ^= bit; bit >>= 1; }
+            reverse ^= bit;
+            if (index < reverse) {
+                double temporary = real[index]; real[index] = real[reverse]; real[reverse] = temporary;
+                temporary = imaginary[index]; imaginary[index] = imaginary[reverse];
+                imaginary[reverse] = temporary;
+            }
+        }
+        for (int length = 2; length <= size; length <<= 1) {
+            double angle = -2 * Math.PI / length;
+            double rootReal = Math.cos(angle), rootImaginary = Math.sin(angle);
+            for (int start = 0; start < size; start += length) {
+                double unitReal = 1, unitImaginary = 0;
+                for (int offset = 0; offset < length / 2; ++offset) {
+                    int even = start + offset, odd = even + length / 2;
+                    double oddReal = real[odd] * unitReal - imaginary[odd] * unitImaginary;
+                    double oddImaginary = real[odd] * unitImaginary + imaginary[odd] * unitReal;
+                    real[odd] = real[even] - oddReal;
+                    imaginary[odd] = imaginary[even] - oddImaginary;
+                    real[even] += oddReal;
+                    imaginary[even] += oddImaginary;
+                    double nextReal = unitReal * rootReal - unitImaginary * rootImaginary;
+                    unitImaginary = unitReal * rootImaginary + unitImaginary * rootReal;
+                    unitReal = nextReal;
+                }
+            }
+        }
+    }
+
+    private void shareAnalysis() {
+        String result = preferences.getString("last_analysis", "");
+        if (result.isEmpty()) { toast("请先导入 CSV"); return; }
+        Intent share = new Intent(Intent.ACTION_SEND).setType("text/plain")
+                .putExtra(Intent.EXTRA_SUBJECT, "LabCapsule 六轴分析")
+                .putExtra(Intent.EXTRA_TEXT, result);
+        startActivity(Intent.createChooser(share, "分享分析结果"));
     }
 
     private String displayName(Uri uri) {
@@ -1154,7 +1621,50 @@ public class MainActivity extends Activity {
             pixel += run;
         }
         byte[] rle = encoded.toByteArray();
-        if (rle.length < raw.length) {
+        byte[] delta = null;
+        if (gifOptimized && previous != null && previous.length == full.length) {
+            ByteArrayOutputStream sparse = new ByteArrayOutputStream(raw.length);
+            int local = 0;
+            while (local < pixels) {
+                int skip = 0;
+                while (local < pixels) {
+                    int global = (minY + local / packet.width) * 240 +
+                            minX + local % packet.width;
+                    if (full[global] != previous[global] || skip == 65535) break;
+                    ++skip;
+                    ++local;
+                }
+                if (skip == 65535 && local < pixels) {
+                    sparse.write(0xFF); sparse.write(0xFF); sparse.write(0);
+                    continue;
+                }
+                int runStart = local;
+                int run = 0;
+                while (local < pixels && run < 255) {
+                    int global = (minY + local / packet.width) * 240 +
+                            minX + local % packet.width;
+                    if (full[global] == previous[global]) break;
+                    ++run;
+                    ++local;
+                }
+                if (run == 0) continue;
+                sparse.write(skip & 0xFF);
+                sparse.write((skip >> 8) & 0xFF);
+                sparse.write(run);
+                for (int index = 0; index < run; ++index) {
+                    int point = runStart + index;
+                    int global = (minY + point / packet.width) * 240 +
+                            minX + point % packet.width;
+                    sparse.write(full[global]);
+                }
+            }
+            delta = sparse.toByteArray();
+        }
+        if (delta != null && delta.length >= 4 && delta.length < raw.length &&
+                delta.length < rle.length) {
+            packet.data = delta;
+            packet.encoding = "delta332";
+        } else if (rle.length < raw.length) {
             packet.data = rle;
             packet.encoding = gifOptimized ? "rle332" : "rle565";
         } else {
@@ -1225,15 +1735,141 @@ public class MainActivity extends Activity {
         if (selectedMovie == null || selectedCropRect == null) {
             toast("请选择 GIF 并先确认裁剪"); return;
         }
-        if (gifStreaming) return;
+        final int transport = selectedTransport();
+        final String endpoint = baseUrl();
+        final String address = bluetoothGatt != null ? bluetoothGatt.getDevice().getAddress()
+                : preferences.getString("ble_address", "");
+        if (transport == 1 && address.isEmpty()) {
+            status("请先连接一次 BLE，让后台播放器记住设备", false); return;
+        }
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(
+                Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},
+                    REQUEST_NOTIFICATION_PERMISSION);
+        }
         gifStreaming = true;
         lastGifComparisonFrame = null;
-        status("GIF 智能流式播放：手机裁剪 + RGB332 + 差分 + RLE", true);
-        if (selectedTransport() == 1) streamNextGifFrameBle(0);
-        else {
-            String endpoint = baseUrl();
-            worker.execute(() -> streamGifWifi(selectedMovie, endpoint));
+        status("正在一次性预处理 GIF；完成后退出 APK 仍会继续播放…", true);
+        showProgress(0);
+        Intent preparing = new Intent(this, GifPlaybackService.class)
+                .setAction(GifPlaybackService.ACTION_PREPARE);
+        if (Build.VERSION.SDK_INT >= 26) startForegroundService(preparing);
+        else startService(preparing);
+        final Movie movie = selectedMovie;
+        worker.execute(() -> prepareGifClip(movie, transport, endpoint, address));
+    }
+
+    private void prepareGifClip(Movie movie, int transport, String endpoint, String address) {
+        ArrayList<MediaPacket> loopFrames = new ArrayList<>();
+        try {
+            int duration = Math.max(1000, movie.duration());
+            int baseInterval = transport == 1 ? 180 : 90;
+            int maximumFrames = transport == 1 ? 120 : 240;
+            int interval = Math.max(baseInterval,
+                    ((duration + maximumFrames * 20 - 1) / (maximumFrames * 20)) * 20);
+            int sampledFrames = Math.max(2, (duration + interval - 1) / interval);
+            Bitmap first = renderCroppedMovieFrame(movie, 0);
+            MediaPacket bootstrap = encodeMediaPacket(first, null, true);
+            byte[] firstQuantized = bootstrap.comparisonFrame;
+            byte[] previous = firstQuantized;
+            bootstrap.comparisonFrame = null;
+            first.recycle();
+            long payloadBytes = bootstrap.data.length;
+            for (int frameIndex = 1; frameIndex < sampledFrames; ++frameIndex) {
+                if (!gifStreaming) throw new IOException("用户已取消预处理");
+                Bitmap bitmap = renderCroppedMovieFrame(movie,
+                        Math.min(duration - 1, frameIndex * interval));
+                MediaPacket packet = encodeMediaPacket(bitmap, previous, true);
+                previous = packet.comparisonFrame;
+                packet.comparisonFrame = null;
+                bitmap.recycle();
+                payloadBytes += packet.data.length;
+                loopFrames.add(packet);
+                final int progress = frameIndex * 90 / sampledFrames;
+                runOnUiThread(() -> showProgress(progress));
+            }
+            Bitmap loopBitmap = renderCroppedMovieFrame(movie, 0);
+            MediaPacket loopToFirst = encodeMediaPacket(loopBitmap, previous, true);
+            loopToFirst.comparisonFrame = null;
+            loopBitmap.recycle();
+            payloadBytes += loopToFirst.data.length;
+            loopFrames.add(loopToFirst);
+
+            File directory = new File(getFilesDir(), "gif-clips");
+            if (!directory.exists() && !directory.mkdirs())
+                throw new IOException("无法创建 GIF 播放缓存");
+            File clip = new File(directory, "active.lcg");
+            try (DataOutputStream output = new DataOutputStream(new BufferedOutputStream(
+                    new FileOutputStream(clip)))) {
+                output.writeInt(GifPlaybackService.CLIP_MAGIC);
+                output.writeInt(GifPlaybackService.CLIP_VERSION);
+                output.writeInt(interval);
+                output.writeInt(loopFrames.size());
+                writeClipFrame(output, bootstrap);
+                for (MediaPacket packet : loopFrames) writeClipFrame(output, packet);
+            }
+            final long bytes = payloadBytes;
+            final int frames = sampledFrames;
+            final int frameInterval = interval;
+            runOnUiThread(() -> startGifService(clip, transport, endpoint, address,
+                    frames, frameInterval, bytes));
+        } catch (Exception error) {
+            gifStreaming = false;
+            runOnUiThread(() -> {
+                Intent stop = new Intent(this, GifPlaybackService.class)
+                        .setAction(GifPlaybackService.ACTION_STOP);
+                startService(stop);
+                status("GIF 预处理失败：" + error.getMessage(), false);
+            });
         }
+    }
+
+    private static void writeClipFrame(DataOutputStream output, MediaPacket packet)
+            throws IOException {
+        int encoding = "rgb332".equals(packet.encoding) ? 1 :
+                "rle332".equals(packet.encoding) ? 2 :
+                        "delta332".equals(packet.encoding) ? 3 : 0;
+        output.writeByte(encoding);
+        output.writeShort(packet.x);
+        output.writeShort(packet.y);
+        output.writeShort(packet.width);
+        output.writeShort(packet.height);
+        output.writeInt(packet.data == null ? 0 : packet.data.length);
+        if (packet.data != null) output.write(packet.data);
+    }
+
+    private void startGifService(File clip, int transport, String endpoint, String address,
+                                 int frames, int interval, long bytes) {
+        if (!gifStreaming) return;
+        if (transport == 1) releaseActivityBle();
+        Intent service = new Intent(this, GifPlaybackService.class)
+                .setAction(GifPlaybackService.ACTION_START)
+                .putExtra(GifPlaybackService.EXTRA_FILE, clip.getAbsolutePath())
+                .putExtra(GifPlaybackService.EXTRA_TRANSPORT, transport)
+                .putExtra(GifPlaybackService.EXTRA_ENDPOINT, endpoint)
+                .putExtra(GifPlaybackService.EXTRA_BLE_ADDRESS, address);
+        if (Build.VERSION.SDK_INT >= 26) startForegroundService(service); else startService(service);
+        gifStreaming = false;
+        String description = String.format(Locale.US,
+                "后台 GIF 已启动 · %d 帧缓存 · %.1f fps · 每轮 %,d B",
+                frames, 1000f / interval, bytes);
+        if (!isDestroyed()) {
+            showProgress(100);
+            if (mediaInfo != null)
+                mediaInfo.setText(description + "\n退出 APK 后由系统通知继续控制");
+            status(description, true);
+        }
+    }
+
+    private void releaseActivityBle() {
+        if (bluetoothGatt != null && hasBlePermissions()) {
+            preferences.edit().putString("ble_address",
+                    bluetoothGatt.getDevice().getAddress()).apply();
+            bluetoothGatt.disconnect();
+            bluetoothGatt.close();
+        }
+        bluetoothGatt = null;
+        bleReady = false;
     }
     private void streamGifWifi(Movie movie, String endpoint) {
         int duration = Math.max(1000, movie.duration());
@@ -1288,7 +1924,10 @@ public class MainActivity extends Activity {
     }
     private void stopGifStream() {
         stopGifStreamSilently();
-        status("GIF 播放已停止", true);
+        Intent stop = new Intent(this, GifPlaybackService.class)
+                .setAction(GifPlaybackService.ACTION_STOP);
+        startService(stop);
+        status("GIF 后台播放已停止", true);
     }
     private void startFirmwareUpdate() {
         if (selectedFirmware == null) { toast("请先选择固件"); return; }
@@ -1508,21 +2147,7 @@ public class MainActivity extends Activity {
         if (currentProtocol == null || currentProtocol.trim().isEmpty()) {
             toast("请先生成实验协议"); return;
         }
-        try {
-            JSONObject protocol = new JSONObject(currentProtocol);
-            int rate = protocol.getInt("sample_rate_hz");
-            int duration = protocol.getInt("duration_seconds");
-            status("正在下发实验协议…", true);
-            if (selectedTransport() == 1) {
-                writeBleCommand("START:" + rate + ":" + duration);
-            } else {
-                http("POST", "/api/experiment?rate=" + rate + "&duration=" + duration,
-                        new byte[0], "application/octet-stream",
-                        result -> status("实验已启动\n" + result, true));
-            }
-        } catch (Exception error) {
-            status("协议无法执行：" + error.getMessage(), false);
-        }
+        executeProtocol(currentProtocol);
     }
 
     private void checkForUpdates(boolean silent) {
@@ -1636,6 +2261,7 @@ public class MainActivity extends Activity {
             if (name == null || !name.startsWith("LabCapsule")) return;
             if (bleScanner != null) bleScanner.stopScan(this);
             bleScanner = null;
+            preferences.edit().putString("ble_address", device.getAddress()).apply();
             status("正在连接 " + name + "…", true);
             bluetoothGatt = device.connectGatt(MainActivity.this, false, gattCallback,
                     BluetoothDevice.TRANSPORT_LE);
@@ -1861,9 +2487,12 @@ public class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
-        gifStreaming = false;
         stopScreenMonitorSilently();
-        worker.shutdownNow();
+        // ACTION_PREPARE has already promoted the process to a foreground service. Let an
+        // in-flight one-time GIF preprocessing job finish even when the Activity is swiped
+        // away; startGifService() performs the final hand-off. The explicit Stop button sets
+        // gifStreaming=false and causes the preparation loop to cancel.
+        if (gifStreaming) worker.shutdown(); else worker.shutdownNow();
         if (bleScanner != null && hasBlePermissions()) bleScanner.stopScan(scanCallback);
         if (bluetoothGatt != null && hasBlePermissions()) {
             bluetoothGatt.disconnect();
@@ -2156,6 +2785,11 @@ public class MainActivity extends Activity {
             setLayerType(LAYER_TYPE_SOFTWARE, null);
         }
         void setItems(String[] labels) { items = labels; invalidate(); }
+        void select(int index) {
+            selected = Math.max(0, Math.min(items.length - 1, index));
+            indicator = selected;
+            invalidate();
+        }
         @Override protected void onDraw(Canvas canvas) {
             float width = getWidth(), height = getHeight();
             RectF shell = new RectF(dp(3), dp(5), width - dp(3), height - dp(5));

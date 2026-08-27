@@ -601,6 +601,8 @@ static esp_err_t media_frame_handler(httpd_req_t *request)
             if (strcmp(value, "rle565") == 0) encoding = LABCAPSULE_MEDIA_RLE565;
             else if (strcmp(value, "rgb332") == 0) encoding = LABCAPSULE_MEDIA_RGB332;
             else if (strcmp(value, "rle332") == 0) encoding = LABCAPSULE_MEDIA_RLE332;
+            else if (strcmp(value, "delta332") == 0)
+                encoding = LABCAPSULE_MEDIA_DELTA332;
         }
     }
     if (request->content_len <= 0 || request->content_len > WALLPAPER_PAYLOAD_BYTES ||
@@ -1155,6 +1157,8 @@ static int ble_access(uint16_t connection_handle, uint16_t attribute_handle,
             if (strcmp(encoding_name, "rle565") == 0) encoding = LABCAPSULE_MEDIA_RLE565;
             else if (strcmp(encoding_name, "rgb332") == 0) encoding = LABCAPSULE_MEDIA_RGB332;
             else if (strcmp(encoding_name, "rle332") == 0) encoding = LABCAPSULE_MEDIA_RLE332;
+            else if (strcmp(encoding_name, "delta332") == 0)
+                encoding = LABCAPSULE_MEDIA_DELTA332;
             if (fields >= 2 && x <= UINT16_MAX && y <= UINT16_MAX &&
                 width <= UINT16_MAX && height <= UINT16_MAX) {
                 if (strcmp(kind, "FRAME") == 0) {

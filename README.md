@@ -2,9 +2,16 @@
 
 > Ask a question. Run an experiment.
 
-LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前版本为 **V0.3.3 Alpha / Motion Experiment Prototype**，已经打通“自然语言问题 → 实验协议 → 六轴采集 → CSV/分析”的设备侧和 Android 控制链路。
+LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前版本为 **V0.4.0 Alpha / Motion Experiment Prototype**，已经打通“自然语言问题 → 实验协议 → 六轴采集 → CSV/分析”的设备侧和 Android 控制链路。
 
-## V0.3.3 已实现
+## V0.4.0 已实现
+
+- APK 主导航重构为“首页 / 实验 / 数据 / AI / 设置”：首页提供实验快捷入口，实验页负责协议与采集，数据页保存记录并分析 CSV；设备、屏幕和固件均归入设置且默认折叠。
+- 首页内置桌面振动、碰撞峰值和姿态稳定三种真实 Experiment Protocol；自定义实验支持 10–500 Hz、1–3600 秒。
+- 数据页可导入串口 CSV，计算六轴 RMS、绝对峰值，并对加速度合量执行 Hann 窗 FFT 和主频估计；实验元数据最多保存 50 条并可分享。
+- GIF 先在手机端一次性裁剪、抽帧、RGB332 量化和差分编码，缓存到 APK 私有目录；ESP32 仍不存储 GIF。
+- 新增 Android 前台播放服务、CPU 唤醒锁和 Wi-Fi 高性能锁。预处理完成后关闭或划掉 APK，GIF 仍继续播放，并可从系统常驻通知停止；系统“强行停止”应用仍会终止服务。
+- GIF 后续帧新增 `delta332` 稀疏变化编码，只发送“跳过长度 + 连续变化像素”，不再把变化矩形中的未变化像素重复发送。Wi-Fi 目标间隔 90 ms，BLE 目标间隔 180 ms，并限制缓存帧数以平衡手机内存、带宽和设备负载。
 
 - ESP32-S3 + ST7789 240×320 + MPU6050，六按键与 USB 串口控制。
 - 设备同时运行恢复热点和外部 Wi-Fi Station；配置一次后，手机可回到有互联网的正常 Wi-Fi。
@@ -12,8 +19,7 @@ LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前版本�
 - BLE 5 控制、状态、OTA、图片/壁纸二进制分片传输和 CRC32 校验。
 - 8 MiB PSRAM 双帧缓冲；画面在内存中合成后通过内部 DMA 小块覆盖，刷新不先清黑屏。
 - JPG/PNG/WebP/GIF 在 APK 中先以可拖动、双指缩放的 3:4 编辑器裁剪；原文件不会直接发给 ESP32。
-- GIF 由手机解码、RGB332 量化、变化区域检测和 RLE 压缩；未变化帧跳过，ESP32 只解压并显示当前区域，不保存 GIF。
-- 静态图片采用无损 RGB565/RLE565，GIF 首帧最坏 76,800 字节、后续仅传变化矩形，显著低于旧版每帧 153,600 字节。
+- 静态图片采用无损 RGB565/RLE565；GIF 基准帧使用 RGB332/RLE332，后续自动选择稀疏 `delta332`、RLE332 或 RGB332 中的最小结果。
 - 壁纸成为主页、设置和开发诊断页的真实底层；临时图片/GIF 也作为动态壁纸叠加 HUD，不再进入孤立的纯图片页。
 - APK 与 ST7789 使用一致的原创工业街机主题，内置街机黄黑、信号红灰、冷蓝录像三套预设。
 - 壁纸可见度、设备面板遮罩、设备 HUD/文字、APK 面板/导航玻璃均可通过 0–100 连续滑杆直接调整。
@@ -36,7 +42,7 @@ LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前版本�
    idf.py -p COM8 flash monitor
    ```
 
-2. 安装 `release/LabCapsule-0.3.3.apk`。首次进入“设备”，推荐选择：
+2. 安装 `release/LabCapsule-0.4.0.apk`。首次进入“设置 → 设备与连接”，推荐选择：
 
    - BLE：点击扫描并允许“附近设备”权限；连接成功后直接点“蓝牙一键配网”；
    - 恢复热点：只在排障时连接 `LabCapsule-XXXX`，密码 `labcapsule`，地址 `http://192.168.4.1`。
@@ -45,7 +51,7 @@ LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前版本�
 
 4. 在“AI”页填写 API Endpoint、模型和 Key，生成协议后点击“发送并开始实验”。Key 由 Android Keystore 加密，仅在手机端使用。
 
-完整操作见 [V0.3.3 蓝牙配网与连接排障](docs/V0.3.3_BLE_WIFI_QUICKSTART_ZH.md)、[V0.3.2 壁纸与界面指南](docs/V0.3.2_WALLPAPER_STYLE_GUIDE_ZH.md) 和 [V0.3.1 基础使用指南](docs/V0.3.1_USER_GUIDE_ZH.md)，系统边界与扩展方式见 [V0.3.0 架构说明](docs/V0.3.0_ARCHITECTURE.md)。
+完整操作见 [V0.4.0 实验、数据与后台 GIF 指南](docs/V0.4.0_EXPERIMENT_GIF_GUIDE_ZH.md)、[V0.3.3 蓝牙配网与连接排障](docs/V0.3.3_BLE_WIFI_QUICKSTART_ZH.md) 和 [V0.3.2 壁纸与界面指南](docs/V0.3.2_WALLPAPER_STYLE_GUIDE_ZH.md)，系统边界与扩展方式见 [V0.3.0 架构说明](docs/V0.3.0_ARCHITECTURE.md)。
 
 ## 冻结引脚
 
@@ -83,13 +89,13 @@ SPEC_V0.1.md             初始产品规格（历史基线）
 
 ## 当前实机状态
 
-2026-08-27 已在 COM8 的 ESP32-S3 rev 0.2 / 16 MiB Flash / 8 MiB Octal PSRAM 上完成 V0.3.3 构建和完整烧录。实测 BLE `STATUS` 返回恢复热点状态、`staConnected=false`、`staIp=0.0.0.0`；BLE `SENSORS` 返回 I²C `0x68`；错误外网配置四次失败后自动退回纯 AP，Windows 在不切换当前联网 Wi-Fi 的情况下重新扫描到 `LabCapsule-6625`，信号 99%。I²C 地址 `0x68` 有响应，但 `WHO_AM_I=0x70` 与标准 MPU6050 标识不一致，正式采集前仍应确认模块型号。
+2026-08-27 已在 COM8 的 ESP32-S3 rev 0.2 / 16 MiB Flash / 8 MiB Octal PSRAM 上完成 V0.4.0 构建和完整烧录，串口启动标识为 `BOOT,LABCAPSULE,0.4.0-alpha`。实测 BLE 发送 240×320 RLE332 基准帧为 604 字节，随后在 10×10 区域更新一个像素的 `delta332` 帧仅 4 字节；设备日志分别确认 `ENC=3` 与 `ENC=4`。BLE `SENSORS` 返回 I²C `0x68`，但 `WHO_AM_I=0x70` 与标准 MPU6050 标识不一致，正式采集前仍应确认模块型号。已保存的错误外网配置仍会在四次失败后退回恢复热点，这是预期保护行为。
 
 ## 安全边界
 
 - APK 中的 API Key、Wi-Fi 和 MQTT 密码使用 Android Keystore 加密保存。
 - 设备状态接口不回传密码；MQTT 支持 `mqtts://` 并使用 ESP-IDF CA 证书包。
-- 恢复热点与局域网 HTTP API 面向受信任本地网络，V0.3.3 尚未提供逐设备 HTTP 登录或云端中继服务。
+- 恢复热点与局域网 HTTP API 面向受信任本地网络，V0.4.0 尚未提供逐设备 HTTP 登录或云端中继服务。
 - Android 系统不允许普通应用静默安装 APK；自动更新会检查并下载，最终安装仍需用户确认。
 
 ## License

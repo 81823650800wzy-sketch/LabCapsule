@@ -5,13 +5,14 @@
 
 #include "esp_err.h"
 
-#define LABCAPSULE_VERSION "0.3.3-alpha"
+#define LABCAPSULE_VERSION "0.4.0-alpha"
 
 typedef enum {
     LABCAPSULE_MEDIA_RAW565 = 0,
     LABCAPSULE_MEDIA_RLE565,
     LABCAPSULE_MEDIA_RGB332,
     LABCAPSULE_MEDIA_RLE332,
+    LABCAPSULE_MEDIA_DELTA332,
 } labcapsule_media_encoding_t;
 
 /** Apply an APK/BLE/HTTP screen action such as HOME, TEST, UP or BL_ON. */

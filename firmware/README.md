@@ -1,4 +1,4 @@
-# LabCapsule ESP-IDF Firmware 0.3.3-alpha
+# LabCapsule ESP-IDF Firmware 0.4.0-alpha
 
 目标硬件：ESP32-S3，16 MiB Flash、8 MiB Octal PSRAM、ESP-IDF 5.5.4。
 
@@ -11,7 +11,7 @@ idf.py build
 idf.py -p COM8 flash monitor
 ```
 
-首次安装、从 0.1.x 升级或修改分区表时必须执行完整 `flash`。之后可以在 APK 中选择 `LabCapsule-0.3.3-ota.bin` 经 Wi-Fi/BLE 更新。不要为普通升级运行 `erase-flash`，它会清除 NVS 配置和持久壁纸。
+首次安装、从 0.1.x 升级或修改分区表时必须执行完整 `flash`。之后可以在 APK 中选择 `LabCapsule-0.4.0-ota.bin` 经 Wi-Fi/BLE 更新。不要为普通升级运行 `erase-flash`，它会清除 NVS 配置和持久壁纸。
 
 ## 分区与内存
 
@@ -49,7 +49,7 @@ idf.py -p COM8 flash monitor
 | POST | `/api/control?action=home` | 屏幕、按键和亮度动作 |
 | GET/POST | `/api/display` | 读取/保存主题和壁纸、面板、HUD 透明度 |
 | POST | `/api/experiment?rate=200&duration=20` | 校验并开始实验 |
-| POST | `/api/media/frame?duration=100&enc=rle332&x=0&y=0&w=240&h=320` | 临时整帧/局部帧，不写 Flash |
+| POST | `/api/media/frame?duration=100&enc=delta332&x=0&y=0&w=240&h=320` | 临时整帧/局部差分帧，不写 Flash |
 | POST | `/api/wallpaper` | 持久 RGB565 壁纸，固定 153600 字节 |
 | POST | `/api/ota` | ESP-IDF 应用 bin，验证后切换 OTA 槽并重启 |
 
@@ -87,7 +87,9 @@ BLE 配网命令为 `WIFI:<base64-ssid>:<base64-password>`，使用标准 Base64
 
 媒体控制帧：`BEGIN:FRAME:<size>:<duration-ms>:<crc32>:<encoding>:<x>:<y>:<w>:<h>` 或 `BEGIN:WALLPAPER:153600:0:<crc32>:raw565:0:0:240:320`，随后写入数据分片并发送 `END`。旧版四字段 FRAME 控制帧仍按完整 `raw565` 兼容。
 
-临时媒体支持 `raw565`、`rle565`、`rgb332`、`rle332`。RLE 格式使用一字节重复计数（1–255）加一个 RGB565 像素或 RGB332 像素。只有第一帧允许从任意页面提交完整区域；后续差分区域必须在媒体视图中，防止把局部数据叠到未初始化画面。
+临时媒体支持 `raw565`、`rle565`、`rgb332`、`rle332` 和 `delta332`。RLE 格式使用一字节重复计数（1–255）加一个 RGB565 像素或 RGB332 像素。`delta332` 每条记录为小端 `skip:uint16`、`run:uint8` 和 `run` 个 RGB332 像素；`run=0` 表示仅跳过，支持跨越 65,535 个未变化像素。解码器只改写动态媒体画布中的变化像素，再统一合成 HUD。只有第一帧允许从任意页面提交完整区域；后续差分区域必须在媒体视图中，防止把局部数据叠到未初始化画面。
+
+2026-08-27 的 BLE 实机验证中，240×320 单色 RLE332 基准帧为 604 字节；随后在 10×10 区域更新一个像素的 `delta332` 负载为 4 字节，串口分别记录 `ENC=3` 与 `ENC=4`。
 
 外观设置 JSON：
 
