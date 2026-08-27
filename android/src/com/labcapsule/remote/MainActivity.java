@@ -28,6 +28,7 @@ import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
+import java.util.ArrayList;
 import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
@@ -40,7 +41,7 @@ import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
 
 public class MainActivity extends Activity {
-    private static final String APP_VERSION = "0.3.1";
+    private static final String APP_VERSION = "0.3.2";
     private static final String REPOSITORY = "81823650800wzy-sketch/LabCapsule";
     private static final int REQUEST_FIRMWARE = 1001, REQUEST_MEDIA = 1002,
             REQUEST_BLE_PERMISSIONS = 1003;
@@ -53,15 +54,19 @@ public class MainActivity extends Activity {
                 "6c4300%02d-4c61-6243-6170-73756c650001", id));
     }
 
-    private static final int INK = Color.rgb(23, 31, 48), MUTED = Color.rgb(94, 108, 133),
-            BLUE = Color.rgb(54, 112, 255), GREEN = Color.rgb(26, 153, 112),
-            RED = Color.rgb(211, 69, 82);
+    private static int INK = Color.rgb(247, 243, 224), MUTED = Color.rgb(169, 166, 151),
+            BLUE = Color.rgb(246, 216, 14), GREEN = Color.rgb(77, 220, 143),
+            RED = Color.rgb(255, 76, 68), CANVAS = Color.rgb(14, 14, 15),
+            PANEL = Color.rgb(25, 25, 24), SECONDARY = Color.rgb(255, 76, 68);
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private SharedPreferences preferences;
     private SecureStore secureStore;
     private FrameLayout content;
+    private ArcadeBackdrop arcadeBackdrop;
+    private LiquidNavBar navigationBar;
+    private final ArrayList<LinearLayout> themedCards = new ArrayList<>();
     private TextView globalStatus, mediaInfo, firmwareInfo, updateInfo, aiResult,
             externalWifiState, externalWifiIp, externalWifiHint;
     private ProgressBar globalProgress;
@@ -81,6 +86,9 @@ public class MainActivity extends Activity {
     private volatile boolean gifStreaming;
     private String latestApkUrl, latestFirmwareUrl;
     private String currentProtocol;
+    private int currentSection, visualPreset, wallpaperOpacity, panelOpacity,
+            hudOpacity, appGlassOpacity;
+    private final Runnable styleSyncRunnable = () -> sendVisualStyle(false);
 
     private BluetoothAdapter bluetoothAdapter;
     private BluetoothLeScanner bleScanner;
@@ -98,13 +106,18 @@ public class MainActivity extends Activity {
         super.onCreate(state);
         preferences = getSharedPreferences("labcapsule", MODE_PRIVATE);
         secureStore = new SecureStore();
+        visualPreset = preferences.getInt("visual_preset", 0);
+        wallpaperOpacity = preferences.getInt("wallpaper_opacity", 82);
+        panelOpacity = preferences.getInt("panel_opacity", 76);
+        hudOpacity = preferences.getInt("hud_opacity", 100);
+        appGlassOpacity = preferences.getInt("app_glass_opacity", 86);
+        applyThemePalette(visualPreset);
         Window window = getWindow();
         window.setStatusBarColor(Color.TRANSPARENT);
         window.setNavigationBarColor(Color.TRANSPARENT);
         window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
         if (Build.VERSION.SDK_INT >= 23) window.getDecorView().setSystemUiVisibility(
-                View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LAYOUT_STABLE |
-                        View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN);
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN);
         BluetoothManager manager = (BluetoothManager) getSystemService(BLUETOOTH_SERVICE);
         bluetoothAdapter = manager == null ? null : manager.getAdapter();
         buildShell();
@@ -114,23 +127,25 @@ public class MainActivity extends Activity {
 
     private void buildShell() {
         FrameLayout root = new FrameLayout(this);
-        root.setBackground(new GradientDrawable(GradientDrawable.Orientation.TL_BR,
-                new int[]{Color.rgb(232, 243, 255), Color.WHITE, Color.rgb(246, 239, 255)}));
+        arcadeBackdrop = new ArcadeBackdrop(this);
+        root.addView(arcadeBackdrop, new FrameLayout.LayoutParams(-1, -1));
         content = new FrameLayout(this);
         FrameLayout.LayoutParams cp = new FrameLayout.LayoutParams(-1, -1);
         cp.bottomMargin = dp(102);
         root.addView(content, cp);
-        LiquidNavBar navigation = new LiquidNavBar(this);
-        navigation.setItems(new String[]{"设备", "屏幕", "实验", "AI", "设置"});
-        navigation.listener = this::showSection;
+        navigationBar = new LiquidNavBar(this);
+        navigationBar.setItems(new String[]{"设备", "屏幕", "实验", "AI", "设置"});
+        navigationBar.listener = this::showSection;
         FrameLayout.LayoutParams np = new FrameLayout.LayoutParams(-1, dp(82), Gravity.BOTTOM);
         np.setMargins(dp(14), 0, dp(14), dp(14));
-        root.addView(navigation, np);
+        root.addView(navigationBar, np);
         setContentView(root);
     }
 
     private void showSection(int index) {
         gifStreaming = false;
+        currentSection = index;
+        themedCards.clear();
         View page = index == 0 ? buildDevicePage() : index == 1 ? buildScreenPage()
                 : index == 2 ? buildExperimentPage() : index == 3 ? buildAiPage()
                 : buildSettingsPage();
@@ -141,6 +156,33 @@ public class MainActivity extends Activity {
         page.animate().alpha(1).translationY(0).setDuration(280).start();
     }
 
+    private void applyThemePalette(int preset) {
+        visualPreset = Math.max(0, Math.min(2, preset));
+        if (visualPreset == 1) {
+            CANVAS = Color.rgb(22, 10, 13); PANEL = Color.rgb(31, 20, 21);
+            BLUE = Color.rgb(255, 76, 68); SECONDARY = Color.rgb(246, 216, 14);
+            INK = Color.rgb(248, 242, 222); MUTED = Color.rgb(176, 157, 151);
+        } else if (visualPreset == 2) {
+            CANVAS = Color.rgb(5, 18, 24); PANEL = Color.rgb(8, 30, 37);
+            BLUE = Color.rgb(40, 224, 230); SECONDARY = Color.rgb(190, 241, 57);
+            INK = Color.rgb(235, 250, 244); MUTED = Color.rgb(126, 174, 179);
+        } else {
+            CANVAS = Color.rgb(14, 14, 15); PANEL = Color.rgb(25, 25, 24);
+            BLUE = Color.rgb(246, 216, 14); SECONDARY = Color.rgb(255, 76, 68);
+            INK = Color.rgb(247, 243, 224); MUTED = Color.rgb(169, 166, 151);
+        }
+    }
+
+    private void refreshThemeSurfaces() {
+        for (LinearLayout card : themedCards) card.setBackground(cardBackground());
+        if (arcadeBackdrop != null) arcadeBackdrop.invalidate();
+        if (navigationBar != null) navigationBar.invalidate();
+        if (mediaPreview instanceof WallpaperPreview) {
+            ((WallpaperPreview) mediaPreview).setStyle(visualPreset, wallpaperOpacity,
+                    panelOpacity, hudOpacity);
+        }
+    }
+
     private ScrollView page(String title, String subtitle) {
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
@@ -148,14 +190,19 @@ public class MainActivity extends Activity {
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(dp(18), dp(48), dp(18), dp(28));
         scroll.addView(root);
+        TextView eyebrow = label("// FIELD CONSOLE · 03", 11, BLUE, true);
+        eyebrow.setLetterSpacing(.12f);
+        eyebrow.setPadding(0, 0, 0, dp(5));
+        root.addView(eyebrow);
         root.addView(label(title, 31, INK, true));
         TextView sub = label(subtitle, 14, MUTED, false);
         sub.setPadding(0, dp(3), 0, dp(16));
         root.addView(sub);
         globalStatus = label("就绪", 13, MUTED, false);
         globalStatus.setPadding(dp(12), dp(10), dp(12), dp(10));
-        globalStatus.setBackground(roundRect(Color.argb(150, 255, 255, 255), 15,
-                Color.argb(45, 80, 110, 170)));
+        globalStatus.setBackground(roundRect(Color.argb(205, Color.red(PANEL),
+                Color.green(PANEL), Color.blue(PANEL)), 8,
+                Color.argb(150, Color.red(BLUE), Color.green(BLUE), Color.blue(BLUE))));
         root.addView(globalStatus, matchWrap(dp(10)));
         globalProgress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         globalProgress.setMax(100);
@@ -170,10 +217,10 @@ public class MainActivity extends Activity {
     private View buildDevicePage() {
         ScrollView page = page("LabCapsule", "一个可扩展、可联网的实验实体小组件");
         LinearLayout root = pageRoot(page);
-        LinearLayout hero = card(root, new int[]{Color.rgb(40, 92, 240), Color.rgb(126, 77, 255)});
-        hero.addView(label("●  等待连接", 22, Color.WHITE, true));
+        LinearLayout hero = card(root, new int[]{BLUE, SECONDARY});
+        hero.addView(label("●  FIELD LINK / 等待连接", 22, Color.rgb(16, 16, 16), true));
         TextView hint = label("局域网、远程 MQTT 与 BLE 三种通道可并行使用", 13,
-                Color.argb(220, 255, 255, 255), false);
+                Color.argb(220, 16, 16, 16), false);
         hint.setPadding(0, dp(7), 0, dp(6));
         hero.addView(hint);
         LinearLayout connection = card(root, null);
@@ -216,33 +263,76 @@ public class MainActivity extends Activity {
     }
 
     private View buildScreenPage() {
-        ScrollView page = page("屏幕与媒体", "静态壁纸、无落盘图片与 GIF 流式播放");
+        ScrollView page = page("屏幕与壁纸", "壁纸是所有设备页面的底层，HUD 始终叠加显示");
         LinearLayout root = pageRoot(page);
         LinearLayout media = card(root, null);
-        section(media, "媒体工作台", "先触控裁剪；GIF 在手机端量化、差分和压缩");
-        mediaPreview = new ImageView(this);
+        section(media, "壁纸工作台", "先裁剪，再预览壁纸与设备界面的最终合成效果");
+        mediaPreview = new WallpaperPreview(this);
         mediaPreview.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        mediaPreview.setBackground(roundRect(Color.rgb(225, 232, 244), 18, Color.TRANSPARENT));
-        media.addView(mediaPreview, new LinearLayout.LayoutParams(-1, dp(230)));
-        mediaInfo = label("选择媒体后必须确认 3:4 裁剪区域", 13, MUTED, false);
+        ((WallpaperPreview) mediaPreview).setStyle(visualPreset, wallpaperOpacity,
+                panelOpacity, hudOpacity);
+        mediaPreview.setBackground(roundRect(CANVAS, 10, BLUE));
+        media.addView(mediaPreview, new LinearLayout.LayoutParams(-1, dp(300)));
+        mediaInfo = label("选择媒体后确认 3:4 裁剪；预览中的字卡不会写入壁纸文件", 13,
+                MUTED, false);
         mediaInfo.setPadding(0, dp(9), 0, dp(4));
         media.addView(mediaInfo);
         transportSpinner = spinner(new String[]{"局域网 / Wi‑Fi", "Bluetooth LE"});
         transportSpinner.setSelection(preferences.getInt("transport", 0));
         media.addView(transportSpinner, matchWrap(dp(4)));
-        media.addView(row(button("选择并裁剪", true, v -> chooseMedia()),
+        media.addView(row(button("选择并裁剪", false, v -> chooseMedia()),
                 button("重新裁剪", false, v -> reopenCropEditor()),
-                button("显示单帧", false, v -> sendSelectedFrame())));
-        media.addView(row(button("保存壁纸", false, v -> saveWallpaper()),
+                button("设为设备壁纸", true, v -> saveWallpaper())));
+        media.addView(row(button("临时单帧", false, v -> sendSelectedFrame()),
                 button("播放 GIF", true, v -> startGifStream()),
                 button("停止播放", false, v -> stopGifStream())));
+
+        LinearLayout appearance = card(root, null);
+        section(appearance, "界面混合台", "所有滑杆均为 0–100 连续调节，预览立即更新");
+        Spinner preset = spinner(new String[]{"街机黄黑", "信号红灰", "冷蓝录像"});
+        preset.setSelection(visualPreset);
+        preset.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(AdapterView<?> parent, View view,
+                                                  int position, long id) {
+                if (position == visualPreset) return;
+                applyThemePalette(position);
+                preferences.edit().putInt("visual_preset", visualPreset).apply();
+                scheduleVisualStyleSync();
+                mainHandler.post(() -> showSection(currentSection));
+            }
+            @Override public void onNothingSelected(AdapterView<?> parent) { }
+        });
+        appearance.addView(preset, matchWrap(0));
+        addOpacitySlider(appearance, "壁纸可见度", wallpaperOpacity, value -> {
+            wallpaperOpacity = value;
+            preferences.edit().putInt("wallpaper_opacity", value).apply();
+            refreshThemeSurfaces(); scheduleVisualStyleSync();
+        });
+        addOpacitySlider(appearance, "设备面板遮罩", panelOpacity, value -> {
+            panelOpacity = value;
+            preferences.edit().putInt("panel_opacity", value).apply();
+            refreshThemeSurfaces(); scheduleVisualStyleSync();
+        });
+        addOpacitySlider(appearance, "设备 HUD / 文字", hudOpacity, value -> {
+            hudOpacity = value;
+            preferences.edit().putInt("hud_opacity", value).apply();
+            refreshThemeSurfaces(); scheduleVisualStyleSync();
+        });
+        addOpacitySlider(appearance, "APK 面板 / 导航玻璃", appGlassOpacity, value -> {
+            appGlassOpacity = value;
+            preferences.edit().putInt("app_glass_opacity", value).apply();
+            refreshThemeSurfaces();
+        });
+        appearance.addView(button("立即同步到设备", true,
+                v -> sendVisualStyle(true)), matchWrap(dp(8)));
+
         LinearLayout remote = card(root, null);
-        section(remote, "屏幕遥控", "双缓冲切换不会先清黑屏");
+        section(remote, "屏幕遥控", "壁纸留在底层；双缓冲切换不会先清黑屏");
         remote.addView(row(button("主页", false, v -> sendAction("home")),
                 button("设置", false, v -> sendAction("settings")),
                 button("开发诊断", false, v -> sendAction("developer"))));
         remote.addView(row(button("彩条", false, v -> sendAction("test")),
-                button("壁纸", false, v -> sendAction("wallpaper")),
+                button("壁纸主页", false, v -> sendAction("wallpaper")),
                 button("颜色反转", false, v -> sendAction("invert"))));
         remote.addView(row(button("背光开", true, v -> sendAction("bl_on")),
                 button("背光关", false, v -> sendAction("bl_off"))));
@@ -343,22 +433,90 @@ public class MainActivity extends Activity {
         updates.addView(row(button("检查更新", false, v -> checkForUpdates(false)),
                 button("下载新版 APK", true, v -> downloadLatestApk())));
         LinearLayout about = card(root, null);
-        section(about, "关于", "LabCapsule V0.3 · Motion Experiment Prototype");
+        section(about, "关于", "LabCapsule V0.3.2 · Motion Experiment Prototype");
         about.addView(label("默认语言：简体中文\n协议：HTTP + MQTT + BLE GATT\n屏幕：240×320 RGB565 双缓冲\n仓库：github.com/" + REPOSITORY, 13, MUTED, false));
         return page;
+    }
+
+    private void addOpacitySlider(LinearLayout parent, String title, int initial,
+                                  IntValueListener listener) {
+        TextView valueLabel = label(title + "  " + initial + "%", 13, INK, true);
+        valueLabel.setPadding(0, dp(10), 0, 0);
+        parent.addView(valueLabel);
+        SeekBar slider = new SeekBar(this);
+        slider.setMax(100);
+        slider.setProgress(initial);
+        if (Build.VERSION.SDK_INT >= 21) {
+            slider.getProgressDrawable().setTint(BLUE);
+            slider.getThumb().setTint(SECONDARY);
+        }
+        slider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar seekBar, int progress,
+                                                     boolean fromUser) {
+                valueLabel.setText(title + "  " + progress + "%");
+                if (fromUser) listener.changed(progress);
+            }
+            @Override public void onStartTrackingTouch(SeekBar seekBar) { }
+            @Override public void onStopTrackingTouch(SeekBar seekBar) { }
+        });
+        parent.addView(slider, matchWrap(0));
+    }
+
+    private void scheduleVisualStyleSync() {
+        mainHandler.removeCallbacks(styleSyncRunnable);
+        mainHandler.postDelayed(styleSyncRunnable, 220);
+    }
+
+    private void sendVisualStyle(boolean notifyUser) {
+        int preset = visualPreset, wallpaper = wallpaperOpacity, panel = panelOpacity,
+                hud = hudOpacity;
+        if (selectedTransport() == 1) {
+            if (!bleReady) {
+                if (notifyUser) status("请先连接 BLE", false);
+                return;
+            }
+            writeBleCommand(String.format(Locale.US, "STYLE:%d:%d:%d:%d", preset,
+                    wallpaper, panel, hud));
+            if (notifyUser) status("外观参数已通过 BLE 同步", true);
+            return;
+        }
+        String endpoint = baseUrl() + "/api/display";
+        worker.execute(() -> {
+            try {
+                JSONObject style = new JSONObject().put("preset", preset)
+                        .put("wallpaperOpacity", wallpaper).put("panelOpacity", panel)
+                        .put("hudOpacity", hud);
+                String response = httpBlocking("POST", endpoint,
+                        style.toString().getBytes(StandardCharsets.UTF_8),
+                        "application/json", 12000);
+                if (notifyUser) runOnUiThread(() -> status(
+                        "外观参数已同步到设备\n" + response, true));
+            } catch (Exception error) {
+                if (notifyUser) runOnUiThread(() -> status(
+                        "外观同步失败：" + error.getMessage(), false));
+            }
+        });
     }
 
     private LinearLayout card(LinearLayout parent, int[] gradient) {
         LinearLayout value = new LinearLayout(this);
         value.setOrientation(LinearLayout.VERTICAL);
         value.setPadding(dp(16), dp(16), dp(16), dp(16));
-        GradientDrawable bg = gradient == null ? roundRect(Color.argb(218, 255, 255, 255),
-                22, Color.argb(42, 70, 90, 140))
+        GradientDrawable bg = gradient == null ? cardBackground()
                 : new GradientDrawable(GradientDrawable.Orientation.TL_BR, gradient);
-        bg.setCornerRadius(dp(22));
+        bg.setCornerRadius(dp(12));
+        bg.setAlpha(appGlassOpacity * 255 / 100);
         value.setBackground(bg);
+        if (gradient == null) themedCards.add(value);
         parent.addView(value, matchWrap(dp(13)));
         return value;
+    }
+
+    private GradientDrawable cardBackground() {
+        GradientDrawable background = roundRect(PANEL, 12,
+                Color.argb(145, Color.red(BLUE), Color.green(BLUE), Color.blue(BLUE)));
+        background.setAlpha(appGlassOpacity * 255 / 100);
+        return background;
     }
 
     private void section(LinearLayout parent, String title, String subtitle) {
@@ -387,8 +545,8 @@ public class MainActivity extends Activity {
         view.setTextSize(14);
         view.setSingleLine(true);
         view.setPadding(dp(13), 0, dp(13), 0);
-        view.setBackground(roundRect(Color.argb(150, 240, 245, 253), 14,
-                Color.argb(35, 55, 80, 140)));
+        view.setBackground(roundRect(Color.argb(235, 245, 241, 219), 8,
+                Color.argb(190, Color.red(BLUE), Color.green(BLUE), Color.blue(BLUE))));
         if (password) view.setInputType(0x00000081);
         return view;
     }
@@ -397,8 +555,8 @@ public class MainActivity extends Activity {
         Spinner spinner = new Spinner(this);
         spinner.setAdapter(new ArrayAdapter<>(this,
                 android.R.layout.simple_spinner_dropdown_item, items));
-        spinner.setBackground(roundRect(Color.argb(150, 240, 245, 253), 14,
-                Color.argb(35, 55, 80, 140)));
+        spinner.setBackground(roundRect(Color.argb(235, 245, 241, 219), 8,
+                Color.argb(190, Color.red(BLUE), Color.green(BLUE), Color.blue(BLUE))));
         return spinner;
     }
 
@@ -416,9 +574,11 @@ public class MainActivity extends Activity {
         button.setText(text);
         button.setTextSize(13);
         button.setAllCaps(false);
-        button.setTextColor(primary ? Color.WHITE : INK);
-        button.setBackground(roundRect(primary ? BLUE : Color.argb(165, 236, 242, 252),
-                15, primary ? Color.TRANSPARENT : Color.argb(35, 55, 80, 140)));
+        button.setTextColor(primary ? Color.rgb(16, 16, 16) : INK);
+        button.setBackground(roundRect(primary ? BLUE : Color.argb(225,
+                        Color.red(PANEL), Color.green(PANEL), Color.blue(PANEL)),
+                8, primary ? Color.TRANSPARENT : Color.argb(160, Color.red(MUTED),
+                        Color.green(MUTED), Color.blue(MUTED))));
         button.setOnClickListener(listener);
         button.setStateListAnimator(null);
         return button;
@@ -540,6 +700,22 @@ public class MainActivity extends Activity {
                         network.optBoolean("staConnected"),
                         network.optString("staIp", "0.0.0.0"),
                         network.optString("recoveryAp", "LabCapsule"));
+                JSONObject device = root.optJSONObject("device");
+                JSONObject style = device == null ? null : device.optJSONObject("style");
+                if (style != null) {
+                    int previousPreset = visualPreset;
+                    applyThemePalette(style.optInt("preset", visualPreset));
+                    wallpaperOpacity = style.optInt("wallpaperOpacity", wallpaperOpacity);
+                    panelOpacity = style.optInt("panelOpacity", panelOpacity);
+                    hudOpacity = style.optInt("hudOpacity", hudOpacity);
+                    preferences.edit().putInt("visual_preset", visualPreset)
+                            .putInt("wallpaper_opacity", wallpaperOpacity)
+                            .putInt("panel_opacity", panelOpacity)
+                            .putInt("hud_opacity", hudOpacity).apply();
+                    refreshThemeSurfaces();
+                    if (previousPreset != visualPreset)
+                        mainHandler.post(() -> showSection(currentSection));
+                }
                 status("设备在线 · 网络状态已刷新", true);
             } catch (Exception error) {
                 status("设备在线，但状态格式无法解析：" + error.getMessage(), false);
@@ -688,9 +864,9 @@ public class MainActivity extends Activity {
                     selectedPreview = preview;
                     lastGifComparisonFrame = null;
                     if (mediaPreview != null) mediaPreview.setImageBitmap(preview);
-                    if (mediaInfo != null) mediaInfo.setText(name + " · 已裁剪 240×320 · " +
-                            (movie == null ? "静态高质量" : "GIF 智能压缩"));
-                    status("裁剪已确认，现在可以传输", true);
+                    if (mediaInfo != null) mediaInfo.setText(name + " · 壁纸裁剪 240×320 · " +
+                            (movie == null ? "RGB565 持久壁纸" : "GIF 智能流媒体"));
+                    status("裁剪已确认；当前显示的是壁纸 + HUD 合成预览", true);
                 }).create();
         cropDialog.setOnShowListener(dialog -> cropDialog.getButton(AlertDialog.BUTTON_NEUTRAL)
                 .setOnClickListener(v -> editor.resetImage()));
@@ -882,12 +1058,14 @@ public class MainActivity extends Activity {
         worker.execute(() -> {
             byte[] data = bitmapToRgb565(frame);
             if (transport == 1) runOnUiThread(() ->
-                    startBleFile("WALLPAPER", data, 0, null));
+                    startBleFile("WALLPAPER", data, 0,
+                            () -> status("壁纸已保存，并作为设备界面底层", true)));
             else {
                 try {
                     String response = httpBlocking("POST", endpoint + "/api/wallpaper",
                             data, "application/octet-stream", 45000);
-                    runOnUiThread(() -> status("壁纸已保存\n" + response, true));
+                    runOnUiThread(() -> status("壁纸已保存，并作为设备界面底层\n" +
+                            response, true));
                 } catch (Exception error) {
                     runOnUiThread(() -> status("壁纸上传失败：" + error.getMessage(), false));
                 }
@@ -1431,6 +1609,88 @@ public class MainActivity extends Activity {
         super.onDestroy();
     }
 
+    private final class ArcadeBackdrop extends View {
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        ArcadeBackdrop(Context context) { super(context); }
+        @Override protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            canvas.drawColor(CANVAS);
+            paint.setStrokeWidth(dp(1));
+            paint.setColor(Color.argb(26, Color.red(MUTED), Color.green(MUTED),
+                    Color.blue(MUTED)));
+            for (int x = -getHeight(); x < getWidth(); x += dp(34)) {
+                canvas.drawLine(x, 0, x + getHeight(), getHeight(), paint);
+            }
+            paint.setColor(Color.argb(225, Color.red(BLUE), Color.green(BLUE),
+                    Color.blue(BLUE)));
+            canvas.drawRect(0, dp(24), getWidth() * .42f, dp(31), paint);
+            paint.setColor(Color.argb(210, Color.red(SECONDARY), Color.green(SECONDARY),
+                    Color.blue(SECONDARY)));
+            canvas.drawRect(getWidth() * .72f, getHeight() - dp(120), getWidth(),
+                    getHeight() - dp(110), paint);
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(dp(2));
+            paint.setColor(Color.argb(70, Color.red(BLUE), Color.green(BLUE),
+                    Color.blue(BLUE)));
+            canvas.drawRect(dp(9), dp(38), getWidth() - dp(9), getHeight() - dp(10), paint);
+            paint.setStyle(Paint.Style.FILL);
+        }
+    }
+
+    private final class WallpaperPreview extends ImageView {
+        private final Paint hudPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private int previewPanelOpacity = 76, previewHudOpacity = 100;
+        WallpaperPreview(Context context) {
+            super(context);
+            setLayerType(LAYER_TYPE_SOFTWARE, null);
+        }
+        void setStyle(int preset, int wallpaper, int panel, int hud) {
+            previewPanelOpacity = panel;
+            previewHudOpacity = hud;
+            setImageAlpha(wallpaper * 255 / 100);
+            invalidate();
+        }
+        private int alphaColor(int color, int percent) {
+            return Color.argb(percent * 255 / 100, Color.red(color), Color.green(color),
+                    Color.blue(color));
+        }
+        private void hudText(Canvas canvas, String text, float x, float y, float size,
+                             int color, boolean bold) {
+            hudPaint.setColor(alphaColor(color, previewHudOpacity));
+            hudPaint.setTextSize(size);
+            hudPaint.setTypeface(bold ? Typeface.DEFAULT_BOLD : Typeface.MONOSPACE);
+            canvas.drawText(text, x, y, hudPaint);
+        }
+        @Override protected void onDraw(Canvas canvas) {
+            canvas.drawColor(CANVAS);
+            super.onDraw(canvas);
+            float sx = getWidth() / 240f, sy = getHeight() / 320f;
+            canvas.save();
+            canvas.scale(sx, sy);
+            hudPaint.setColor(alphaColor(PANEL, previewPanelOpacity));
+            canvas.drawRoundRect(new RectF(0, 0, 240, 116), 0, 0, hudPaint);
+            canvas.drawRoundRect(new RectF(12, 128, 228, 190), 8, 8, hudPaint);
+            canvas.drawRoundRect(new RectF(12, 202, 228, 302), 8, 8, hudPaint);
+            for (int x = 0; x < 240; x += 30) {
+                hudPaint.setColor(alphaColor(x % 60 == 0 ? BLUE : SECONDARY,
+                        previewHudOpacity));
+                canvas.drawRect(x, 0, x + 18, 8, hudPaint);
+            }
+            hudPaint.setColor(alphaColor(BLUE, previewHudOpacity));
+            canvas.drawRoundRect(new RectF(16, 22, 60, 43), 3, 3, hudPaint);
+            hudText(canvas, "LC", 25, 38, 14, CANVAS, true);
+            hudText(canvas, "LAB CAPSULE", 70, 42, 20, INK, true);
+            hudText(canvas, "FIELD UNIT 01", 18, 80, 11, MUTED, false);
+            hudPaint.setColor(alphaColor(BLUE, previewHudOpacity));
+            canvas.drawRect(18, 104, 222, 107, hudPaint);
+            hudText(canvas, "READY", 24, 173, 28, BLUE, true);
+            hudText(canvas, "MPU LINK / STANDBY", 24, 234, 13, INK, true);
+            hudText(canvas, "SENSOR MODE", 24, 266, 12, MUTED, false);
+            hudText(canvas, "200HZ  10SEC", 24, 294, 12, INK, true);
+            canvas.restore();
+        }
+    }
+
     private static final class CropImageView extends View {
         private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG |
                 Paint.FILTER_BITMAP_FLAG);
@@ -1613,8 +1873,9 @@ public class MainActivity extends Activity {
         @Override protected void onDraw(Canvas canvas) {
             float width = getWidth(), height = getHeight();
             RectF shell = new RectF(dp(3), dp(5), width - dp(3), height - dp(5));
-            paint.setColor(Color.argb(205, 255, 255, 255));
-            paint.setShadowLayer(dp(18), 0, dp(7), Color.argb(42, 55, 70, 120));
+            paint.setColor(Color.argb(appGlassOpacity * 255 / 100, Color.red(PANEL),
+                    Color.green(PANEL), Color.blue(PANEL)));
+            paint.setShadowLayer(dp(18), 0, dp(7), Color.argb(125, 0, 0, 0));
             canvas.drawRoundRect(shell, dp(28), dp(28), paint);
             paint.clearShadowLayer();
             if (items.length == 0) return;
@@ -1622,8 +1883,10 @@ public class MainActivity extends Activity {
             float center = (indicator + .5f) * cell;
             paint.setShader(new LinearGradient(center - cell * .42f, 0,
                     center + cell * .42f, height,
-                    new int[]{Color.argb(225, 60, 140, 255),
-                            Color.argb(225, 142, 75, 255)}, null, Shader.TileMode.CLAMP));
+                    new int[]{Color.argb(240, Color.red(BLUE), Color.green(BLUE),
+                            Color.blue(BLUE)), Color.argb(240, Color.red(SECONDARY),
+                            Color.green(SECONDARY), Color.blue(SECONDARY))}, null,
+                    Shader.TileMode.CLAMP));
             canvas.drawRoundRect(new RectF(center - cell * .42f, dp(10),
                     center + cell * .42f, height - dp(10)), dp(24), dp(24), paint);
             paint.setShader(null);
@@ -1632,11 +1895,11 @@ public class MainActivity extends Activity {
             for (int i = 0; i < items.length; ++i) {
                 boolean active = i == selected;
                 paint.setTextSize(dp(active ? 14 : 13));
-                paint.setColor(active ? Color.WHITE : MUTED);
+                paint.setColor(active ? Color.rgb(16, 16, 16) : MUTED);
                 canvas.drawText(items[i], (i + .5f) * cell,
                         height * .56f + (active ? dp(1) : dp(4)), paint);
                 if (active) {
-                    paint.setColor(Color.argb(150, 255, 255, 255));
+                    paint.setColor(Color.argb(180, 16, 16, 16));
                     canvas.drawCircle((i + .5f) * cell, height * .75f, dp(2), paint);
                 }
             }
@@ -1661,5 +1924,6 @@ public class MainActivity extends Activity {
             return true;
         }
     }
+    private interface IntValueListener { void changed(int value); }
     private interface SelectionListener { void changed(int index); }
 }

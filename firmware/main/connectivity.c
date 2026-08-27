@@ -416,6 +416,75 @@ static esp_err_t network_handler(httpd_req_t *request)
                      "{\"ok\":true,\"message\":\"saved; station connecting\"}");
 }
 
+static esp_err_t display_config_handler(httpd_req_t *request)
+{
+    if (request->method == HTTP_GET) {
+        char status[384];
+        labcapsule_build_status_json(status, sizeof(status));
+        return http_json(request, NULL, status);
+    }
+    if (request->content_len <= 0 || request->content_len >= 384) {
+        return http_json(request, "400 Bad Request",
+                         "{\"ok\":false,\"error\":\"missing display style\"}");
+    }
+    char body[384];
+    size_t received_total = 0;
+    while (received_total < (size_t)request->content_len) {
+        int received = httpd_req_recv(request, body + received_total,
+                                      request->content_len - received_total);
+        if (received == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (received <= 0) return ESP_FAIL;
+        received_total += (size_t)received;
+    }
+    body[received_total] = '\0';
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        return http_json(request, "400 Bad Request",
+                         "{\"ok\":false,\"error\":\"invalid JSON\"}");
+    }
+    labcapsule_config_t config = *device_config_get();
+    bool invalid = false;
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, "preset");
+    if (cJSON_IsNumber(item)) {
+        invalid = item->valueint < 0 || item->valueint > 2;
+        if (!invalid) config.visual_preset = (uint8_t)item->valueint;
+    }
+    item = cJSON_GetObjectItemCaseSensitive(root, "wallpaperOpacity");
+    if (cJSON_IsNumber(item)) {
+        invalid = invalid || item->valueint < 0 || item->valueint > 100;
+        if (item->valueint >= 0 && item->valueint <= 100)
+            config.wallpaper_opacity = (uint8_t)item->valueint;
+    }
+    item = cJSON_GetObjectItemCaseSensitive(root, "panelOpacity");
+    if (cJSON_IsNumber(item)) {
+        invalid = invalid || item->valueint < 0 || item->valueint > 100;
+        if (item->valueint >= 0 && item->valueint <= 100)
+            config.panel_opacity = (uint8_t)item->valueint;
+    }
+    item = cJSON_GetObjectItemCaseSensitive(root, "hudOpacity");
+    if (cJSON_IsNumber(item)) {
+        invalid = invalid || item->valueint < 0 || item->valueint > 100;
+        if (item->valueint >= 0 && item->valueint <= 100)
+            config.hud_opacity = (uint8_t)item->valueint;
+    }
+    cJSON_Delete(root);
+    if (invalid || config.visual_preset > 2 || config.wallpaper_opacity > 100 ||
+        config.panel_opacity > 100 || config.hud_opacity > 100 ||
+        device_config_save(&config) != ESP_OK ||
+        labcapsule_set_visual_style(config.visual_preset, config.wallpaper_opacity,
+                                    config.panel_opacity, config.hud_opacity) != ESP_OK) {
+        return http_json(request, "400 Bad Request",
+                         "{\"ok\":false,\"error\":\"style values out of range\"}");
+    }
+    char response[192];
+    snprintf(response, sizeof(response),
+             "{\"ok\":true,\"preset\":%u,\"wallpaperOpacity\":%u,"
+             "\"panelOpacity\":%u,\"hudOpacity\":%u}",
+             (unsigned)config.visual_preset, (unsigned)config.wallpaper_opacity,
+             (unsigned)config.panel_opacity, (unsigned)config.hud_opacity);
+    return http_json(request, NULL, response);
+}
+
 static esp_err_t sensors_handler(httpd_req_t *request)
 {
     char sensors[1600];
@@ -633,7 +702,7 @@ static esp_err_t http_server_start(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.stack_size = 8192;
-    config.max_uri_handlers = 12;
+    config.max_uri_handlers = 14;
     httpd_handle_t server = NULL;
     ESP_RETURN_ON_ERROR(httpd_start(&server, &config), TAG, "HTTP server start failed");
 
@@ -655,6 +724,12 @@ static esp_err_t http_server_start(void)
     const httpd_uri_t network_post_uri = {
         .uri = "/api/network", .method = HTTP_POST, .handler = network_handler,
     };
+    const httpd_uri_t display_get_uri = {
+        .uri = "/api/display", .method = HTTP_GET, .handler = display_config_handler,
+    };
+    const httpd_uri_t display_post_uri = {
+        .uri = "/api/display", .method = HTTP_POST, .handler = display_config_handler,
+    };
     const httpd_uri_t sensors_uri = {
         .uri = "/api/sensors", .method = HTTP_GET, .handler = sensors_handler,
     };
@@ -673,6 +748,8 @@ static esp_err_t http_server_start(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &ota_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &network_get_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &network_post_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &display_get_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &display_post_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &sensors_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &media_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &experiment_uri));
@@ -849,6 +926,23 @@ static int ble_access(uint16_t connection_handle, uint16_t attribute_handle,
         char response[96];
         if (labcapsule_remote_action(command, response, sizeof(response)) != ESP_OK) {
             return BLE_ATT_ERR_UNLIKELY;
+        }
+        if (strncmp(command, "STYLE:", 6) == 0) {
+            unsigned preset = 0, wallpaper_opacity = 0, panel_opacity = 0,
+                     hud_opacity = 0;
+            if (sscanf(command + 6, "%u:%u:%u:%u", &preset, &wallpaper_opacity,
+                       &panel_opacity, &hud_opacity) == 4 && preset <= 2 &&
+                wallpaper_opacity <= 100 && panel_opacity <= 100 &&
+                hud_opacity <= 100) {
+                labcapsule_config_t config = *device_config_get();
+                config.visual_preset = (uint8_t)preset;
+                config.wallpaper_opacity = (uint8_t)wallpaper_opacity;
+                config.panel_opacity = (uint8_t)panel_opacity;
+                config.hud_opacity = (uint8_t)hud_opacity;
+                if (device_config_save(&config) != ESP_OK) {
+                    return BLE_ATT_ERR_UNLIKELY;
+                }
+            }
         }
         ble_gatts_chr_updated(s_ble_status_handle);
         return 0;
@@ -1097,6 +1191,12 @@ esp_err_t connectivity_start(void)
     }
     ESP_RETURN_ON_ERROR(nvs_result, TAG, "NVS init failed");
     ESP_RETURN_ON_ERROR(device_config_init(), TAG, "Device configuration failed");
+    const labcapsule_config_t *saved = device_config_get();
+    ESP_RETURN_ON_ERROR(labcapsule_set_brightness(saved->brightness), TAG,
+                        "Display brightness restore failed");
+    ESP_RETURN_ON_ERROR(labcapsule_set_visual_style(saved->visual_preset,
+                        saved->wallpaper_opacity, saved->panel_opacity,
+                        saved->hud_opacity), TAG, "Display style restore failed");
 
     uint8_t mac[6];
     ESP_RETURN_ON_ERROR(esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP), TAG,

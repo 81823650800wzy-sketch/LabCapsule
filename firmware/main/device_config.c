@@ -24,6 +24,10 @@ esp_err_t device_config_init(void)
     strlcpy(s_config.locale, "zh-CN", sizeof(s_config.locale));
     strlcpy(s_config.mqtt_topic, "labcapsule", sizeof(s_config.mqtt_topic));
     s_config.brightness = 90;
+    s_config.visual_preset = 0;
+    s_config.wallpaper_opacity = 82;
+    s_config.panel_opacity = 76;
+    s_config.hud_opacity = 100;
     s_config.keep_recovery_ap = true;
 
     nvs_handle_t handle;
@@ -41,9 +45,18 @@ esp_err_t device_config_init(void)
     load_string(handle, "locale", s_config.locale, sizeof(s_config.locale));
     uint8_t value = 0;
     if (nvs_get_u8(handle, "brightness", &value) == ESP_OK) s_config.brightness = value;
+    if (nvs_get_u8(handle, "ui_preset", &value) == ESP_OK) s_config.visual_preset = value;
+    if (nvs_get_u8(handle, "wall_alpha", &value) == ESP_OK) s_config.wallpaper_opacity = value;
+    if (nvs_get_u8(handle, "panel_alpha", &value) == ESP_OK) s_config.panel_opacity = value;
+    if (nvs_get_u8(handle, "hud_alpha", &value) == ESP_OK) s_config.hud_opacity = value;
     if (nvs_get_u8(handle, "keep_ap", &value) == ESP_OK) s_config.keep_recovery_ap = value != 0;
     if (nvs_get_u8(handle, "remote", &value) == ESP_OK) s_config.remote_enabled = value != 0;
     nvs_close(handle);
+    if (s_config.brightness > 100) s_config.brightness = 90;
+    if (s_config.visual_preset > 2) s_config.visual_preset = 0;
+    if (s_config.wallpaper_opacity > 100) s_config.wallpaper_opacity = 82;
+    if (s_config.panel_opacity > 100) s_config.panel_opacity = 76;
+    if (s_config.hud_opacity > 100) s_config.hud_opacity = 100;
     return ESP_OK;
 }
 
@@ -54,7 +67,9 @@ const labcapsule_config_t *device_config_get(void)
 
 esp_err_t device_config_save(const labcapsule_config_t *config)
 {
-    if (!config || config->brightness > 100) return ESP_ERR_INVALID_ARG;
+    if (!config || config->brightness > 100 || config->visual_preset > 2 ||
+        config->wallpaper_opacity > 100 || config->panel_opacity > 100 ||
+        config->hud_opacity > 100) return ESP_ERR_INVALID_ARG;
     nvs_handle_t handle;
     ESP_RETURN_ON_ERROR(nvs_open(CONFIG_NAMESPACE, NVS_READWRITE, &handle),
                         "DeviceConfig", "NVS open failed");
@@ -66,6 +81,10 @@ esp_err_t device_config_save(const labcapsule_config_t *config)
     if (result == ESP_OK) result = nvs_set_str(handle, "mqtt_topic", config->mqtt_topic);
     if (result == ESP_OK) result = nvs_set_str(handle, "locale", config->locale);
     if (result == ESP_OK) result = nvs_set_u8(handle, "brightness", config->brightness);
+    if (result == ESP_OK) result = nvs_set_u8(handle, "ui_preset", config->visual_preset);
+    if (result == ESP_OK) result = nvs_set_u8(handle, "wall_alpha", config->wallpaper_opacity);
+    if (result == ESP_OK) result = nvs_set_u8(handle, "panel_alpha", config->panel_opacity);
+    if (result == ESP_OK) result = nvs_set_u8(handle, "hud_alpha", config->hud_opacity);
     if (result == ESP_OK) result = nvs_set_u8(handle, "keep_ap", config->keep_recovery_ap);
     if (result == ESP_OK) result = nvs_set_u8(handle, "remote", config->remote_enabled);
     if (result == ESP_OK) result = nvs_commit(handle);
@@ -80,10 +99,14 @@ void device_config_redacted_json(char *buffer, size_t buffer_size)
     snprintf(buffer, buffer_size,
              "{\"wifiSsid\":\"%s\",\"wifiConfigured\":%s,\"mqttUri\":\"%s\","
              "\"mqttUser\":\"%s\",\"mqttTopic\":\"%s\",\"remoteEnabled\":%s,"
-             "\"keepRecoveryAp\":%s,\"locale\":\"%s\",\"brightness\":%u}",
+             "\"keepRecoveryAp\":%s,\"locale\":\"%s\",\"brightness\":%u,"
+             "\"visualPreset\":%u,\"wallpaperOpacity\":%u,"
+             "\"panelOpacity\":%u,\"hudOpacity\":%u}",
              s_config.wifi_ssid, s_config.wifi_ssid[0] ? "true" : "false",
              s_config.mqtt_uri, s_config.mqtt_username, s_config.mqtt_topic,
              s_config.remote_enabled ? "true" : "false",
              s_config.keep_recovery_ap ? "true" : "false",
-             s_config.locale, (unsigned)s_config.brightness);
+             s_config.locale, (unsigned)s_config.brightness,
+             (unsigned)s_config.visual_preset, (unsigned)s_config.wallpaper_opacity,
+             (unsigned)s_config.panel_opacity, (unsigned)s_config.hud_opacity);
 }

@@ -109,6 +109,15 @@ typedef enum {
     DISPLAY_VIEW_MEDIA,
 } display_view_t;
 
+typedef struct {
+    uint16_t base;
+    uint16_t panel;
+    uint16_t accent;
+    uint16_t secondary;
+    uint16_t text;
+    uint16_t muted;
+} visual_palette_t;
+
 static const char *TAG = "LabCapsule";
 static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -129,6 +138,10 @@ static bool s_display_inverted = true;
 static bool s_backlight_commanded_on = false;
 static bool s_backlight_pwm_ready = false;
 static uint8_t s_backlight_brightness = 100;
+static uint8_t s_visual_preset = 0;
+static uint8_t s_wallpaper_opacity = 82;
+static uint8_t s_panel_opacity = 76;
+static uint8_t s_hud_opacity = 100;
 static uint8_t s_mpu_address = MPU6050_ADDRESS_LOW;
 
 static i2c_master_bus_handle_t s_i2c_bus = NULL;
@@ -138,6 +151,8 @@ static esp_lcd_panel_handle_t s_panel = NULL;
 static uint16_t s_display_lines[2][TFT_WIDTH * DISPLAY_TRANSFER_ROWS];
 static uint8_t s_display_line_index;
 static uint16_t *s_framebuffers[2];
+static uint16_t *s_media_canvas;
+static const uint16_t *s_live_background_override;
 static uint8_t s_render_buffer;
 static SemaphoreHandle_t s_display_mutex;
 static uint8_t *s_media_receive_buffer;
@@ -408,6 +423,88 @@ static esp_err_t display_fill_rect(int x, int y, int width, int height, uint16_t
     return ESP_OK;
 }
 
+static uint16_t blend_rgb565(uint16_t background, uint16_t foreground, uint8_t opacity)
+{
+    if (opacity == 0) return background;
+    if (opacity >= 100) return foreground;
+    uint16_t bg = (uint16_t)((background << 8) | (background >> 8));
+    uint16_t fg = (uint16_t)((foreground << 8) | (foreground >> 8));
+    uint8_t bg_r = (uint8_t)(((bg >> 11) & 0x1FU) * 255U / 31U);
+    uint8_t bg_g = (uint8_t)(((bg >> 5) & 0x3FU) * 255U / 63U);
+    uint8_t bg_b = (uint8_t)((bg & 0x1FU) * 255U / 31U);
+    uint8_t fg_r = (uint8_t)(((fg >> 11) & 0x1FU) * 255U / 31U);
+    uint8_t fg_g = (uint8_t)(((fg >> 5) & 0x3FU) * 255U / 63U);
+    uint8_t fg_b = (uint8_t)((fg & 0x1FU) * 255U / 31U);
+    uint8_t red = (uint8_t)((bg_r * (100U - opacity) + fg_r * opacity) / 100U);
+    uint8_t green = (uint8_t)((bg_g * (100U - opacity) + fg_g * opacity) / 100U);
+    uint8_t blue = (uint8_t)((bg_b * (100U - opacity) + fg_b * opacity) / 100U);
+    return rgb565(red, green, blue);
+}
+
+static esp_err_t display_fill_rect_alpha(int x, int y, int width, int height,
+                                         uint16_t color, uint8_t opacity)
+{
+    if (!s_framebuffers[s_render_buffer] || opacity >= 100) {
+        return display_fill_rect(x, y, width, height, color);
+    }
+    if (opacity == 0 || width <= 0 || height <= 0) return ESP_OK;
+    if (x < 0) { width += x; x = 0; }
+    if (y < 0) { height += y; y = 0; }
+    if (x + width > TFT_WIDTH) width = TFT_WIDTH - x;
+    if (y + height > TFT_HEIGHT) height = TFT_HEIGHT - y;
+    if (width <= 0 || height <= 0) return ESP_OK;
+    uint16_t *frame = s_framebuffers[s_render_buffer];
+    for (int row = 0; row < height; ++row) {
+        uint16_t *destination = frame + (y + row) * TFT_WIDTH + x;
+        for (int column = 0; column < width; ++column) {
+            destination[column] = blend_rgb565(destination[column], color, opacity);
+        }
+    }
+    return ESP_OK;
+}
+
+static visual_palette_t visual_palette(void)
+{
+    if (s_visual_preset == 1) {
+        return (visual_palette_t){
+            .base = rgb565(22, 10, 13), .panel = rgb565(26, 17, 18),
+            .accent = rgb565(255, 76, 68), .secondary = rgb565(246, 218, 27),
+            .text = rgb565(248, 242, 222), .muted = rgb565(176, 157, 151),
+        };
+    }
+    if (s_visual_preset == 2) {
+        return (visual_palette_t){
+            .base = rgb565(5, 18, 24), .panel = rgb565(8, 29, 36),
+            .accent = rgb565(40, 224, 230), .secondary = rgb565(190, 241, 57),
+            .text = rgb565(235, 250, 244), .muted = rgb565(126, 174, 179),
+        };
+    }
+    return (visual_palette_t){
+        .base = rgb565(14, 14, 15), .panel = rgb565(22, 22, 21),
+        .accent = rgb565(246, 216, 14), .secondary = rgb565(255, 76, 68),
+        .text = rgb565(247, 243, 224), .muted = rgb565(169, 166, 151),
+    };
+}
+
+static void display_prepare_background(uint16_t base)
+{
+    uint16_t *frame = s_framebuffers[s_render_buffer];
+    bool loaded = false;
+    if (s_wallpaper_opacity > 0 && frame && s_live_background_override) {
+        memcpy(frame, s_live_background_override, WALLPAPER_PAYLOAD_BYTES);
+        loaded = true;
+    } else if (s_wallpaper_opacity > 0 && frame && wallpaper_available()) {
+        loaded = wallpaper_read_frame(frame, WALLPAPER_PAYLOAD_BYTES) == ESP_OK;
+    }
+    if (!loaded) {
+        display_fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, base);
+        return;
+    }
+    for (size_t pixel = 0; pixel < TFT_WIDTH * TFT_HEIGHT; ++pixel) {
+        frame[pixel] = blend_rgb565(base, frame[pixel], s_wallpaper_opacity);
+    }
+}
+
 static const uint8_t *font_glyph(char character)
 {
     static const uint8_t blank[5] = {0, 0, 0, 0, 0};
@@ -436,8 +533,8 @@ static void display_text(int x, int y, const char *text, int scale, uint16_t col
         for (int column = 0; column < 5; ++column) {
             for (int row = 0; row < 7; ++row) {
                 if (glyph[column] & (1U << row)) {
-                    display_fill_rect(x + column * scale, y + row * scale,
-                                      scale, scale, color);
+                    display_fill_rect_alpha(x + column * scale, y + row * scale,
+                                            scale, scale, color, s_hud_opacity);
                 }
             }
         }
@@ -543,9 +640,11 @@ static esp_err_t display_init(void)
         s_framebuffers[i] = heap_caps_calloc(TFT_WIDTH * TFT_HEIGHT, sizeof(uint16_t),
                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
+    s_media_canvas = heap_caps_calloc(TFT_WIDTH * TFT_HEIGHT, sizeof(uint16_t),
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_media_receive_buffer = heap_caps_malloc(WALLPAPER_PAYLOAD_BYTES,
                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_display_mutex || !s_framebuffers[0] || !s_framebuffers[1] ||
+    if (!s_display_mutex || !s_framebuffers[0] || !s_framebuffers[1] || !s_media_canvas ||
         !s_media_receive_buffer) {
         ESP_LOGE(TAG, "PSRAM frame buffer allocation failed");
         return ESP_ERR_NO_MEM;
@@ -578,83 +677,85 @@ static void display_render_state(device_state_t state)
     if (!s_display_ready) {
         return;
     }
-    uint16_t background;
-    uint16_t accent;
+    visual_palette_t theme = visual_palette();
+    uint16_t accent = theme.accent;
     switch (state) {
         case STATE_RECORDING:
-            background = rgb565(65, 5, 5);
             accent = rgb565(255, 70, 70);
             break;
         case STATE_COMPLETE:
-            background = rgb565(0, 55, 25);
             accent = rgb565(70, 255, 145);
             break;
         case STATE_ABORTED:
-            background = rgb565(60, 35, 0);
             accent = rgb565(255, 190, 50);
             break;
         case STATE_ERROR:
-            background = rgb565(55, 0, 45);
             accent = rgb565(255, 90, 210);
             break;
         default:
-            background = rgb565(4, 18, 42);
-            accent = rgb565(70, 190, 255);
             break;
     }
-    uint16_t white = rgb565(245, 250, 255);
-    uint16_t muted = rgb565(135, 155, 175);
-    display_fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, background);
-    display_fill_rect(0, 0, TFT_WIDTH, 8, accent);
-    display_text(20, 30, "LAB", 4, white);
-    display_text(20, 66, "CAPSULE", 4, white);
-    display_fill_rect(20, 112, 200, 2, accent);
-    display_text(20, 140, state_name(state), state == STATE_RECORDING ? 3 : 4, accent);
-    display_text(20, 210, s_mpu_ready ? "MPU OK" : "MPU MISSING", 2,
-                 s_mpu_ready ? white : rgb565(255, 185, 70));
-    display_text(20, 244, s_mock_enabled ? "MOCK ON" : "MOCK OFF", 2, muted);
+    display_prepare_background(theme.base);
+    display_fill_rect_alpha(0, 0, TFT_WIDTH, 116, theme.panel, s_panel_opacity);
+    display_fill_rect_alpha(12, 128, 216, 62, theme.panel, s_panel_opacity);
+    display_fill_rect_alpha(12, 202, 216, 100, theme.panel, s_panel_opacity);
+    for (int x = 0; x < TFT_WIDTH; x += 30) {
+        display_fill_rect_alpha(x, 0, 18, 8, x % 60 ? theme.secondary : accent,
+                                s_hud_opacity);
+    }
+    display_fill_rect_alpha(16, 22, 44, 20, accent, s_hud_opacity);
+    display_text(21, 26, "LC", 2, theme.base);
+    display_text(70, 23, "LAB CAPSULE", 3, theme.text);
+    display_text(18, 70, "FIELD UNIT 01", 2, theme.muted);
+    display_fill_rect_alpha(18, 104, 204, 3, accent, s_hud_opacity);
+    display_text(24, 144, state_name(state), state == STATE_RECORDING ? 3 : 4, accent);
+    display_text(24, 218, s_mpu_ready ? "MPU LINK OK" : "MPU LINK LOST", 2,
+                 s_mpu_ready ? theme.text : theme.secondary);
+    display_text(24, 250, s_mock_enabled ? "SIMULATION ON" : "SENSOR MODE", 2,
+                 theme.muted);
 
     char config_text[32];
-    snprintf(config_text, sizeof(config_text), "%lu HZ  %lu S",
+    snprintf(config_text, sizeof(config_text), "%luHZ  %luSEC",
              (unsigned long)s_sample_rate_hz, (unsigned long)s_duration_seconds);
-    display_text(20, 278, config_text, 2, muted);
+    display_text(24, 280, config_text, 2, theme.text);
 }
 
 static void display_render_settings(void)
 {
-    uint16_t background = rgb565(4, 18, 42);
-    uint16_t white = rgb565(245, 250, 255);
-    uint16_t accent = rgb565(70, 190, 255);
-    uint16_t muted = rgb565(135, 155, 175);
-
-    display_fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, background);
-    display_fill_rect(0, 0, TFT_WIDTH, 8, accent);
-    display_text(18, 28, "SETTINGS", 3, white);
-    display_fill_rect(18, 68, 204, 2, accent);
-    display_fill_rect(12, 94, 216, 54, rgb565(10, 45, 78));
-    display_text(28, 110, "DEVELOPER", 3, accent);
-    display_text(20, 184, "OK OPEN", 2, white);
-    display_text(20, 218, "BACK HOME", 2, muted);
-    display_text(20, 270, "TFT DIAGNOSTICS", 2, muted);
+    visual_palette_t theme = visual_palette();
+    display_prepare_background(theme.base);
+    display_fill_rect_alpha(0, 0, TFT_WIDTH, 84, theme.panel, s_panel_opacity);
+    display_fill_rect_alpha(12, 96, 216, 64, theme.panel, s_panel_opacity);
+    display_fill_rect_alpha(12, 176, 216, 112, theme.panel, s_panel_opacity);
+    display_fill_rect_alpha(0, 0, TFT_WIDTH, 8, theme.accent, s_hud_opacity);
+    display_text(18, 24, "SYSTEM DECK", 3, theme.text);
+    display_text(18, 58, "DISPLAY ROUTER", 2, theme.muted);
+    display_fill_rect_alpha(18, 76, 204, 3, theme.accent, s_hud_opacity);
+    display_text(28, 112, "DEVELOPER", 3, theme.accent);
+    display_text(20, 190, "OK  OPEN PANEL", 2, theme.text);
+    display_text(20, 224, "BACK  RETURN", 2, theme.muted);
+    display_text(20, 268, "STYLE LINKED", 2, theme.secondary);
 }
 
 static void display_render_developer(uint8_t page)
 {
-    uint16_t background = rgb565(8, 10, 20);
-    uint16_t white = rgb565(245, 250, 255);
-    uint16_t cyan = rgb565(80, 220, 255);
+    visual_palette_t theme = visual_palette();
+    uint16_t white = theme.text;
+    uint16_t cyan = theme.accent;
     uint16_t green = rgb565(80, 255, 145);
     uint16_t amber = rgb565(255, 185, 70);
     uint16_t red = rgb565(255, 80, 80);
-    uint16_t muted = rgb565(130, 145, 165);
+    uint16_t muted = theme.muted;
     char line[32];
 
-    display_fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, background);
-    display_fill_rect(0, 0, TFT_WIDTH, 8, cyan);
+    display_prepare_background(theme.base);
+    display_fill_rect_alpha(0, 0, TFT_WIDTH, TFT_HEIGHT, theme.panel,
+                            s_panel_opacity > 85 ? s_panel_opacity : 85);
+    display_fill_rect_alpha(0, 0, TFT_WIDTH, 8, cyan, s_hud_opacity);
     display_text(14, 20, "DEVELOPER", 3, white);
     snprintf(line, sizeof(line), "PAGE %u OF 4", (unsigned)(page + 1));
     display_text(16, 56, line, 2, muted);
-    display_fill_rect(14, 82, 212, 2, cyan);
+    display_fill_rect_alpha(14, 82, 212, 2, cyan, s_hud_opacity);
 
     if (page == 0) {
         display_text(16, 102, "TFT SPI TX ONLY", 2, cyan);
@@ -712,7 +813,6 @@ static void display_render_current(void)
     if (!s_display_ready) {
         return;
     }
-    if (s_display_view == DISPLAY_VIEW_MEDIA) return;
     if (s_display_mutex) xSemaphoreTake(s_display_mutex, portMAX_DELAY);
     switch (s_display_view) {
         case DISPLAY_VIEW_SETTINGS:
@@ -725,10 +825,12 @@ static void display_render_current(void)
             display_render_color_test();
             break;
         case DISPLAY_VIEW_WALLPAPER:
-            if (wallpaper_read_frame(s_framebuffers[s_render_buffer],
-                                     WALLPAPER_PAYLOAD_BYTES) != ESP_OK) {
-                display_render_state(get_state());
-            }
+            display_render_state(get_state());
+            break;
+        case DISPLAY_VIEW_MEDIA:
+            s_live_background_override = s_media_canvas;
+            display_render_state(get_state());
+            s_live_background_override = NULL;
             break;
         case DISPLAY_VIEW_STATUS:
         default:
@@ -918,6 +1020,25 @@ static void handle_command(char *line)
         emit_status();
     } else if (strcmp(command, "DISPLAY") == 0 || strcmp(command, "TFT") == 0) {
         handle_display_command(&save_pointer);
+    } else if (strcmp(command, "STYLE") == 0) {
+        char *preset_text = strtok_r(NULL, ", ", &save_pointer);
+        char *wallpaper_text = strtok_r(NULL, ", ", &save_pointer);
+        char *panel_text = strtok_r(NULL, ", ", &save_pointer);
+        char *hud_text = strtok_r(NULL, ", ", &save_pointer);
+        unsigned preset = preset_text ? strtoul(preset_text, NULL, 10) : 0;
+        unsigned wallpaper_opacity = wallpaper_text ? strtoul(wallpaper_text, NULL, 10) : 0;
+        unsigned panel_opacity = panel_text ? strtoul(panel_text, NULL, 10) : 0;
+        unsigned hud_opacity = hud_text ? strtoul(hud_text, NULL, 10) : 0;
+        if (!preset_text || !wallpaper_text || !panel_text || !hud_text || preset > 2 ||
+            wallpaper_opacity > 100 || panel_opacity > 100 || hud_opacity > 100 ||
+            labcapsule_set_visual_style((uint8_t)preset, (uint8_t)wallpaper_opacity,
+                                        (uint8_t)panel_opacity,
+                                        (uint8_t)hud_opacity) != ESP_OK) {
+            serial_emit("ERR,STYLE,EXPECTED=STYLE,PRESET,WALL,PANEL,HUD");
+        } else {
+            serial_emit("OK,STYLE,%u,%u,%u,%u", preset, wallpaper_opacity,
+                        panel_opacity, hud_opacity);
+        }
     } else if (strcmp(command, "DEVELOPER") == 0 || strcmp(command, "DEV") == 0) {
         s_display_view = DISPLAY_VIEW_DEVELOPER;
         s_developer_page = 0;
@@ -956,6 +1077,7 @@ static void handle_command(char *line)
     } else if (strcmp(command, "HELP") == 0) {
         serial_emit("COMMANDS,PING|STATUS|START[,RATE,DURATION]|STOP|ABORT|MOCK,ON|OFF");
         serial_emit("COMMANDS,DISPLAY[,DEV|TEST|WALLPAPER|SETTINGS|HOME|INVERT|BL,ON|OFF]");
+        serial_emit("COMMANDS,STYLE,PRESET,WALL,PANEL,HUD");
     } else {
         serial_emit("ERR,UNKNOWN_COMMAND,%s", command);
     }
@@ -1197,21 +1319,24 @@ void labcapsule_build_status_json(char *buffer, size_t buffer_size)
     snprintf(buffer, buffer_size,
              "{\"version\":\"%s\",\"state\":\"%s\",\"view\":\"%s\","
              "\"mpu\":\"%s\",\"mock\":%s,\"rate\":%lu,\"duration\":%lu,"
-             "\"samples\":%lu,\"backlight\":%s,\"brightness\":%u,\"wallpaper\":%s}",
+             "\"samples\":%lu,\"backlight\":%s,\"brightness\":%u,\"wallpaper\":%s,"
+             "\"style\":{\"preset\":%u,\"wallpaperOpacity\":%u,"
+             "\"panelOpacity\":%u,\"hudOpacity\":%u}}",
              LABCAPSULE_VERSION, state_name(get_state()), display_view_name(s_display_view),
              s_mpu_ready ? "ok" : "missing", s_mock_enabled ? "true" : "false",
              (unsigned long)s_sample_rate_hz, (unsigned long)s_duration_seconds,
              (unsigned long)s_sample_count, s_backlight_commanded_on ? "true" : "false",
-             (unsigned)s_backlight_brightness,
-             wallpaper_available() ? "true" : "false");
+             (unsigned)s_backlight_brightness, wallpaper_available() ? "true" : "false",
+             (unsigned)s_visual_preset, (unsigned)s_wallpaper_opacity,
+             (unsigned)s_panel_opacity, (unsigned)s_hud_opacity);
 }
 
 void labcapsule_show_wallpaper(void)
 {
     if (wallpaper_available()) {
-        s_display_view = DISPLAY_VIEW_WALLPAPER;
+        s_display_view = DISPLAY_VIEW_STATUS;
         display_request_refresh();
-        serial_emit("UI,WALLPAPER");
+        serial_emit("UI,WALLPAPER_BACKGROUND");
     }
 }
 
@@ -1306,8 +1431,7 @@ esp_err_t labcapsule_media_frame_finish(uint32_t duration_ms)
             size_t row = pixel / s_media_width;
             size_t column = pixel % s_media_width;
             size_t target = ((size_t)s_media_y + row) * TFT_WIDTH + s_media_x + column;
-            s_framebuffers[0][target] = color;
-            s_framebuffers[1][target] = color;
+            s_media_canvas[target] = color;
         }
     }
     if (source != s_media_received || pixel != pixels) decode_result = ESP_ERR_INVALID_SIZE;
@@ -1318,6 +1442,9 @@ esp_err_t labcapsule_media_frame_finish(uint32_t duration_ms)
     }
     s_display_view = DISPLAY_VIEW_MEDIA;
     s_media_frame_duration_ms = duration_ms < 20 ? 20 : duration_ms;
+    s_live_background_override = s_media_canvas;
+    display_render_state(get_state());
+    s_live_background_override = NULL;
     esp_err_t result = display_present();
     xSemaphoreGive(s_display_mutex);
     s_media_receive_active = false;
@@ -1348,6 +1475,25 @@ esp_err_t labcapsule_set_brightness(uint8_t percent)
     return ESP_OK;
 }
 
+esp_err_t labcapsule_set_visual_style(uint8_t preset, uint8_t wallpaper_opacity,
+                                      uint8_t panel_opacity, uint8_t hud_opacity)
+{
+    if (preset > 2 || wallpaper_opacity > 100 || panel_opacity > 100 ||
+        hud_opacity > 100) return ESP_ERR_INVALID_ARG;
+    s_visual_preset = preset;
+    s_wallpaper_opacity = wallpaper_opacity;
+    s_panel_opacity = panel_opacity;
+    s_hud_opacity = hud_opacity;
+    if (s_display_view == DISPLAY_VIEW_WALLPAPER) {
+        s_display_view = DISPLAY_VIEW_STATUS;
+    }
+    display_request_refresh();
+    serial_emit("DISPLAY,STYLE=%u,WALL=%u,PANEL=%u,HUD=%u", (unsigned)preset,
+                (unsigned)wallpaper_opacity, (unsigned)panel_opacity,
+                (unsigned)hud_opacity);
+    return ESP_OK;
+}
+
 esp_err_t labcapsule_start_experiment(uint32_t rate_hz, uint32_t duration_seconds)
 {
     return start_recording(rate_hz, duration_seconds);
@@ -1367,7 +1513,25 @@ esp_err_t labcapsule_remote_action(const char *action, char *response, size_t re
     }
     normalized[index] = '\0';
 
-    if (strncmp(normalized, "START:", 6) == 0) {
+    if (strncmp(normalized, "STYLE:", 6) == 0) {
+        unsigned preset = 0, wallpaper_opacity = 0, panel_opacity = 0, hud_opacity = 0;
+        if (sscanf(normalized + 6, "%u:%u:%u:%u", &preset, &wallpaper_opacity,
+                   &panel_opacity, &hud_opacity) != 4) {
+            snprintf(response, response_size, "expected STYLE:preset:wall:panel:hud");
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (preset > 2 || wallpaper_opacity > 100 || panel_opacity > 100 ||
+            hud_opacity > 100) {
+            snprintf(response, response_size, "style values out of range");
+            return ESP_ERR_INVALID_ARG;
+        }
+        esp_err_t result = labcapsule_set_visual_style((uint8_t)preset,
+                (uint8_t)wallpaper_opacity, (uint8_t)panel_opacity,
+                (uint8_t)hud_opacity);
+        snprintf(response, response_size, result == ESP_OK ? "visual style applied" :
+                 "visual style rejected");
+        return result;
+    } else if (strncmp(normalized, "START:", 6) == 0) {
         unsigned rate = 0;
         unsigned duration = 0;
         if (sscanf(normalized + 6, "%u:%u", &rate, &duration) != 2) {
@@ -1392,7 +1556,7 @@ esp_err_t labcapsule_remote_action(const char *action, char *response, size_t re
             snprintf(response, response_size, "wallpaper not uploaded");
             return ESP_ERR_NOT_FOUND;
         }
-        s_display_view = DISPLAY_VIEW_WALLPAPER;
+        s_display_view = DISPLAY_VIEW_STATUS;
     } else if (strcmp(normalized, "INVERT") == 0) {
         s_display_inverted = !s_display_inverted;
         if (s_display_ready) {

@@ -1,4 +1,4 @@
-# LabCapsule ESP-IDF Firmware 0.3.1-alpha
+# LabCapsule ESP-IDF Firmware 0.3.2-alpha
 
 目标硬件：ESP32-S3，16 MiB Flash、8 MiB Octal PSRAM、ESP-IDF 5.5.4。
 
@@ -11,13 +11,13 @@ idf.py build
 idf.py -p COM8 flash monitor
 ```
 
-首次安装、从 0.1.x 升级或修改分区表时必须执行完整 `flash`。之后可以在 APK 中选择 `LabCapsule-0.3.1-ota.bin` 经 Wi-Fi/BLE 更新。不要为普通升级运行 `erase-flash`，它会清除 NVS 配置和持久壁纸。
+首次安装、从 0.1.x 升级或修改分区表时必须执行完整 `flash`。之后可以在 APK 中选择 `LabCapsule-0.3.2-ota.bin` 经 Wi-Fi/BLE 更新。不要为普通升级运行 `erase-flash`，它会清除 NVS 配置和持久壁纸。
 
 ## 分区与内存
 
 - `ota_0` / `ota_1`：各 3 MiB；当前固件约 1.25 MiB，余量约 58%。
 - `wallpaper`：256 KiB，使用双槽提交头，完整校验后才切换。
-- 两张 240×320 RGB565 帧缓冲和最大 153,600 字节媒体接收区位于 PSRAM；局部更新同时写入两张缓冲，避免下一帧回退。
+- 两张显示帧缓冲、独立动态媒体画布和最大 153,600 字节媒体接收区位于 PSRAM。GIF 差分只修改干净媒体画布，随后重新合成 HUD，避免把上一帧文字写进动画底图。
 - 显示合成后以 8 行内部 DMA 缓冲覆盖 ST7789，不先擦黑屏，也不让 SPI DMA 直接访问大块 PSRAM。
 
 ## 联网
@@ -47,6 +47,7 @@ idf.py -p COM8 flash monitor
 | POST | `/api/network` | JSON 保存 Wi-Fi/MQTT/语言/亮度配置 |
 | GET | `/api/sensors` | 扫描总线并返回传感器注册表 |
 | POST | `/api/control?action=home` | 屏幕、按键和亮度动作 |
+| GET/POST | `/api/display` | 读取/保存主题和壁纸、面板、HUD 透明度 |
 | POST | `/api/experiment?rate=200&duration=20` | 校验并开始实验 |
 | POST | `/api/media/frame?duration=100&enc=rle332&x=0&y=0&w=240&h=320` | 临时整帧/局部帧，不写 Flash |
 | POST | `/api/wallpaper` | 持久 RGB565 壁纸，固定 153600 字节 |
@@ -85,6 +86,14 @@ idf.py -p COM8 flash monitor
 媒体控制帧：`BEGIN:FRAME:<size>:<duration-ms>:<crc32>:<encoding>:<x>:<y>:<w>:<h>` 或 `BEGIN:WALLPAPER:153600:0:<crc32>:raw565:0:0:240:320`，随后写入数据分片并发送 `END`。旧版四字段 FRAME 控制帧仍按完整 `raw565` 兼容。
 
 临时媒体支持 `raw565`、`rle565`、`rgb332`、`rle332`。RLE 格式使用一字节重复计数（1–255）加一个 RGB565 像素或 RGB332 像素。只有第一帧允许从任意页面提交完整区域；后续差分区域必须在媒体视图中，防止把局部数据叠到未初始化画面。
+
+外观设置 JSON：
+
+```json
+{"preset":0,"wallpaperOpacity":82,"panelOpacity":76,"hudOpacity":100}
+```
+
+`preset` 为 0–2，其余字段为 0–100。HTTP 与 BLE 会保存到 NVS；BLE/远程命令格式为 `STYLE:0:82:76:100`，USB 串口格式为 `STYLE,0,82,76,100`。持久壁纸、临时图片和 GIF 都先作为背景，再合成同一套 HUD。
 
 ## 传感器扩展
 

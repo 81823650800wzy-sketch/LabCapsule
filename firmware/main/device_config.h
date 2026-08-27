@@ -15,6 +15,10 @@ typedef struct {
     char mqtt_topic[65];
     char locale[8];
     uint8_t brightness;
+    uint8_t visual_preset;
+    uint8_t wallpaper_opacity;
+    uint8_t panel_opacity;
+    uint8_t hud_opacity;
     bool keep_recovery_ap;
     bool remote_enabled;
 } labcapsule_config_t;
