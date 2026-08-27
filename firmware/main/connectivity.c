@@ -28,6 +28,7 @@
 #include "host/ble_uuid.h"
 #include "labcapsule_control.h"
 #include "mqtt_client.h"
+#include "mbedtls/base64.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "nvs_flash.h"
@@ -49,10 +50,13 @@ static uint8_t s_ble_own_addr_type;
 static uint16_t s_ble_status_handle;
 static bool s_sta_connected;
 static bool s_remote_connected;
+static uint8_t s_sta_retry_count;
+static uint16_t s_sta_last_disconnect_reason;
 static char s_sta_ip[16] = "0.0.0.0";
 static esp_mqtt_client_handle_t s_mqtt_client;
 static char s_mqtt_command_topic[160];
 static char s_mqtt_status_topic[160];
+static char s_ble_response[BLE_VALUE_MAX];
 
 static bool s_ota_active;
 static esp_ota_handle_t s_ota_handle;
@@ -305,6 +309,8 @@ static void mqtt_restart(void);
 static esp_err_t wifi_station_apply(void)
 {
     const labcapsule_config_t *saved = device_config_get();
+    wifi_mode_t previous_mode = WIFI_MODE_NULL;
+    esp_wifi_get_mode(&previous_mode);
     wifi_config_t station = {0};
     strlcpy((char *)station.sta.ssid, saved->wifi_ssid, sizeof(station.sta.ssid));
     strlcpy((char *)station.sta.password, saved->wifi_password, sizeof(station.sta.password));
@@ -315,6 +321,13 @@ static esp_err_t wifi_station_apply(void)
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &station), TAG,
                         "Wi-Fi station config failed");
     if (saved->wifi_ssid[0]) {
+        s_sta_retry_count = 0;
+        ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_APSTA), TAG,
+                            "Wi-Fi AP+STA mode restore failed");
+        if (previous_mode == WIFI_MODE_AP || previous_mode == WIFI_MODE_NULL) {
+            /* WIFI_EVENT_STA_START will initiate the first connection. */
+            return ESP_OK;
+        }
         esp_wifi_disconnect();
         return esp_wifi_connect();
     }
@@ -325,14 +338,86 @@ void connectivity_build_status_json(char *buffer, size_t buffer_size)
 {
     if (!buffer || buffer_size == 0) return;
     const labcapsule_config_t *config = device_config_get();
+    wifi_mode_t wifi_mode = WIFI_MODE_NULL;
+    esp_wifi_get_mode(&wifi_mode);
+    const bool recovery_ap_active = wifi_mode == WIFI_MODE_AP ||
+            wifi_mode == WIFI_MODE_APSTA;
     snprintf(buffer, buffer_size,
-             "{\"mode\":\"ap+sta\",\"recoveryAp\":\"%s\",\"staConfigured\":%s,"
+             "{\"mode\":\"%s\",\"recoveryAp\":\"%s\",\"recoveryApActive\":%s,"
+             "\"staConfigured\":%s,"
              "\"staConnected\":%s,\"staIp\":\"%s\",\"remoteEnabled\":%s,"
-             "\"remoteConnected\":%s}",
-             s_ap_ssid, config->wifi_ssid[0] ? "true" : "false",
+             "\"remoteConnected\":%s,\"lastDisconnectReason\":%u}",
+             wifi_mode == WIFI_MODE_AP ? "ap" : wifi_mode == WIFI_MODE_STA ? "sta" :
+                     wifi_mode == WIFI_MODE_APSTA ? "ap+sta" : "off",
+             s_ap_ssid, recovery_ap_active ? "true" : "false",
+             config->wifi_ssid[0] ? "true" : "false",
              s_sta_connected ? "true" : "false", s_sta_ip,
              config->remote_enabled ? "true" : "false",
-             s_remote_connected ? "true" : "false");
+             s_remote_connected ? "true" : "false",
+             (unsigned)s_sta_last_disconnect_reason);
+}
+
+static void ble_build_status_response(void)
+{
+    char device_status[384];
+    char network_status[256];
+    labcapsule_build_status_json(device_status, sizeof(device_status));
+    connectivity_build_status_json(network_status, sizeof(network_status));
+    cJSON *device = cJSON_Parse(device_status);
+    cJSON *style = device ? cJSON_GetObjectItemCaseSensitive(device, "style") : NULL;
+    const cJSON *state = device ? cJSON_GetObjectItemCaseSensitive(device, "state") : NULL;
+    const cJSON *view = device ? cJSON_GetObjectItemCaseSensitive(device, "view") : NULL;
+    const cJSON *mpu = device ? cJSON_GetObjectItemCaseSensitive(device, "mpu") : NULL;
+    const cJSON *backlight = device
+            ? cJSON_GetObjectItemCaseSensitive(device, "backlight") : NULL;
+    const cJSON *brightness = device
+            ? cJSON_GetObjectItemCaseSensitive(device, "brightness") : NULL;
+    const cJSON *wallpaper = device
+            ? cJSON_GetObjectItemCaseSensitive(device, "wallpaper") : NULL;
+    const cJSON *preset = style
+            ? cJSON_GetObjectItemCaseSensitive(style, "preset") : NULL;
+    const cJSON *wallpaper_opacity = style
+            ? cJSON_GetObjectItemCaseSensitive(style, "wallpaperOpacity") : NULL;
+    const cJSON *panel_opacity = style
+            ? cJSON_GetObjectItemCaseSensitive(style, "panelOpacity") : NULL;
+    const cJSON *hud_opacity = style
+            ? cJSON_GetObjectItemCaseSensitive(style, "hudOpacity") : NULL;
+    snprintf(s_ble_response, sizeof(s_ble_response),
+             "{\"ok\":true,\"type\":\"status\",\"device\":{"
+             "\"version\":\"%s\",\"state\":\"%s\",\"view\":\"%s\","
+             "\"mpu\":\"%s\",\"backlight\":%s,\"brightness\":%d,"
+             "\"wallpaper\":%s,\"style\":{\"preset\":%d,"
+             "\"wallpaperOpacity\":%d,\"panelOpacity\":%d,"
+             "\"hudOpacity\":%d}},\"network\":%s}",
+             LABCAPSULE_VERSION,
+             cJSON_IsString(state) ? state->valuestring : "UNKNOWN",
+             cJSON_IsString(view) ? view->valuestring : "home",
+             cJSON_IsString(mpu) ? mpu->valuestring : "unknown",
+             cJSON_IsTrue(backlight) ? "true" : "false",
+             cJSON_IsNumber(brightness) ? brightness->valueint : 0,
+             cJSON_IsTrue(wallpaper) ? "true" : "false",
+             cJSON_IsNumber(preset) ? preset->valueint : 0,
+             cJSON_IsNumber(wallpaper_opacity) ? wallpaper_opacity->valueint : 82,
+             cJSON_IsNumber(panel_opacity) ? panel_opacity->valueint : 76,
+             cJSON_IsNumber(hud_opacity) ? hud_opacity->valueint : 100,
+             network_status);
+    cJSON_Delete(device);
+}
+
+static bool ble_decode_base64(const char *encoded, char *decoded, size_t decoded_size)
+{
+    if (!encoded || !decoded || decoded_size < 2) return false;
+    if (!encoded[0]) {
+        decoded[0] = '\0';
+        return true;
+    }
+    size_t decoded_length = 0;
+    int result = mbedtls_base64_decode((unsigned char *)decoded, decoded_size - 1,
+                                      &decoded_length,
+                                      (const unsigned char *)encoded, strlen(encoded));
+    if (result != 0 || decoded_length >= decoded_size) return false;
+    decoded[decoded_length] = '\0';
+    return true;
 }
 
 static esp_err_t status_handler(httpd_req_t *request)
@@ -829,17 +914,30 @@ static void wifi_event_handler(void *argument, esp_event_base_t base, int32_t ev
     if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         if (device_config_get()->wifi_ssid[0]) esp_wifi_connect();
     } else if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        const wifi_event_sta_disconnected_t *event = event_data;
         s_sta_connected = false;
+        s_sta_last_disconnect_reason = event ? event->reason : 0;
         strlcpy(s_sta_ip, "0.0.0.0", sizeof(s_sta_ip));
         mqtt_stop();
         if (device_config_get()->wifi_ssid[0]) {
-            if (!device_config_get()->keep_recovery_ap) esp_wifi_set_mode(WIFI_MODE_APSTA);
-            esp_wifi_connect();
+            ++s_sta_retry_count;
+            if (s_sta_retry_count <= 3) {
+                /* A failed router connection must never hide the recovery AP. */
+                esp_wifi_set_mode(WIFI_MODE_APSTA);
+                esp_wifi_connect();
+            } else {
+                ESP_LOGW(TAG, "Station failed %u times (reason=%u); recovery AP only",
+                         (unsigned)s_sta_retry_count,
+                         (unsigned)s_sta_last_disconnect_reason);
+                esp_wifi_set_mode(WIFI_MODE_AP);
+            }
         }
     } else if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = event_data;
         snprintf(s_sta_ip, sizeof(s_sta_ip), IPSTR, IP2STR(&event->ip_info.ip));
         s_sta_connected = true;
+        s_sta_retry_count = 0;
+        s_sta_last_disconnect_reason = 0;
         ESP_LOGI(TAG, "Wi-Fi station connected: %s", s_sta_ip);
         mqtt_restart();
         if (!device_config_get()->keep_recovery_ap) esp_wifi_set_mode(WIFI_MODE_STA);
@@ -903,9 +1001,8 @@ static int ble_access(uint16_t connection_handle, uint16_t attribute_handle,
 
     if (context->op == BLE_GATT_ACCESS_OP_READ_CHR &&
         ble_uuid_cmp(uuid, &s_status_uuid.u) == 0) {
-        char status[384];
-        labcapsule_build_status_json(status, sizeof(status));
-        return os_mbuf_append(context->om, status, strlen(status)) == 0
+        if (!s_ble_response[0]) ble_build_status_response();
+        return os_mbuf_append(context->om, s_ble_response, strlen(s_ble_response)) == 0
                    ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
 
@@ -915,13 +1012,57 @@ static int ble_access(uint16_t connection_handle, uint16_t attribute_handle,
 
     uint16_t length = OS_MBUF_PKTLEN(context->om);
     if (ble_uuid_cmp(uuid, &s_command_uuid.u) == 0) {
-        if (length == 0 || length >= 64) {
+        if (length == 0 || length >= 192) {
             return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         }
-        char command[64] = {0};
+        char command[192] = {0};
         uint16_t copied = 0;
         if (ble_hs_mbuf_to_flat(context->om, command, sizeof(command) - 1, &copied) != 0) {
             return BLE_ATT_ERR_UNLIKELY;
+        }
+        command[copied] = '\0';
+        if (strcmp(command, "STATUS") == 0) {
+            ble_build_status_response();
+            ble_gatts_chr_updated(s_ble_status_handle);
+            return 0;
+        }
+        if (strcmp(command, "SENSORS") == 0) {
+            sensor_hub_discover();
+            sensor_hub_build_ble_json(s_ble_response, sizeof(s_ble_response));
+            ble_gatts_chr_updated(s_ble_status_handle);
+            return 0;
+        }
+        if (strcmp(command, "AP:ON") == 0) {
+            labcapsule_config_t config = *device_config_get();
+            config.keep_recovery_ap = true;
+            s_sta_retry_count = 0;
+            if (device_config_save(&config) != ESP_OK ||
+                esp_wifi_set_mode(WIFI_MODE_AP) != ESP_OK) {
+                return BLE_ATT_ERR_UNLIKELY;
+            }
+            ble_build_status_response();
+            ble_gatts_chr_updated(s_ble_status_handle);
+            return 0;
+        }
+        if (strncmp(command, "WIFI:", 5) == 0) {
+            char *separator = strchr(command + 5, ':');
+            char ssid[sizeof(((labcapsule_config_t *)0)->wifi_ssid)] = {0};
+            char password[sizeof(((labcapsule_config_t *)0)->wifi_password)] = {0};
+            if (!separator) return BLE_ATT_ERR_UNLIKELY;
+            *separator = '\0';
+            if (!ble_decode_base64(command + 5, ssid, sizeof(ssid)) ||
+                !ble_decode_base64(separator + 1, password, sizeof(password)) ||
+                !ssid[0]) return BLE_ATT_ERR_UNLIKELY;
+            labcapsule_config_t config = *device_config_get();
+            strlcpy(config.wifi_ssid, ssid, sizeof(config.wifi_ssid));
+            strlcpy(config.wifi_password, password, sizeof(config.wifi_password));
+            config.keep_recovery_ap = true;
+            if (device_config_save(&config) != ESP_OK ||
+                esp_wifi_set_mode(WIFI_MODE_APSTA) != ESP_OK ||
+                wifi_station_apply() != ESP_OK) return BLE_ATT_ERR_UNLIKELY;
+            ble_build_status_response();
+            ble_gatts_chr_updated(s_ble_status_handle);
+            return 0;
         }
         char response[96];
         if (labcapsule_remote_action(command, response, sizeof(response)) != ESP_OK) {
@@ -944,6 +1085,7 @@ static int ble_access(uint16_t connection_handle, uint16_t attribute_handle,
                 }
             }
         }
+        ble_build_status_response();
         ble_gatts_chr_updated(s_ble_status_handle);
         return 0;
     }

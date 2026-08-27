@@ -31,3 +31,4 @@ esp_err_t sensor_hub_register(const sensor_driver_t *driver);
 void sensor_hub_set_primary_ready(const char *id, bool ready);
 size_t sensor_hub_discover(void);
 void sensor_hub_build_json(char *buffer, size_t buffer_size);
+void sensor_hub_build_ble_json(char *buffer, size_t buffer_size);

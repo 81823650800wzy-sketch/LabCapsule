@@ -18,6 +18,7 @@ import android.provider.OpenableColumns;
 import android.provider.Settings;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
+import android.util.Base64;
 import android.view.*;
 import android.widget.*;
 
@@ -41,8 +42,10 @@ import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
 
 public class MainActivity extends Activity {
-    private static final String APP_VERSION = "0.3.2";
+    private static final String APP_VERSION = "0.3.3";
     private static final String REPOSITORY = "81823650800wzy-sketch/LabCapsule";
+    private static final String WIFI_GUIDE_URL = "https://github.com/" + REPOSITORY +
+            "/blob/main/docs/V0.3.3_BLE_WIFI_QUICKSTART_ZH.md";
     private static final int REQUEST_FIRMWARE = 1001, REQUEST_MEDIA = 1002,
             REQUEST_BLE_PERMISSIONS = 1003;
 
@@ -68,7 +71,8 @@ public class MainActivity extends Activity {
     private LiquidNavBar navigationBar;
     private final ArrayList<LinearLayout> themedCards = new ArrayList<>();
     private TextView globalStatus, mediaInfo, firmwareInfo, updateInfo, aiResult,
-            externalWifiState, externalWifiIp, externalWifiHint;
+            externalWifiState, externalWifiIp, externalWifiHint, sensorResult,
+            screenMonitorState;
     private ProgressBar globalProgress;
     private EditText deviceUrlInput, wifiSsid, wifiPassword, mqttUri, mqttUser, mqttPassword,
             mqttTopic, brightnessInput, aiEndpoint, aiModel, aiKey, aiQuestion;
@@ -96,11 +100,19 @@ public class MainActivity extends Activity {
     private BluetoothGattCharacteristic commandCharacteristic, statusCharacteristic,
             otaControlCharacteristic, otaDataCharacteristic, fileControlCharacteristic,
             fileDataCharacteristic;
-    private boolean bleReady, scanAfterPermission;
+    private boolean bleReady, scanAfterPermission, blePendingQuiet, screenMonitorActive;
+    private String blePendingCommand = "";
     private int bleMtu = 23, bleTransferOffset, blePendingLength;
     private byte[] bleTransferData;
     private String bleTransferPhase = "idle", bleTransferKind = "";
     private Runnable bleTransferCompletion;
+    private final Runnable screenMonitorRunnable = new Runnable() {
+        @Override public void run() {
+            if (!screenMonitorActive || currentSection != 1) return;
+            requestDeviceStatus(true);
+            mainHandler.postDelayed(this, 1000);
+        }
+    };
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
@@ -144,6 +156,7 @@ public class MainActivity extends Activity {
 
     private void showSection(int index) {
         gifStreaming = false;
+        if (index != 1) stopScreenMonitorSilently();
         currentSection = index;
         themedCards.clear();
         View page = index == 0 ? buildDevicePage() : index == 1 ? buildScreenPage()
@@ -236,11 +249,13 @@ public class MainActivity extends Activity {
         connection.addView(row(button("Wi‑Fi 系统设置", false,
                         v -> startActivity(new Intent(Settings.ACTION_WIFI_SETTINGS))),
                 button("读取传感器", false, v -> fetchSensors())));
+        connection.addView(row(button("蓝牙一键配网", true, v -> showBleWifiDialog()),
+                button("恢复设备热点", false, v -> restoreRecoveryAp())), matchWrap(dp(7)));
         LinearLayout wifiStatus = card(root, null);
         section(wifiStatus, "外部 Wi‑Fi 状态", "这里直接显示连接结果，不需要查找原始 JSON");
         externalWifiState = label("● 尚未读取设备状态", 17, MUTED, true);
         externalWifiIp = label("局域网 IP：尚未获取", 15, INK, false);
-        externalWifiHint = label("先连接恢复热点并点击“检测设备”", 13, MUTED, false);
+        externalWifiHint = label("只需 BLE 连接即可配置路由器，无需让手机断网", 13, MUTED, false);
         externalWifiState.setPadding(0, 0, 0, dp(5));
         externalWifiIp.setTextIsSelectable(true);
         externalWifiHint.setPadding(0, dp(5), 0, dp(7));
@@ -249,6 +264,8 @@ public class MainActivity extends Activity {
         wifiStatus.addView(externalWifiHint);
         wifiStatus.addView(row(button("刷新 Wi‑Fi 状态", true, v -> fetchStatus()),
                 button("使用此局域网 IP", false, v -> useStationIp())));
+        wifiStatus.addView(button("打开 GitHub 配网说明", false,
+                v -> openUrl(WIFI_GUIDE_URL)), matchWrap(dp(7)));
         renderExternalWifi(preferences.getBoolean("sta_configured", false),
                 preferences.getBoolean("sta_connected", false),
                 preferences.getString("sta_ip", "0.0.0.0"),
@@ -272,7 +289,7 @@ public class MainActivity extends Activity {
         ((WallpaperPreview) mediaPreview).setStyle(visualPreset, wallpaperOpacity,
                 panelOpacity, hudOpacity);
         mediaPreview.setBackground(roundRect(CANVAS, 10, BLUE));
-        media.addView(mediaPreview, new LinearLayout.LayoutParams(-1, dp(300)));
+        media.addView(mediaPreview, new LinearLayout.LayoutParams(-1, -2));
         mediaInfo = label("选择媒体后确认 3:4 裁剪；预览中的字卡不会写入壁纸文件", 13,
                 MUTED, false);
         mediaInfo.setPadding(0, dp(9), 0, dp(4));
@@ -286,6 +303,19 @@ public class MainActivity extends Activity {
         media.addView(row(button("临时单帧", false, v -> sendSelectedFrame()),
                 button("播放 GIF", true, v -> startGifStream()),
                 button("停止播放", false, v -> stopGifStream())));
+
+        LinearLayout monitor = card(root, null);
+        section(monitor, "实时屏幕镜像", "严格 240×320 比例；每秒同步设备页面、状态与 HUD");
+        screenMonitorState = label(screenMonitorActive
+                ? "● 正在同步设备渲染状态" : "● 尚未开始监看", 13,
+                screenMonitorActive ? GREEN : MUTED, true);
+        screenMonitorState.setPadding(0, 0, 0, dp(7));
+        monitor.addView(screenMonitorState);
+        monitor.addView(label("ST7789 是只写屏，本功能镜像设备实际渲染状态与本机壁纸，"
+                + "不会伪装成面板像素回读。", 12, MUTED, false));
+        monitor.addView(row(button("开始实时监看", true, v -> startScreenMonitor()),
+                button("停止", false, v -> stopScreenMonitor())), matchWrap(dp(7)));
+        if (screenMonitorActive) mainHandler.post(screenMonitorRunnable);
 
         LinearLayout appearance = card(root, null);
         section(appearance, "界面混合台", "所有滑杆均为 0–100 连续调节，预览立即更新");
@@ -352,6 +382,10 @@ public class MainActivity extends Activity {
         sensors.addView(label("GPIO8 / GPIO9 是扩展 I²C 总线。固件可发现 MPU6050、BME280、SHT3x、INA219、ADS1115、VL53L0X，并继续注册 SPI、UART、ADC、OneWire 驱动。", 14, INK, false));
         sensors.addView(row(button("扫描传感器", true, v -> fetchSensors()),
                 button("刷新状态", false, v -> fetchStatus())));
+        sensorResult = label("尚未扫描。BLE 连接时也可直接扫描 I²C。", 13, MUTED, false);
+        sensorResult.setTextIsSelectable(true);
+        sensorResult.setPadding(0, dp(8), 0, 0);
+        sensors.addView(sensorResult);
         LinearLayout firmware = card(root, null);
         section(firmware, "固件更新", "双 OTA 分区，校验成功后才切换启动槽");
         transportSpinner = spinner(new String[]{"局域网 / Wi‑Fi", "Bluetooth LE"});
@@ -399,12 +433,16 @@ public class MainActivity extends Activity {
         ScrollView page = page("设置", "网络、远程连接、更新与本地偏好");
         LinearLayout root = pageRoot(page);
         LinearLayout network = card(root, null);
-        section(network, "外部 Wi‑Fi", "通过恢复热点配置一次，随后回到正常网络使用");
+        section(network, "外部 Wi‑Fi", "推荐连接 BLE 后直接保存；手机全程保持正常联网");
+        transportSpinner = spinner(new String[]{"局域网 / Wi‑Fi", "Bluetooth LE"});
+        transportSpinner.setSelection(preferences.getInt("transport", 0));
+        network.addView(transportSpinner, matchWrap(0));
         wifiSsid = input(preferences.getString("wifi_ssid", ""), "路由器 SSID", false);
         wifiPassword = input(secureStore.get("wifi_password"), "路由器密码", true);
         network.addView(wifiSsid, matchWrap(0));
         network.addView(wifiPassword, matchWrap(dp(5)));
-        keepRecoveryAp = check("保留 LabCapsule 恢复热点", preferences.getBoolean("keep_ap", true));
+        keepRecoveryAp = check("保留 LabCapsule 恢复热点（推荐）", true);
+        keepRecoveryAp.setEnabled(false);
         network.addView(keepRecoveryAp);
         section(network, "远程 MQTT", "设备主动连接服务器，无需开放路由器入站端口");
         mqttUri = input(preferences.getString("mqtt_uri", ""), "mqtts://broker.example.com:8883", false);
@@ -421,6 +459,8 @@ public class MainActivity extends Activity {
                 "屏幕亮度 0–100", false);
         network.addView(brightnessInput, matchWrap(dp(5)));
         network.addView(button("保存并连接", true, v -> saveNetworkSettings()), matchWrap(dp(8)));
+        network.addView(button("查看普通用户配网步骤", false,
+                v -> openUrl(WIFI_GUIDE_URL)), matchWrap(dp(6)));
         LinearLayout updates = card(root, null);
         section(updates, "自动更新", "通过 GitHub Releases 查找 APK 和固件");
         CheckBox automatic = check("启动时自动检查更新", preferences.getBoolean("auto_update", true));
@@ -433,7 +473,7 @@ public class MainActivity extends Activity {
         updates.addView(row(button("检查更新", false, v -> checkForUpdates(false)),
                 button("下载新版 APK", true, v -> downloadLatestApk())));
         LinearLayout about = card(root, null);
-        section(about, "关于", "LabCapsule V0.3.2 · Motion Experiment Prototype");
+        section(about, "关于", "LabCapsule V0.3.3 · Motion Experiment Prototype");
         about.addView(label("默认语言：简体中文\n协议：HTTP + MQTT + BLE GATT\n屏幕：240×320 RGB565 双缓冲\n仓库：github.com/" + REPOSITORY, 13, MUTED, false));
         return page;
     }
@@ -691,36 +731,79 @@ public class MainActivity extends Activity {
     }
 
     private void fetchStatus() {
-        status("正在连接设备…", true);
-        http("GET", "/api/status", null, null, result -> {
+        requestDeviceStatus(false);
+    }
+    private void requestDeviceStatus(boolean quiet) {
+        if (!quiet) status("正在连接设备…", true);
+        if (selectedTransport() == 1) {
+            writeBleCommand("STATUS", quiet);
+            return;
+        }
+        String endpoint = baseUrl() + "/api/status";
+        worker.execute(() -> {
             try {
-                JSONObject root = new JSONObject(result);
-                JSONObject network = root.getJSONObject("network");
-                renderExternalWifi(network.optBoolean("staConfigured"),
-                        network.optBoolean("staConnected"),
-                        network.optString("staIp", "0.0.0.0"),
-                        network.optString("recoveryAp", "LabCapsule"));
-                JSONObject device = root.optJSONObject("device");
-                JSONObject style = device == null ? null : device.optJSONObject("style");
-                if (style != null) {
-                    int previousPreset = visualPreset;
-                    applyThemePalette(style.optInt("preset", visualPreset));
-                    wallpaperOpacity = style.optInt("wallpaperOpacity", wallpaperOpacity);
-                    panelOpacity = style.optInt("panelOpacity", panelOpacity);
-                    hudOpacity = style.optInt("hudOpacity", hudOpacity);
-                    preferences.edit().putInt("visual_preset", visualPreset)
-                            .putInt("wallpaper_opacity", wallpaperOpacity)
-                            .putInt("panel_opacity", panelOpacity)
-                            .putInt("hud_opacity", hudOpacity).apply();
-                    refreshThemeSurfaces();
-                    if (previousPreset != visualPreset)
-                        mainHandler.post(() -> showSection(currentSection));
-                }
-                status("设备在线 · 网络状态已刷新", true);
+                String result = httpBlocking("GET", endpoint, null, null, 8000);
+                runOnUiThread(() -> handleStatusPayload(result, quiet));
             } catch (Exception error) {
-                status("设备在线，但状态格式无法解析：" + error.getMessage(), false);
+                if (!quiet) runOnUiThread(() ->
+                        status("请求失败：" + error.getMessage(), false));
             }
         });
+    }
+    private void handleStatusPayload(String result, boolean quiet) {
+        try {
+            JSONObject root = new JSONObject(result);
+            JSONObject network = root.optJSONObject("network");
+            if (network != null) renderExternalWifi(network.optBoolean("staConfigured"),
+                    network.optBoolean("staConnected"),
+                    network.optString("staIp", "0.0.0.0"),
+                    network.optString("recoveryAp", "LabCapsule"));
+            if (network != null && !network.optBoolean("recoveryApActive", true) &&
+                    externalWifiHint != null) {
+                externalWifiHint.append("\n恢复热点当前未启用；请点击“恢复设备热点”。");
+            }
+            if (network != null && !network.optBoolean("staConnected") &&
+                    network.optInt("lastDisconnectReason", 0) != 0 &&
+                    externalWifiHint != null) {
+                externalWifiHint.append("\n最近失败：" + wifiReasonText(
+                        network.optInt("lastDisconnectReason", 0)));
+            }
+            JSONObject device = root.optJSONObject("device");
+            JSONObject style = device == null ? null : device.optJSONObject("style");
+            if (style != null) {
+                int previousPreset = visualPreset;
+                applyThemePalette(style.optInt("preset", visualPreset));
+                wallpaperOpacity = style.optInt("wallpaperOpacity", wallpaperOpacity);
+                panelOpacity = style.optInt("panelOpacity", panelOpacity);
+                hudOpacity = style.optInt("hudOpacity", hudOpacity);
+                preferences.edit().putInt("visual_preset", visualPreset)
+                        .putInt("wallpaper_opacity", wallpaperOpacity)
+                        .putInt("panel_opacity", panelOpacity)
+                        .putInt("hud_opacity", hudOpacity).apply();
+                refreshThemeSurfaces();
+                if (previousPreset != visualPreset && !screenMonitorActive)
+                    mainHandler.post(() -> showSection(currentSection));
+            }
+            if (device != null && mediaPreview instanceof WallpaperPreview) {
+                ((WallpaperPreview) mediaPreview).setDeviceState(
+                        device.optString("state", "READY"),
+                        device.optString("view", "home"),
+                        device.optString("mpu", "unknown"),
+                        device.optBoolean("backlight", true));
+            }
+            if (screenMonitorState != null && screenMonitorActive) {
+                screenMonitorState.setText("● 实时同步中 · " +
+                        (device == null ? "等待设备状态" : device.optString("view", "home") +
+                                " / " + device.optString("state", "READY")));
+                screenMonitorState.setTextColor(GREEN);
+            }
+            if (!quiet) status("设备在线 · staConnected=" +
+                    (network != null && network.optBoolean("staConnected")) +
+                    " · staIp=" + (network == null ? "未知" :
+                    network.optString("staIp", "0.0.0.0")), true);
+        } catch (Exception error) {
+            if (!quiet) status("设备在线，但状态格式无法解析：" + error.getMessage(), false);
+        }
     }
     private void renderExternalWifi(boolean configured, boolean connected, String ip,
                                     String recoveryAp) {
@@ -737,7 +820,8 @@ public class MainActivity extends Activity {
             }
             if (externalWifiIp != null) externalWifiIp.setText("局域网 IP：http://" + ip);
             if (externalWifiHint != null) externalWifiHint.setText(
-                    "手机现在可以切回正常联网 Wi‑Fi，再点击“使用此局域网 IP”。");
+                    "连接成功。手机保持正常联网 Wi‑Fi，点击“使用此局域网 IP”即可。\n"
+                            + "staConnected=true · staIp=" + ip);
         } else if (configured) {
             lastStationIp = null;
             if (externalWifiState != null) {
@@ -746,7 +830,9 @@ public class MainActivity extends Activity {
             }
             if (externalWifiIp != null) externalWifiIp.setText("局域网 IP：尚未获取");
             if (externalWifiHint != null) externalWifiHint.setText(
-                    "请确认是 2.4 GHz Wi‑Fi、密码正确，并保持连接 " + recoveryAp + " 后重试。");
+                    "staConnected=false · staIp=0.0.0.0\n"
+                            + "请确认路由器开启 2.4 GHz、SSID/密码正确；可直接用 BLE 重配。"
+                            + "恢复热点：" + recoveryAp);
         } else {
             lastStationIp = null;
             if (externalWifiState != null) {
@@ -755,8 +841,16 @@ public class MainActivity extends Activity {
             }
             if (externalWifiIp != null) externalWifiIp.setText("局域网 IP：尚未获取");
             if (externalWifiHint != null) externalWifiHint.setText(
-                    "进入“设置”填写路由器 SSID 与密码，然后返回这里刷新。");
+                    "staConnected=false · staIp=0.0.0.0\n"
+                            + "连接 BLE 后点击“蓝牙一键配网”，无需连接设备热点。");
         }
+    }
+    private String wifiReasonText(int reason) {
+        if (reason == 201) return "未找到该 2.4 GHz 网络（代码 201）";
+        if (reason == 202) return "密码或认证失败（代码 202）";
+        if (reason == 203) return "路由器拒绝关联（代码 203）";
+        if (reason == 204) return "握手超时（代码 204）";
+        return "Wi‑Fi 断开代码 " + reason;
     }
     private void useStationIp() {
         if (lastStationIp == null || lastStationIp.isEmpty()) {
@@ -769,8 +863,48 @@ public class MainActivity extends Activity {
     }
     private void fetchSensors() {
         status("正在扫描扩展总线…", true);
+        if (selectedTransport() == 1) {
+            writeBleCommand("SENSORS");
+            return;
+        }
         http("GET", "/api/sensors", null, null,
-                result -> status("传感器扫描完成\n" + result, true));
+                this::handleSensorPayload);
+    }
+    private void handleSensorPayload(String payload) {
+        try {
+            JSONObject root = new JSONObject(payload);
+            JSONObject hub = root.optJSONObject("hub");
+            JSONObject source = hub == null ? root : hub;
+            JSONArray sensors = source.optJSONArray("sensors");
+            StringBuilder result = new StringBuilder("I²C 扫描完成");
+            int found = root.optInt("count", -1);
+            if (sensors != null) {
+                if (found < 0) {
+                    found = 0;
+                    for (int i = 0; i < sensors.length(); ++i)
+                        if (sensors.getJSONObject(i).optBoolean("detected")) ++found;
+                }
+                result.append(" · 发现 ").append(found).append(" 个响应设备");
+                for (int i = 0; i < sensors.length(); ++i) {
+                    JSONObject sensor = sensors.getJSONObject(i);
+                    if (hub != null && !sensor.optBoolean("detected")) continue;
+                    String address = sensor.optString("address", "?");
+                    if (hub != null && sensor.has("address"))
+                        address = String.format(Locale.US, "0x%02X",
+                                sensor.optInt("address"));
+                    result.append("\n• ").append(sensor.optString("name",
+                            sensor.optString("id", "未知设备"))).append(" · ").append(address);
+                }
+            }
+            if (found == 0) result.append("\n请检查 SDA=GPIO8、SCL=GPIO9、3V3 与共地。");
+            if (sensorResult != null) {
+                sensorResult.setText(result.toString());
+                sensorResult.setTextColor(found > 0 ? GREEN : RED);
+            }
+            status(result.toString(), found > 0);
+        } catch (Exception error) {
+            status("扫描结果无法解析：" + error.getMessage(), false);
+        }
     }
     private void sendAction(String action) {
         if (selectedTransport() == 1) { writeBleCommand(action); return; }
@@ -832,7 +966,9 @@ public class MainActivity extends Activity {
         BitmapFactory.Options bounds = new BitmapFactory.Options();
         bounds.inJustDecodeBounds = true;
         BitmapFactory.decodeByteArray(bytes, 0, bytes.length, bounds);
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null;
         BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inSampleSize = 1;
         int largest = Math.max(bounds.outWidth, bounds.outHeight);
         while (largest / options.inSampleSize > 2048) options.inSampleSize *= 2;
         options.inPreferredConfig = Bitmap.Config.ARGB_8888;
@@ -1160,6 +1296,87 @@ public class MainActivity extends Activity {
         else uploadBytes("/api/ota", selectedFirmware, "固件校验成功，设备正在重启");
     }
 
+    private void showBleWifiDialog() {
+        if (!bleReady) {
+            status("请先点击“扫描 BLE”并等待显示 BLE 已就绪", false);
+            return;
+        }
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(dp(20), dp(8), dp(20), 0);
+        TextView guide = label("输入家中/实验室路由器的 2.4 GHz Wi‑Fi。手机不会切换网络。",
+                13, MUTED, false);
+        EditText ssid = input(preferences.getString("wifi_ssid", ""),
+                "路由器 SSID（区分大小写）", false);
+        EditText password = input(secureStore.get("wifi_password"),
+                "Wi‑Fi 密码（开放网络可留空）", true);
+        form.addView(guide, matchWrap(0));
+        form.addView(ssid, matchWrap(dp(8)));
+        form.addView(password, matchWrap(dp(6)));
+        new AlertDialog.Builder(this).setTitle("通过蓝牙连接外部 Wi‑Fi")
+                .setView(form).setNegativeButton("取消", null)
+                .setPositiveButton("保存并连接", (dialog, which) ->
+                        configureWifiOverBle(ssid.getText().toString().trim(),
+                                password.getText().toString())).show();
+    }
+
+    private void configureWifiOverBle(String ssid, String password) {
+        if (ssid.isEmpty()) { status("SSID 不能为空，请重新打开配网", false); return; }
+        if (ssid.getBytes(StandardCharsets.UTF_8).length > 32 ||
+                password.getBytes(StandardCharsets.UTF_8).length > 63) {
+            status("SSID 或密码超过 Wi‑Fi 标准长度", false); return;
+        }
+        preferences.edit().putString("wifi_ssid", ssid).putBoolean("keep_ap", true).apply();
+        secureStore.put("wifi_password", password);
+        String encodedSsid = Base64.encodeToString(ssid.getBytes(StandardCharsets.UTF_8),
+                Base64.NO_WRAP);
+        String encodedPassword = Base64.encodeToString(
+                password.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
+        status("配网信息正在通过 BLE 下发；手机保持当前联网状态…", true);
+        writeBleCommand("WIFI:" + encodedSsid + ":" + encodedPassword);
+        mainHandler.postDelayed(() -> writeBleCommand("STATUS", true), 1800);
+        mainHandler.postDelayed(() -> writeBleCommand("STATUS", true), 4500);
+        mainHandler.postDelayed(() -> writeBleCommand("STATUS", false), 8500);
+    }
+
+    private void restoreRecoveryAp() {
+        if (!bleReady) {
+            status("恢复热点需要 BLE 连接；请先扫描并连接设备", false); return;
+        }
+        status("正在通过 BLE 恢复设备热点…", true);
+        writeBleCommand("AP:ON");
+        mainHandler.postDelayed(() -> writeBleCommand("STATUS", false), 1200);
+    }
+
+    private void openUrl(String url) {
+        try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url))); }
+        catch (Exception error) { status("无法打开链接：" + error.getMessage(), false); }
+    }
+
+    private void startScreenMonitor() {
+        screenMonitorActive = true;
+        if (screenMonitorState != null) {
+            screenMonitorState.setText("● 正在建立实时镜像…");
+            screenMonitorState.setTextColor(GREEN);
+        }
+        mainHandler.removeCallbacks(screenMonitorRunnable);
+        mainHandler.post(screenMonitorRunnable);
+    }
+
+    private void stopScreenMonitorSilently() {
+        screenMonitorActive = false;
+        mainHandler.removeCallbacks(screenMonitorRunnable);
+    }
+
+    private void stopScreenMonitor() {
+        stopScreenMonitorSilently();
+        if (screenMonitorState != null) {
+            screenMonitorState.setText("● 实时监看已停止");
+            screenMonitorState.setTextColor(MUTED);
+        }
+        status("屏幕实时镜像已停止", true);
+    }
+
     private void saveNetworkSettings() {
         preferences.edit().putString("wifi_ssid", wifiSsid.getText().toString().trim())
                 .putString("mqtt_uri", mqttUri.getText().toString().trim())
@@ -1172,6 +1389,12 @@ public class MainActivity extends Activity {
         secureStore.put("wifi_password", wifiPassword.getText().toString());
         try {
             int brightness = Integer.parseInt(brightnessInput.getText().toString().trim());
+            if (selectedTransport() == 1) {
+                configureWifiOverBle(wifiSsid.getText().toString().trim(),
+                        wifiPassword.getText().toString());
+                status("BLE 已下发 Wi‑Fi；MQTT 等高级项将在局域网连接后同步", true);
+                return;
+            }
             JSONObject config = new JSONObject()
                     .put("ssid", wifiSsid.getText().toString())
                     .put("password", wifiPassword.getText().toString())
@@ -1447,8 +1670,14 @@ public class MainActivity extends Activity {
                     otaControlCharacteristic != null && otaDataCharacteristic != null &&
                     fileControlCharacteristic != null && fileDataCharacteristic != null;
             if (hasBlePermissions()) gatt.requestMtu(517);
-            runOnUiThread(() -> status(bleReady ? "BLE 控制、OTA 与媒体通道已就绪"
-                    : "BLE 特征不完整", bleReady));
+            runOnUiThread(() -> {
+                if (bleReady) {
+                    preferences.edit().putInt("transport", 1).apply();
+                    if (transportSpinner != null) transportSpinner.setSelection(1);
+                }
+                status(bleReady ? "BLE 控制、配网、I²C 扫描与媒体通道已就绪"
+                        : "BLE 特征不完整", bleReady);
+            });
         }
         @Override public void onMtuChanged(BluetoothGatt gatt, int mtu, int code) {
             if (code == BluetoothGatt.GATT_SUCCESS) bleMtu = mtu;
@@ -1467,16 +1696,43 @@ public class MainActivity extends Activity {
         }
     };
     private void handleBleRead(byte[] value, int code) {
-        runOnUiThread(() -> status(code == BluetoothGatt.GATT_SUCCESS && value != null
-                ? "BLE 在线\n" + new String(value, StandardCharsets.UTF_8)
-                : "BLE 读取失败：" + code, code == BluetoothGatt.GATT_SUCCESS));
+        final boolean quiet = blePendingQuiet;
+        blePendingQuiet = false;
+        blePendingCommand = "";
+        runOnUiThread(() -> {
+            if (code != BluetoothGatt.GATT_SUCCESS || value == null) {
+                if (!quiet) status("BLE 读取失败：" + code, false);
+                return;
+            }
+            String payload = new String(value, StandardCharsets.UTF_8);
+            try {
+                JSONObject root = new JSONObject(payload);
+                if ("sensors".equals(root.optString("type"))) {
+                    handleSensorPayload(payload);
+                } else if (root.has("network") || "status".equals(root.optString("type"))) {
+                    handleStatusPayload(payload, quiet);
+                } else if (!quiet) {
+                    status("BLE 在线\n" + payload, true);
+                }
+            } catch (Exception error) {
+                if (!quiet) status("BLE 回包无法解析：" + payload, false);
+            }
+        });
     }
     private void writeBleCommand(String command) {
+        writeBleCommand(command, false);
+    }
+    private void writeBleCommand(String command, boolean quiet) {
         if (!bleReady || !"idle".equals(bleTransferPhase)) {
-            status("BLE 未连接或正在传输", false); return;
+            if (!quiet) status("BLE 未连接或正在传输", false);
+            return;
         }
+        blePendingQuiet = quiet;
+        blePendingCommand = command;
+        String wireCommand = command.startsWith("WIFI:")
+                ? command : command.toUpperCase(Locale.ROOT);
         if (!writeCharacteristic(commandCharacteristic,
-                command.toUpperCase(Locale.ROOT).getBytes(StandardCharsets.UTF_8)))
+                wireCommand.getBytes(StandardCharsets.UTF_8)) && !quiet)
             status("BLE 指令发送失败", false);
     }
     private boolean writeCharacteristic(BluetoothGattCharacteristic characteristic,
@@ -1567,8 +1823,14 @@ public class MainActivity extends Activity {
                 status("BLE " + bleTransferKind + " 传输完成", true);
                 if (completion != null) completion.run();
             });
-        } else if ("idle".equals(bleTransferPhase)) {
-            runOnUiThread(() -> status("BLE 指令已执行", true));
+        } else if ("idle".equals(bleTransferPhase) && uuid.equals(COMMAND_UUID)) {
+            if (bluetoothGatt == null || statusCharacteristic == null ||
+                    !hasBlePermissions() || !bluetoothGatt.readCharacteristic(statusCharacteristic)) {
+                final boolean quiet = blePendingQuiet;
+                runOnUiThread(() -> {
+                    if (!quiet) status("BLE 指令已执行，但无法读取结果", false);
+                });
+            }
         }
     }
     private void advanceBleTransfer() {
@@ -1600,6 +1862,7 @@ public class MainActivity extends Activity {
 
     @Override protected void onDestroy() {
         gifStreaming = false;
+        stopScreenMonitorSilently();
         worker.shutdownNow();
         if (bleScanner != null && hasBlePermissions()) bleScanner.stopScan(scanCallback);
         if (bluetoothGatt != null && hasBlePermissions()) {
@@ -1640,6 +1903,8 @@ public class MainActivity extends Activity {
     private final class WallpaperPreview extends ImageView {
         private final Paint hudPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private int previewPanelOpacity = 76, previewHudOpacity = 100;
+        private String deviceState = "READY", deviceView = "home", deviceMpu = "unknown";
+        private boolean deviceBacklight = true;
         WallpaperPreview(Context context) {
             super(context);
             setLayerType(LAYER_TYPE_SOFTWARE, null);
@@ -1649,6 +1914,18 @@ public class MainActivity extends Activity {
             previewHudOpacity = hud;
             setImageAlpha(wallpaper * 255 / 100);
             invalidate();
+        }
+        void setDeviceState(String state, String view, String mpu, boolean backlight) {
+            deviceState = state == null ? "READY" : state;
+            deviceView = view == null ? "home" : view;
+            deviceMpu = mpu == null ? "unknown" : mpu;
+            deviceBacklight = backlight;
+            invalidate();
+        }
+        @Override protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+            int width = MeasureSpec.getSize(widthMeasureSpec);
+            if (width <= 0) width = dp(240);
+            setMeasuredDimension(width, Math.round(width * 320f / 240f));
         }
         private int alphaColor(int color, int percent) {
             return Color.argb(percent * 255 / 100, Color.red(color), Color.green(color),
@@ -1683,10 +1960,19 @@ public class MainActivity extends Activity {
             hudText(canvas, "FIELD UNIT 01", 18, 80, 11, MUTED, false);
             hudPaint.setColor(alphaColor(BLUE, previewHudOpacity));
             canvas.drawRect(18, 104, 222, 107, hudPaint);
-            hudText(canvas, "READY", 24, 173, 28, BLUE, true);
-            hudText(canvas, "MPU LINK / STANDBY", 24, 234, 13, INK, true);
-            hudText(canvas, "SENSOR MODE", 24, 266, 12, MUTED, false);
-            hudText(canvas, "200HZ  10SEC", 24, 294, 12, INK, true);
+            String primary = "home".equals(deviceView) ? deviceState :
+                    "settings".equals(deviceView) ? "SETTINGS" :
+                    "developer".equals(deviceView) ? "DEVELOPER" :
+                    "test".equals(deviceView) ? "COLOR TEST" :
+                    "wallpaper".equals(deviceView) ? "WALLPAPER" :
+                    "media".equals(deviceView) ? "LIVE MEDIA" : deviceView.toUpperCase(Locale.ROOT);
+            hudText(canvas, primary, 24, 173, primary.length() > 10 ? 20 : 28, BLUE, true);
+            hudText(canvas, "VIEW / " + deviceView.toUpperCase(Locale.ROOT), 24, 234,
+                    13, INK, true);
+            hudText(canvas, "I2C " + deviceMpu.toUpperCase(Locale.ROOT), 24, 266,
+                    12, MUTED, false);
+            hudText(canvas, deviceBacklight ? "DISPLAY ONLINE" : "BACKLIGHT OFF",
+                    24, 294, 12, deviceBacklight ? INK : RED, true);
             canvas.restore();
         }
     }

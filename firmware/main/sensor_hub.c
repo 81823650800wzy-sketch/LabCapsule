@@ -97,3 +97,30 @@ void sensor_hub_build_json(char *buffer, size_t buffer_size)
     }
     if (used + 3 < buffer_size) snprintf(buffer + used, buffer_size - used, "]}");
 }
+
+void sensor_hub_build_ble_json(char *buffer, size_t buffer_size)
+{
+    if (!buffer || buffer_size == 0) return;
+    size_t found = 0;
+    for (size_t i = 0; i < s_slot_count; ++i) {
+        if (s_slots[i].detected) ++found;
+    }
+    size_t used = snprintf(buffer, buffer_size,
+                           "{\"ok\":true,\"type\":\"sensors\",\"count\":%u,"
+                           "\"i2c\":\"SDA GPIO8 / SCL GPIO9\",\"sensors\":[",
+                           (unsigned)found);
+    bool first = true;
+    for (size_t i = 0; i < s_slot_count && used < buffer_size; ++i) {
+        const sensor_slot_t *slot = &s_slots[i];
+        if (!slot->detected) continue;
+        int written = snprintf(buffer + used, buffer_size - used,
+                               "%s{\"id\":\"%s\",\"name\":\"%s\","
+                               "\"bus\":\"i2c\",\"address\":\"0x%02X\"}",
+                               first ? "" : ",", slot->driver.id,
+                               slot->driver.display_name, slot->driver.address);
+        if (written < 0 || (size_t)written >= buffer_size - used) break;
+        used += (size_t)written;
+        first = false;
+    }
+    if (used + 3 < buffer_size) snprintf(buffer + used, buffer_size - used, "]}");
+}

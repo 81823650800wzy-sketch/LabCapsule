@@ -5,7 +5,7 @@
 
 #include "esp_err.h"
 
-#define LABCAPSULE_VERSION "0.3.2-alpha"
+#define LABCAPSULE_VERSION "0.3.3-alpha"
 
 typedef enum {
     LABCAPSULE_MEDIA_RAW565 = 0,

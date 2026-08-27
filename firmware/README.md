@@ -1,4 +1,4 @@
-# LabCapsule ESP-IDF Firmware 0.3.2-alpha
+# LabCapsule ESP-IDF Firmware 0.3.3-alpha
 
 目标硬件：ESP32-S3，16 MiB Flash、8 MiB Octal PSRAM、ESP-IDF 5.5.4。
 
@@ -11,7 +11,7 @@ idf.py build
 idf.py -p COM8 flash monitor
 ```
 
-首次安装、从 0.1.x 升级或修改分区表时必须执行完整 `flash`。之后可以在 APK 中选择 `LabCapsule-0.3.2-ota.bin` 经 Wi-Fi/BLE 更新。不要为普通升级运行 `erase-flash`，它会清除 NVS 配置和持久壁纸。
+首次安装、从 0.1.x 升级或修改分区表时必须执行完整 `flash`。之后可以在 APK 中选择 `LabCapsule-0.3.3-ota.bin` 经 Wi-Fi/BLE 更新。不要为普通升级运行 `erase-flash`，它会清除 NVS 配置和持久壁纸。
 
 ## 分区与内存
 
@@ -25,8 +25,8 @@ idf.py -p COM8 flash monitor
 启动后进入 AP+STA 模式：
 
 - 恢复热点 `LabCapsule-XXXX`，密码 `labcapsule`，HTTP `192.168.4.1`；
-- 保存外部 Wi-Fi 后自动连接，`GET /api/status` 的 `network` 对象返回 `staConfigured`、`staConnected` 和 `staIp`；
-- 可保留恢复热点，防止配置错误后失联；
+- 保存外部 Wi-Fi 后自动连接，HTTP 和 BLE 状态均返回 `staConfigured`、`staConnected`、`staIp`、`recoveryApActive` 与最近断开原因；
+- Station 连续失败四次后自动退回纯恢复热点，防止错误配置造成热点长期不可见；新的 BLE 配网会重新启动 AP+STA；
 - 可配置设备主动连接 MQTT/mqtts Broker，无需在家庭路由器开放入站端口。
 
 远程主题：
@@ -76,12 +76,14 @@ idf.py -p COM8 flash monitor
 
 | 结尾 | 属性 | 功能 |
 |---:|---|---|
-| `0002` | command | 屏幕/按键命令，含 `START:200:20` |
+| `0002` | command | 屏幕/按键命令，以及 `STATUS`、`SENSORS`、`AP:ON`、BLE Wi-Fi 配网 |
 | `0003` | status | 状态读取/通知 |
 | `0004` | OTA control | `BEGIN:size`、`END`、`ABORT` |
 | `0005` | OTA data | 固件分片 |
 | `0006` | file control | 媒体开始、结束、CRC32 |
 | `0007` | file data | RGB565 分片 |
+
+BLE 配网命令为 `WIFI:<base64-ssid>:<base64-password>`，使用标准 Base64 且不换行。SSID/密码不会出现在状态回包中。`STATUS` 回包包含精简设备渲染状态和完整网络状态；`SENSORS` 会重新扫描 GPIO8/9 并只返回当前有响应的 I²C 设备。
 
 媒体控制帧：`BEGIN:FRAME:<size>:<duration-ms>:<crc32>:<encoding>:<x>:<y>:<w>:<h>` 或 `BEGIN:WALLPAPER:153600:0:<crc32>:raw565:0:0:240:320`，随后写入数据分片并发送 `END`。旧版四字段 FRAME 控制帧仍按完整 `raw565` 兼容。
 
