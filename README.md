@@ -2,9 +2,17 @@
 
 > Ask a question. Run an experiment.
 
-LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前版本为 **V0.4.0 Alpha / Motion Experiment Prototype**，已经打通“自然语言问题 → 实验协议 → 六轴采集 → CSV/分析”的设备侧和 Android 控制链路。
+LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前版本为 **V0.5.0 Alpha / Offline-capable Motion Experiment Prototype**，已经打通“自然语言问题 → 实验协议 → 六轴采集 → 在线直传或离线缓存 → CSV/分析”的设备侧和 Android 控制链路。
 
-## V0.4.0 已实现
+## V0.5.0 已实现
+
+- 新增 8 MiB 磨损均衡离线实验分区和 `LCB1` 紧凑数据格式。没有 BLE/MQTT 实时接收端时，设备自动缓存时间戳与六轴数据；在线时直接推送，不重复写 Flash。
+- 新增 BLE 实时实验通知与离线会话导出。APK“数据”页可读取容量/会话数、同步缓存、转换 CSV，并直接执行 RMS、Peak、FFT 与主频分析。
+- 新增统一 `input_hub`。现有六按键、未来模拟摇杆、按键矩阵、I/O 扩展芯片及 BLE/HTTP 虚拟按键都映射为同一组逻辑动作；仅使用硬件即可调整采样率/时长、开始、停止或中止实验。
+- 固件串口输出改为非阻塞，避免没有 USB 数据接收端时拖慢采样；离线会话在采样任务启动前建立，消除开头样本竞态。
+- APK 明确说明 ESP32-S3 仅支持 2.4 GHz Wi-Fi。只有纯 5 GHz 网络时，`staConnected=false`、`staIp=0.0.0.0` 是硬件能力边界，BLE 控制、传感器扫描、实验与离线同步仍可使用。
+
+V0.4.0 的界面与媒体能力继续保留：
 
 - APK 主导航重构为“首页 / 实验 / 数据 / AI / 设置”：首页提供实验快捷入口，实验页负责协议与采集，数据页保存记录并分析 CSV；设备、屏幕和固件均归入设置且默认折叠。
 - 首页内置桌面振动、碰撞峰值和姿态稳定三种真实 Experiment Protocol；自定义实验支持 10–500 Hz、1–3600 秒。
@@ -42,7 +50,7 @@ LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前版本�
    idf.py -p COM8 flash monitor
    ```
 
-2. 安装 `release/LabCapsule-0.4.0.apk`。首次进入“设置 → 设备与连接”，推荐选择：
+2. 安装 `release/LabCapsule-0.5.0.apk`。首次进入“设置 → 设备与连接”，推荐选择：
 
    - BLE：点击扫描并允许“附近设备”权限；连接成功后直接点“蓝牙一键配网”；
    - 恢复热点：只在排障时连接 `LabCapsule-XXXX`，密码 `labcapsule`，地址 `http://192.168.4.1`。
@@ -51,7 +59,7 @@ LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前版本�
 
 4. 在“AI”页填写 API Endpoint、模型和 Key，生成协议后点击“发送并开始实验”。Key 由 Android Keystore 加密，仅在手机端使用。
 
-完整操作见 [V0.4.0 实验、数据与后台 GIF 指南](docs/V0.4.0_EXPERIMENT_GIF_GUIDE_ZH.md)、[V0.3.3 蓝牙配网与连接排障](docs/V0.3.3_BLE_WIFI_QUICKSTART_ZH.md) 和 [V0.3.2 壁纸与界面指南](docs/V0.3.2_WALLPAPER_STYLE_GUIDE_ZH.md)，系统边界与扩展方式见 [V0.3.0 架构说明](docs/V0.3.0_ARCHITECTURE.md)。
+完整操作见 [V0.5.0 离线实验与硬件扩展指南](docs/V0.5.0_OFFLINE_HARDWARE_GUIDE_ZH.md)、[V0.4.0 实验、数据与后台 GIF 指南](docs/V0.4.0_EXPERIMENT_GIF_GUIDE_ZH.md)、[V0.3.3 蓝牙配网与连接排障](docs/V0.3.3_BLE_WIFI_QUICKSTART_ZH.md) 和 [V0.3.2 壁纸与界面指南](docs/V0.3.2_WALLPAPER_STYLE_GUIDE_ZH.md)。
 
 ## 冻结引脚
 
@@ -70,10 +78,10 @@ LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前版本�
 自然语言问题
   → APK 内 AI / 本地回退模板
   → Experiment Protocol JSON
-  → HTTP 或 BLE 下发
+  → 按键 / HTTP / BLE 下发
   → MPU6050 / Mock 采样
-  → USB 串口实时六轴数据
-  → PC 保存 CSV
+  → BLE/MQTT 在线直传；无人接收时写入 8 MiB 离线分区
+  → APK 同步为 CSV，或 USB 串口实时保存
   → RMS / Peak / FFT / 主频与实验组比较
 ```
 
@@ -89,13 +97,13 @@ SPEC_V0.1.md             初始产品规格（历史基线）
 
 ## 当前实机状态
 
-2026-08-27 已在 COM8 的 ESP32-S3 rev 0.2 / 16 MiB Flash / 8 MiB Octal PSRAM 上完成 V0.4.0 构建和完整烧录，串口启动标识为 `BOOT,LABCAPSULE,0.4.0-alpha`。实测 BLE 发送 240×320 RLE332 基准帧为 604 字节，随后在 10×10 区域更新一个像素的 `delta332` 帧仅 4 字节；设备日志分别确认 `ENC=3` 与 `ENC=4`。BLE `SENSORS` 返回 I²C `0x68`，但 `WHO_AM_I=0x70` 与标准 MPU6050 标识不一致，正式采集前仍应确认模块型号。已保存的错误外网配置仍会在四次失败后退回恢复热点，这是预期保护行为。
+2026-08-28 已在 COM8 的 ESP32-S3 rev 0.2 / 16 MiB Flash / 8 MiB Octal PSRAM 上完成 V0.5.0 构建、完整分区烧录和实机验证，串口启动标识为 `BOOT,LABCAPSULE,0.5.0-alpha`。100 Hz × 2 秒离线实验得到串口 200 条、缓存 200 条、丢样 0；BLE 在线实验收到 200/200 个通知且不新增离线会话；3 个缓存会话共 8,208 字节已通过 BLE 完整导出并逐头校验。BLE `SENSORS` 返回 I²C `0x68`，但 `WHO_AM_I=0x70` 与标准 MPU6050 标识不一致，正式采集前仍应确认模块型号。纯 5 GHz 网络无法被 ESP32-S3 Station 使用，设备会保持 BLE 可用并在失败四次后恢复热点。
 
 ## 安全边界
 
 - APK 中的 API Key、Wi-Fi 和 MQTT 密码使用 Android Keystore 加密保存。
 - 设备状态接口不回传密码；MQTT 支持 `mqtts://` 并使用 ESP-IDF CA 证书包。
-- 恢复热点与局域网 HTTP API 面向受信任本地网络，V0.4.0 尚未提供逐设备 HTTP 登录或云端中继服务。
+- 恢复热点与局域网 HTTP API 面向受信任本地网络，V0.5.0 尚未提供逐设备 HTTP 登录或托管云端中继服务。
 - Android 系统不允许普通应用静默安装 APK；自动更新会检查并下载，最终安装仍需用户确认。
 
 ## License

@@ -1,6 +1,7 @@
 #include "connectivity.h"
 
 #include <stdbool.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +37,7 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include "sensor_hub.h"
+#include "offline_store.h"
 #include "wallpaper.h"
 
 #define WIFI_AP_PASSWORD "labcapsule"
@@ -48,6 +50,9 @@ static char s_device_name[24] = "LabCapsule";
 static char s_ap_ssid[24] = "LabCapsule";
 static uint8_t s_ble_own_addr_type;
 static uint16_t s_ble_status_handle;
+static uint16_t s_ble_data_handle;
+static uint16_t s_ble_connection_handle = UINT16_MAX;
+static bool s_ble_data_subscribed;
 static bool s_sta_connected;
 static bool s_remote_connected;
 static uint8_t s_sta_retry_count;
@@ -56,6 +61,7 @@ static char s_sta_ip[16] = "0.0.0.0";
 static esp_mqtt_client_handle_t s_mqtt_client;
 static char s_mqtt_command_topic[160];
 static char s_mqtt_status_topic[160];
+static char s_mqtt_data_topic[160];
 static char s_ble_response[BLE_VALUE_MAX];
 
 static bool s_ota_active;
@@ -104,6 +110,10 @@ static const ble_uuid128_t s_file_control_uuid = BLE_UUID128_INIT(
 static const ble_uuid128_t s_file_data_uuid = BLE_UUID128_INIT(
     0x01, 0x00, 0x65, 0x6c, 0x75, 0x73, 0x70, 0x61,
     0x43, 0x62, 0x61, 0x4c, 0x07, 0x00, 0x43, 0x6c);
+/* Live samples (notify) and queued-session export (read). */
+static const ble_uuid128_t s_experiment_data_uuid = BLE_UUID128_INIT(
+    0x01, 0x00, 0x65, 0x6c, 0x75, 0x73, 0x70, 0x61,
+    0x43, 0x62, 0x61, 0x4c, 0x08, 0x00, 0x43, 0x6c);
 
 static uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t length)
 {
@@ -359,7 +369,7 @@ void connectivity_build_status_json(char *buffer, size_t buffer_size)
 
 static void ble_build_status_response(void)
 {
-    char device_status[384];
+    char device_status[640];
     char network_status[256];
     labcapsule_build_status_json(device_status, sizeof(device_status));
     connectivity_build_status_json(network_status, sizeof(network_status));
@@ -404,6 +414,22 @@ static void ble_build_status_response(void)
     cJSON_Delete(device);
 }
 
+static void ble_build_offline_response(void)
+{
+    offline_store_info_t info;
+    offline_store_get_info(&info);
+    snprintf(s_ble_response, sizeof(s_ble_response),
+             "{\"ok\":true,\"type\":\"offline\",\"ready\":%s,"
+             "\"recording\":%s,\"full\":%s,\"sessions\":%lu,"
+             "\"samples\":%lu,\"currentSamples\":%lu,\"droppedSamples\":%lu,"
+             "\"bytesUsed\":%llu,\"bytesCapacity\":%llu}",
+             info.ready ? "true" : "false", info.recording ? "true" : "false",
+             info.full ? "true" : "false", (unsigned long)info.sessions,
+             (unsigned long)info.samples, (unsigned long)info.current_samples,
+             (unsigned long)info.dropped_samples, (unsigned long long)info.bytes_used,
+             (unsigned long long)info.bytes_capacity);
+}
+
 static bool ble_decode_base64(const char *encoded, char *decoded, size_t decoded_size)
 {
     if (!encoded || !decoded || decoded_size < 2) return false;
@@ -422,9 +448,9 @@ static bool ble_decode_base64(const char *encoded, char *decoded, size_t decoded
 
 static esp_err_t status_handler(httpd_req_t *request)
 {
-    char device_status[384];
+    char device_status[640];
     char network_status[384];
-    char response[900];
+    char response[1200];
     labcapsule_build_status_json(device_status, sizeof(device_status));
     connectivity_build_status_json(network_status, sizeof(network_status));
     snprintf(response, sizeof(response),
@@ -504,7 +530,7 @@ static esp_err_t network_handler(httpd_req_t *request)
 static esp_err_t display_config_handler(httpd_req_t *request)
 {
     if (request->method == HTTP_GET) {
-        char status[384];
+        char status[640];
         labcapsule_build_status_json(status, sizeof(status));
         return http_json(request, NULL, status);
     }
@@ -778,6 +804,41 @@ static esp_err_t ota_handler(httpd_req_t *request)
     return response_result;
 }
 
+static esp_err_t offline_handler(httpd_req_t *request)
+{
+    if (request->method == HTTP_POST) {
+        esp_err_t result = offline_store_clear();
+        if (result != ESP_OK)
+            return http_json(request, "409 Conflict",
+                             "{\"ok\":false,\"error\":\"recording or storage unavailable\"}");
+        return http_json(request, NULL, "{\"ok\":true,\"message\":\"offline data cleared\"}");
+    }
+    if (offline_store_export_open() != ESP_OK)
+        return http_json(request, "409 Conflict",
+                         "{\"ok\":false,\"error\":\"finish the experiment before export\"}");
+    httpd_resp_set_type(request, "application/octet-stream");
+    httpd_resp_set_hdr(request, "Content-Disposition",
+                       "attachment; filename=labcapsule-offline.lcb");
+    httpd_resp_set_hdr(request, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    uint8_t *buffer = malloc(HTTP_BUFFER_SIZE);
+    if (!buffer) {
+        offline_store_export_close();
+        return ESP_ERR_NO_MEM;
+    }
+    esp_err_t result = ESP_OK;
+    while (true) {
+        size_t count = offline_store_export_read(buffer, HTTP_BUFFER_SIZE);
+        if (count == 0) break;
+        result = httpd_resp_send_chunk(request, (const char *)buffer, count);
+        if (result != ESP_OK) break;
+    }
+    free(buffer);
+    offline_store_export_close();
+    if (result == ESP_OK) result = httpd_resp_send_chunk(request, NULL, 0);
+    return result;
+}
+
 static esp_err_t options_handler(httpd_req_t *request)
 {
     http_common_headers(request);
@@ -826,6 +887,12 @@ static esp_err_t http_server_start(void)
     const httpd_uri_t experiment_uri = {
         .uri = "/api/experiment", .method = HTTP_POST, .handler = experiment_handler,
     };
+    const httpd_uri_t offline_get_uri = {
+        .uri = "/api/offline", .method = HTTP_GET, .handler = offline_handler,
+    };
+    const httpd_uri_t offline_post_uri = {
+        .uri = "/api/offline", .method = HTTP_POST, .handler = offline_handler,
+    };
     const httpd_uri_t options_uri = {
         .uri = "/*", .method = HTTP_OPTIONS, .handler = options_handler,
     };
@@ -840,6 +907,8 @@ static esp_err_t http_server_start(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &sensors_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &media_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &experiment_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &offline_get_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &offline_post_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &options_uri));
     return ESP_OK;
 }
@@ -853,7 +922,7 @@ static void mqtt_event_handler(void *argument, esp_event_base_t base, int32_t ev
     if (event_id == MQTT_EVENT_CONNECTED) {
         s_remote_connected = true;
         esp_mqtt_client_subscribe(event->client, s_mqtt_command_topic, 1);
-        char status[384];
+        char status[640];
         labcapsule_build_status_json(status, sizeof(status));
         esp_mqtt_client_publish(event->client, s_mqtt_status_topic, status, 0, 1, 1);
         ESP_LOGI(TAG, "Remote MQTT connected");
@@ -893,6 +962,8 @@ static void mqtt_restart(void)
              config->mqtt_topic[0] ? config->mqtt_topic : "labcapsule", s_device_name);
     snprintf(s_mqtt_status_topic, sizeof(s_mqtt_status_topic), "%s/%s/status",
              config->mqtt_topic[0] ? config->mqtt_topic : "labcapsule", s_device_name);
+    snprintf(s_mqtt_data_topic, sizeof(s_mqtt_data_topic), "%s/%s/data",
+             config->mqtt_topic[0] ? config->mqtt_topic : "labcapsule", s_device_name);
     esp_mqtt_client_config_t mqtt_config = {
         .broker.address.uri = config->mqtt_uri,
         .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
@@ -907,6 +978,63 @@ static void mqtt_restart(void)
     esp_mqtt_client_register_event(s_mqtt_client, ESP_EVENT_ANY_ID,
                                    mqtt_event_handler, NULL);
     esp_mqtt_client_start(s_mqtt_client);
+}
+
+static int16_t stream_quantize(float value, float scale)
+{
+    long converted = lrintf(value * scale);
+    if (converted > INT16_MAX) converted = INT16_MAX;
+    if (converted < INT16_MIN) converted = INT16_MIN;
+    return (int16_t)converted;
+}
+
+static void put_u32_le(uint8_t *target, uint32_t value)
+{
+    target[0] = value & 0xFFU;
+    target[1] = (value >> 8) & 0xFFU;
+    target[2] = (value >> 16) & 0xFFU;
+    target[3] = (value >> 24) & 0xFFU;
+}
+
+static void put_i16_le(uint8_t *target, int16_t value)
+{
+    uint16_t raw = (uint16_t)value;
+    target[0] = raw & 0xFFU;
+    target[1] = (raw >> 8) & 0xFFU;
+}
+
+bool connectivity_stream_motion(uint32_t elapsed_us, float ax, float ay, float az,
+                                float gx, float gy, float gz)
+{
+    bool accepted = false;
+    if (s_ble_data_subscribed && s_ble_connection_handle != UINT16_MAX &&
+        s_ble_data_handle != 0) {
+        /* Type 0x10 + 16-byte compact sample fits the default 20-byte ATT payload. */
+        uint8_t packet[17];
+        packet[0] = 0x10;
+        put_u32_le(packet + 1, elapsed_us);
+        const int16_t axes[6] = {
+            stream_quantize(ax, 4096.0f), stream_quantize(ay, 4096.0f),
+            stream_quantize(az, 4096.0f), stream_quantize(gx, 16.0f),
+            stream_quantize(gy, 16.0f), stream_quantize(gz, 16.0f),
+        };
+        for (size_t index = 0; index < 6; ++index)
+            put_i16_le(packet + 5 + index * 2, axes[index]);
+        struct os_mbuf *value = ble_hs_mbuf_from_flat(packet, sizeof(packet));
+        if (value && ble_gatts_notify_custom(s_ble_connection_handle, s_ble_data_handle,
+                                             value) == 0) accepted = true;
+    }
+    if (s_remote_connected && s_mqtt_client && s_mqtt_data_topic[0]) {
+        char payload[192];
+        int length = snprintf(payload, sizeof(payload),
+                "{\"t\":%lu,\"ax\":%.4f,\"ay\":%.4f,\"az\":%.4f,"
+                "\"gx\":%.3f,\"gy\":%.3f,\"gz\":%.3f}",
+                (unsigned long)elapsed_us, ax, ay, az, gx, gy, gz);
+        if (length > 0 && length < (int)sizeof(payload) &&
+            esp_mqtt_client_enqueue(s_mqtt_client, s_mqtt_data_topic, payload,
+                                    length, 0, 0, false) >= 0) accepted = true;
+    }
+    return accepted;
 }
 
 static void wifi_event_handler(void *argument, esp_event_base_t base, int32_t event_id,
@@ -1008,6 +1136,19 @@ static int ble_access(uint16_t connection_handle, uint16_t attribute_handle,
                    ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
 
+    if (context->op == BLE_GATT_ACCESS_OP_READ_CHR &&
+        ble_uuid_cmp(uuid, &s_experiment_data_uuid.u) == 0) {
+        uint8_t packet[BLE_VALUE_MAX];
+        uint16_t mtu = ble_att_mtu(connection_handle);
+        size_t capacity = mtu > 4 ? (size_t)mtu - 4U : 16U;
+        if (capacity > sizeof(packet) - 1U) capacity = sizeof(packet) - 1U;
+        size_t count = offline_store_export_read(packet + 1, capacity);
+        packet[0] = count > 0 ? 0x20 : 0x21;
+        if (count == 0) offline_store_export_close();
+        return os_mbuf_append(context->om, packet, count + 1U) == 0
+                   ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+
     if (context->op != BLE_GATT_ACCESS_OP_WRITE_CHR) {
         return BLE_ATT_ERR_READ_NOT_PERMITTED;
     }
@@ -1031,6 +1172,29 @@ static int ble_access(uint16_t connection_handle, uint16_t attribute_handle,
         if (strcmp(command, "SENSORS") == 0) {
             sensor_hub_discover();
             sensor_hub_build_ble_json(s_ble_response, sizeof(s_ble_response));
+            ble_gatts_chr_updated(s_ble_status_handle);
+            return 0;
+        }
+        if (strcmp(command, "OFFLINE:INFO") == 0) {
+            ble_build_offline_response();
+            ble_gatts_chr_updated(s_ble_status_handle);
+            return 0;
+        }
+        if (strcmp(command, "OFFLINE:OPEN") == 0) {
+            if (offline_store_export_open() != ESP_OK) return BLE_ATT_ERR_UNLIKELY;
+            ble_build_offline_response();
+            ble_gatts_chr_updated(s_ble_status_handle);
+            return 0;
+        }
+        if (strcmp(command, "OFFLINE:CLOSE") == 0) {
+            offline_store_export_close();
+            ble_build_offline_response();
+            ble_gatts_chr_updated(s_ble_status_handle);
+            return 0;
+        }
+        if (strcmp(command, "OFFLINE:CLEAR") == 0) {
+            if (offline_store_clear() != ESP_OK) return BLE_ATT_ERR_UNLIKELY;
+            ble_build_offline_response();
             ble_gatts_chr_updated(s_ble_status_handle);
             return 0;
         }
@@ -1223,6 +1387,12 @@ static const struct ble_gatt_chr_def s_ble_characteristics[] = {
         .access_cb = ble_access,
         .flags = BLE_GATT_CHR_F_WRITE,
     },
+    {
+        .uuid = &s_experiment_data_uuid.u,
+        .access_cb = ble_access,
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+        .val_handle = &s_ble_data_handle,
+    },
     {0},
 };
 
@@ -1244,11 +1414,22 @@ static int ble_gap_event(struct ble_gap_event *event, void *argument)
         case BLE_GAP_EVENT_CONNECT:
             if (event->connect.status != 0) {
                 ble_advertise();
+            } else {
+                s_ble_connection_handle = event->connect.conn_handle;
             }
             return 0;
         case BLE_GAP_EVENT_DISCONNECT:
+            s_ble_connection_handle = UINT16_MAX;
+            s_ble_data_subscribed = false;
+            offline_store_export_close();
+            ble_advertise();
+            return 0;
         case BLE_GAP_EVENT_ADV_COMPLETE:
             ble_advertise();
+            return 0;
+        case BLE_GAP_EVENT_SUBSCRIBE:
+            if (event->subscribe.attr_handle == s_ble_data_handle)
+                s_ble_data_subscribed = event->subscribe.cur_notify != 0;
             return 0;
         default:
             return 0;

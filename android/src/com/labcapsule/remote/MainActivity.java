@@ -42,7 +42,7 @@ import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
 
 public class MainActivity extends Activity {
-    private static final String APP_VERSION = "0.4.0";
+    private static final String APP_VERSION = "0.5.0";
     private static final String REPOSITORY = "81823650800wzy-sketch/LabCapsule";
     private static final String WIFI_GUIDE_URL = "https://github.com/" + REPOSITORY +
             "/blob/main/docs/V0.3.3_BLE_WIFI_QUICKSTART_ZH.md";
@@ -54,7 +54,8 @@ public class MainActivity extends Activity {
 
     private static final UUID SERVICE_UUID = uuid(1), COMMAND_UUID = uuid(2),
             STATUS_UUID = uuid(3), OTA_CONTROL_UUID = uuid(4), OTA_DATA_UUID = uuid(5),
-            FILE_CONTROL_UUID = uuid(6), FILE_DATA_UUID = uuid(7);
+            FILE_CONTROL_UUID = uuid(6), FILE_DATA_UUID = uuid(7),
+            EXPERIMENT_DATA_UUID = uuid(8);
     private static UUID uuid(int id) {
         return UUID.fromString(String.format(Locale.US,
                 "6c4300%02d-4c61-6243-6170-73756c650001", id));
@@ -76,7 +77,7 @@ public class MainActivity extends Activity {
     private TextView globalStatus, mediaInfo, firmwareInfo, updateInfo, aiResult,
             externalWifiState, externalWifiIp, externalWifiHint, sensorResult,
             screenMonitorState, historyView, activeProtocolView, gifServiceState,
-            analysisResultView;
+            analysisResultView, offlineStoreState;
     private ProgressBar globalProgress;
     private EditText deviceUrlInput, wifiSsid, wifiPassword, mqttUri, mqttUser, mqttPassword,
             mqttTopic, brightnessInput, aiEndpoint, aiModel, aiKey, aiQuestion,
@@ -104,13 +105,19 @@ public class MainActivity extends Activity {
     private BluetoothGatt bluetoothGatt;
     private BluetoothGattCharacteristic commandCharacteristic, statusCharacteristic,
             otaControlCharacteristic, otaDataCharacteristic, fileControlCharacteristic,
-            fileDataCharacteristic;
+            fileDataCharacteristic, experimentDataCharacteristic;
     private boolean bleReady, scanAfterPermission, blePendingQuiet, screenMonitorActive;
     private String blePendingCommand = "";
     private int bleMtu = 23, bleTransferOffset, blePendingLength;
     private byte[] bleTransferData;
     private String bleTransferPhase = "idle", bleTransferKind = "";
     private Runnable bleTransferCompletion;
+    private File offlineSyncFile;
+    private OutputStream offlineSyncOutput;
+    private OutputStream liveCaptureOutput;
+    private long offlineSyncBytes, lastLiveElapsed = -1;
+    private int liveCaptureSamples;
+    private final Runnable liveCaptureIdleCloseRunnable = this::finishLiveCaptureAfterIdle;
     private final Runnable screenMonitorRunnable = new Runnable() {
         @Override public void run() {
             if (!screenMonitorActive || currentSection != 4) return;
@@ -457,6 +464,17 @@ public class MainActivity extends Activity {
         summary.addView(historyView);
         summary.addView(row(button("分享 CSV 摘要", true, v -> shareHistory()),
                 button("清空记录", false, v -> clearHistory())), matchWrap(dp(8)));
+        LinearLayout deviceCache = card(root, null);
+        section(deviceCache, "设备离线缓存",
+                "无 BLE/MQTT 接收端时设备自动落盘；连接后同步到手机");
+        offlineStoreState = label("尚未读取设备缓存。仅有 5 GHz Wi‑Fi 时可直接使用 BLE。",
+                13, MUTED, false);
+        offlineStoreState.setTextIsSelectable(true);
+        deviceCache.addView(offlineStoreState);
+        deviceCache.addView(row(button("读取状态", false, v -> refreshOfflineStore()),
+                button("同步并分析", true, v -> syncOfflineData()),
+                button("清空设备缓存", false, v -> confirmClearOfflineData())),
+                matchWrap(dp(7)));
         LinearLayout analysis = card(root, null);
         section(analysis, "六轴 CSV 分析", "在手机端计算 RMS、绝对峰值、FFT 主频");
         analysisResultView = label(preferences.getString("last_analysis",
@@ -628,6 +646,11 @@ public class MainActivity extends Activity {
         addFirmwareSettingsGroup(root);
         LinearLayout network = card(root, null);
         section(network, "外部 Wi‑Fi", "推荐连接 BLE 后直接保存；手机全程保持正常联网");
+        TextView wifiBandNotice = label(
+                "硬件限制：ESP32‑S3 只能连接 2.4 GHz Wi‑Fi，不能连接纯 5 GHz。"
+                        + "没有 2.4 GHz 路由器时，可继续使用 BLE，或临时开启手机的 2.4 GHz 兼容热点。",
+                13, RED, true);
+        network.addView(wifiBandNotice, matchWrap(dp(4)));
         transportSpinner = transportSelector();
         network.addView(transportSpinner, matchWrap(0));
         wifiSsid = input(preferences.getString("wifi_ssid", ""), "路由器 SSID", false);
@@ -666,7 +689,7 @@ public class MainActivity extends Activity {
         updates.addView(row(button("检查更新", false, v -> checkForUpdates(false)),
                 button("下载新版 APK", true, v -> downloadLatestApk())));
         LinearLayout about = card(root, null);
-        section(about, "关于", "LabCapsule V0.4.0 · Motion Experiment Prototype");
+        section(about, "关于", "LabCapsule V0.5.0 · Autonomous Experiment Prototype");
         about.addView(label("默认语言：简体中文\n协议：HTTP + MQTT + BLE GATT\n屏幕：240×320 RGB565 双缓冲\n仓库：github.com/" + REPOSITORY, 13, MUTED, false));
         about.addView(button("查看 V0.4 实验与后台 GIF 指南", false,
                 v -> openUrl(V040_GUIDE_URL)), matchWrap(dp(7)));
@@ -1114,6 +1137,13 @@ public class MainActivity extends Activity {
             JSONObject device = root.optJSONObject("device");
             if (device != null) preferences.edit().putLong("last_sample_count",
                     device.optLong("samples", preferences.getLong("last_sample_count", 0))).apply();
+            if (device != null && device.has("offlineSessions")) {
+                JSONObject offline = new JSONObject()
+                        .put("sessions", device.optLong("offlineSessions"))
+                        .put("samples", device.optLong("offlineSamples"))
+                        .put("recording", device.optBoolean("offlineRecording"));
+                handleOfflinePayload(offline);
+            }
             JSONObject style = device == null ? null : device.optJSONObject("style");
             if (style != null) {
                 int previousPreset = visualPreset;
@@ -1421,6 +1451,232 @@ public class MainActivity extends Activity {
                 .putExtra(Intent.EXTRA_TEXT, result);
         startActivity(Intent.createChooser(share, "分享分析结果"));
     }
+
+    private void refreshOfflineStore() {
+        status("正在读取设备离线缓存…", true);
+        if (selectedTransport() == 1) {
+            writeBleCommand("OFFLINE:INFO");
+        } else {
+            fetchStatus();
+        }
+    }
+
+    private void handleOfflinePayload(JSONObject offline) {
+        if (offline == null) return;
+        long sessions = offline.optLong("sessions", offline.optLong("offlineSessions", 0));
+        long samples = offline.optLong("samples", offline.optLong("offlineSamples", 0));
+        long current = offline.optLong("currentSamples", 0);
+        long dropped = offline.optLong("droppedSamples", 0);
+        long used = offline.optLong("bytesUsed", 0);
+        long capacity = offline.optLong("bytesCapacity", 0);
+        boolean recording = offline.optBoolean("recording",
+                offline.optBoolean("offlineRecording", false));
+        StringBuilder text = new StringBuilder();
+        text.append(recording ? "● 正在实验并缓存" : "● 缓存可用")
+                .append("\n离线实验：").append(sessions)
+                .append(" · 已保存样本：").append(samples);
+        if (current > 0) text.append(" · 本轮：").append(current);
+        if (capacity > 0) text.append("\n空间：").append(formatBytes(used))
+                .append(" / ").append(formatBytes(capacity));
+        if (dropped > 0) text.append("\n警告：队列丢弃 ").append(dropped).append(" 个样本");
+        if (offline.optBoolean("full", false)) text.append("\n警告：设备缓存空间已满");
+        preferences.edit().putLong("offline_sessions", sessions)
+                .putLong("offline_samples", samples).apply();
+        if (offlineStoreState != null) {
+            offlineStoreState.setText(text.toString());
+            offlineStoreState.setTextColor(dropped > 0 || offline.optBoolean("full", false)
+                    ? RED : GREEN);
+        }
+        if (currentSection == 2) status(text.toString(), true);
+    }
+
+    private static String formatBytes(long bytes) {
+        if (bytes >= 1024L * 1024L)
+            return String.format(Locale.US, "%.1f MB", bytes / (1024.0 * 1024.0));
+        if (bytes >= 1024L) return String.format(Locale.US, "%.1f KB", bytes / 1024.0);
+        return bytes + " B";
+    }
+
+    private File newOfflineSyncFile() throws IOException {
+        File directory = new File(getFilesDir(), "experiment-sync");
+        if (!directory.exists() && !directory.mkdirs())
+            throw new IOException("无法创建设备数据目录");
+        return new File(directory, "offline-" + System.currentTimeMillis() + ".lcb");
+    }
+
+    private void syncOfflineData() {
+        if ("offline_open".equals(bleTransferPhase) ||
+                "offline_read".equals(bleTransferPhase)) {
+            status("设备缓存正在同步", false); return;
+        }
+        try {
+            offlineSyncFile = newOfflineSyncFile();
+            offlineSyncOutput = new BufferedOutputStream(new FileOutputStream(offlineSyncFile));
+            offlineSyncBytes = 0;
+        } catch (Exception error) {
+            status("无法准备同步文件：" + error.getMessage(), false); return;
+        }
+        showProgress(0);
+        if (selectedTransport() == 1) {
+            if (!bleReady || experimentDataCharacteristic == null ||
+                    !"idle".equals(bleTransferPhase)) {
+                closeOfflineSync(true);
+                status("请先连接支持离线缓存的 V0.5 BLE 固件", false); return;
+            }
+            bleTransferPhase = "offline_open";
+            if (!writeCharacteristic(commandCharacteristic,
+                    "OFFLINE:OPEN".getBytes(StandardCharsets.UTF_8))) {
+                bleTransferPhase = "idle";
+                closeOfflineSync(true);
+                status("无法打开设备离线缓存", false);
+            } else status("BLE 正在同步离线实验…", true);
+        } else {
+            worker.execute(this::syncOfflineHttp);
+        }
+    }
+
+    private void syncOfflineHttp() {
+        HttpURLConnection connection = null;
+        try {
+            connection = (HttpURLConnection)new URL(baseUrl() + "/api/offline").openConnection();
+            connection.setRequestMethod("GET");
+            connection.setConnectTimeout(8000);
+            connection.setReadTimeout(60000);
+            int code = connection.getResponseCode();
+            if (code < 200 || code >= 300) throw new IOException("HTTP " + code);
+            try (InputStream input = new BufferedInputStream(connection.getInputStream())) {
+                byte[] buffer = new byte[8192];
+                int count;
+                while ((count = input.read(buffer)) >= 0) {
+                    if (count == 0) continue;
+                    offlineSyncOutput.write(buffer, 0, count);
+                    offlineSyncBytes += count;
+                }
+            }
+            offlineSyncOutput.close();
+            offlineSyncOutput = null;
+            finishOfflineSync();
+        } catch (Exception error) {
+            closeOfflineSync(true);
+            runOnUiThread(() -> status("离线数据同步失败：" + error.getMessage(), false));
+        } finally {
+            if (connection != null) connection.disconnect();
+        }
+    }
+
+    private void closeOfflineSync(boolean deletePartial) {
+        try { if (offlineSyncOutput != null) offlineSyncOutput.close(); }
+        catch (Exception ignored) { }
+        offlineSyncOutput = null;
+        if (deletePartial && offlineSyncFile != null) offlineSyncFile.delete();
+    }
+
+    private void finishOfflineSync() {
+        final File file = offlineSyncFile;
+        final long bytes = offlineSyncBytes;
+        if (file == null || bytes == 0) {
+            closeOfflineSync(true);
+            runOnUiThread(() -> status("设备中没有可同步的离线实验", true));
+            return;
+        }
+        worker.execute(() -> {
+            try {
+                String result = analyzeOfflineBinary(file);
+                preferences.edit().putString("last_analysis", result)
+                        .putString("last_offline_file", file.getAbsolutePath()).apply();
+                runOnUiThread(() -> {
+                    if (analysisResultView != null) {
+                        analysisResultView.setText(result);
+                        analysisResultView.setTextColor(INK);
+                    }
+                    showProgress(100);
+                    status("离线数据已同步并分析 · " + formatBytes(bytes), true);
+                });
+            } catch (Exception error) {
+                runOnUiThread(() -> status("离线数据格式错误：" + error.getMessage(), false));
+            }
+        });
+    }
+
+    private void confirmClearOfflineData() {
+        new AlertDialog.Builder(this).setTitle("清空设备离线数据？")
+                .setMessage("请先确认已经同步。此操作无法撤销，实验进行中不能清空。")
+                .setNegativeButton("取消", null)
+                .setPositiveButton("清空", (dialog, which) -> clearOfflineData()).show();
+    }
+
+    private void clearOfflineData() {
+        if (selectedTransport() == 1) {
+            writeBleCommand("OFFLINE:CLEAR");
+        } else {
+            http("POST", "/api/offline", new byte[0], "application/octet-stream",
+                    ignored -> {
+                        if (offlineStoreState != null)
+                            offlineStoreState.setText("设备离线缓存已清空");
+                        status("设备离线缓存已清空", true);
+                    });
+        }
+    }
+
+    private String analyzeOfflineBinary(File source) throws Exception {
+        int sessions = 0;
+        long totalSamples = 0;
+        StringBuilder csv = new StringBuilder();
+        try (InputStream input = new BufferedInputStream(new FileInputStream(source))) {
+            byte[] header = new byte[32];
+            byte[] sample = new byte[16];
+            while (readFullyOrEof(input, header)) {
+                if (littleInt(header, 0) != 0x3142434C || littleShort(header, 4) != 1 ||
+                        littleShort(header, 6) != 32) throw new IOException("LCB1 头无效");
+                long rate = unsignedInt(littleInt(header, 12));
+                long count = unsignedInt(littleInt(header, 20));
+                ++sessions;
+                totalSamples += count;
+                for (long index = 0; index < count; ++index) {
+                    if (!readFullyOrEof(input, sample)) throw new EOFException("样本不完整");
+                    if (sessions == 1 && index < 100000) {
+                        long elapsed = unsignedInt(littleInt(sample, 0));
+                        csv.append(elapsed);
+                        for (int axis = 0; axis < 6; ++axis) {
+                            short packed = (short)littleShort(sample, 4 + axis * 2);
+                            double scale = axis < 3 ? 4096.0 : 16.0;
+                            csv.append(',').append(String.format(Locale.US, "%.5f",
+                                    packed / scale));
+                        }
+                        csv.append('\n');
+                    }
+                }
+                if (rate == 0) throw new IOException("采样率无效");
+            }
+        }
+        if (sessions == 0) throw new IOException("没有完整实验");
+        return "设备离线同步：" + sessions + " 组，共 " + totalSamples + " 个样本\n"
+                + "本地文件：" + source.getAbsolutePath() + "\n"
+                + "以下分析使用第一组实验：\n" + analyzeCsv(csv.toString(), source.getName());
+    }
+
+    private static boolean readFullyOrEof(InputStream input, byte[] buffer) throws IOException {
+        int offset = 0;
+        while (offset < buffer.length) {
+            int count = input.read(buffer, offset, buffer.length - offset);
+            if (count < 0) {
+                if (offset == 0) return false;
+                throw new EOFException("文件被截断");
+            }
+            offset += count;
+        }
+        return true;
+    }
+
+    private static int littleShort(byte[] value, int offset) {
+        return (value[offset] & 0xFF) | ((value[offset + 1] & 0xFF) << 8);
+    }
+
+    private static int littleInt(byte[] value, int offset) {
+        return littleShort(value, offset) | (littleShort(value, offset + 2) << 16);
+    }
+
+    private static long unsignedInt(int value) { return value & 0xFFFFFFFFL; }
 
     private String displayName(Uri uri) {
         try (Cursor cursor = getContentResolver().query(uri,
@@ -2277,6 +2533,12 @@ public class MainActivity extends Activity {
                 if (hasBlePermissions()) gatt.discoverServices();
             } else if (state == BluetoothProfile.STATE_DISCONNECTED) {
                 bleReady = false;
+                closeLiveCapture();
+                if ("offline_open".equals(bleTransferPhase) ||
+                        "offline_read".equals(bleTransferPhase)) {
+                    bleTransferPhase = "idle";
+                    closeOfflineSync(true);
+                }
                 runOnUiThread(() -> status("BLE 已断开", false));
             }
         }
@@ -2292,36 +2554,53 @@ public class MainActivity extends Activity {
             otaDataCharacteristic = service.getCharacteristic(OTA_DATA_UUID);
             fileControlCharacteristic = service.getCharacteristic(FILE_CONTROL_UUID);
             fileDataCharacteristic = service.getCharacteristic(FILE_DATA_UUID);
+            experimentDataCharacteristic = service.getCharacteristic(EXPERIMENT_DATA_UUID);
             bleReady = commandCharacteristic != null && statusCharacteristic != null &&
                     otaControlCharacteristic != null && otaDataCharacteristic != null &&
                     fileControlCharacteristic != null && fileDataCharacteristic != null;
-            if (hasBlePermissions()) gatt.requestMtu(517);
+            boolean mtuPending = hasBlePermissions() && gatt.requestMtu(517);
+            if (!mtuPending) enableExperimentNotifications(gatt);
             runOnUiThread(() -> {
                 if (bleReady) {
                     preferences.edit().putInt("transport", 1).apply();
                     if (transportSpinner != null) transportSpinner.setSelection(1);
                 }
-                status(bleReady ? "BLE 控制、配网、I²C 扫描与媒体通道已就绪"
+                status(bleReady ? "BLE 控制、实时实验、离线同步与媒体通道已就绪"
                         : "BLE 特征不完整", bleReady);
             });
         }
         @Override public void onMtuChanged(BluetoothGatt gatt, int mtu, int code) {
             if (code == BluetoothGatt.GATT_SUCCESS) bleMtu = mtu;
+            enableExperimentNotifications(gatt);
         }
         @Override @SuppressWarnings("deprecation") public void onCharacteristicRead(
                 BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int code) {
-            handleBleRead(characteristic.getValue(), code);
+            handleBleRead(characteristic, characteristic.getValue(), code);
         }
         @Override public void onCharacteristicRead(BluetoothGatt gatt,
                 BluetoothGattCharacteristic characteristic, byte[] value, int code) {
-            handleBleRead(value, code);
+            handleBleRead(characteristic, value, code);
+        }
+        @Override @SuppressWarnings("deprecation") public void onCharacteristicChanged(
+                BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) {
+            handleExperimentNotification(characteristic, characteristic.getValue());
+        }
+        @Override public void onCharacteristicChanged(BluetoothGatt gatt,
+                BluetoothGattCharacteristic characteristic, byte[] value) {
+            handleExperimentNotification(characteristic, value);
         }
         @Override public void onCharacteristicWrite(BluetoothGatt gatt,
                 BluetoothGattCharacteristic characteristic, int code) {
             handleBleWrite(characteristic, code);
         }
     };
-    private void handleBleRead(byte[] value, int code) {
+    private void handleBleRead(BluetoothGattCharacteristic characteristic, byte[] value,
+                               int code) {
+        if (characteristic != null && EXPERIMENT_DATA_UUID.equals(characteristic.getUuid()) &&
+                "offline_read".equals(bleTransferPhase)) {
+            handleOfflineBleChunk(value, code);
+            return;
+        }
         final boolean quiet = blePendingQuiet;
         blePendingQuiet = false;
         blePendingCommand = "";
@@ -2335,6 +2614,8 @@ public class MainActivity extends Activity {
                 JSONObject root = new JSONObject(payload);
                 if ("sensors".equals(root.optString("type"))) {
                     handleSensorPayload(payload);
+                } else if ("offline".equals(root.optString("type"))) {
+                    handleOfflinePayload(root);
                 } else if (root.has("network") || "status".equals(root.optString("type"))) {
                     handleStatusPayload(payload, quiet);
                 } else if (!quiet) {
@@ -2344,6 +2625,125 @@ public class MainActivity extends Activity {
                 if (!quiet) status("BLE 回包无法解析：" + payload, false);
             }
         });
+    }
+
+    @SuppressWarnings("deprecation")
+    private void enableExperimentNotifications(BluetoothGatt gatt) {
+        if (gatt == null || experimentDataCharacteristic == null || !hasBlePermissions()) return;
+        if (!gatt.setCharacteristicNotification(experimentDataCharacteristic, true)) return;
+        BluetoothGattDescriptor descriptor = experimentDataCharacteristic.getDescriptor(
+                UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"));
+        if (descriptor == null) return;
+        if (Build.VERSION.SDK_INT >= 33) {
+            gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+        } else {
+            descriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+            gatt.writeDescriptor(descriptor);
+        }
+    }
+
+    private void handleExperimentNotification(BluetoothGattCharacteristic characteristic,
+                                              byte[] value) {
+        if (characteristic == null || !EXPERIMENT_DATA_UUID.equals(characteristic.getUuid()) ||
+                value == null || value.length != 17 || value[0] != 0x10) return;
+        long elapsed = unsignedInt(littleInt(value, 1));
+        double[] axes = new double[6];
+        for (int axis = 0; axis < 6; ++axis) {
+            short packed = (short)littleShort(value, 5 + axis * 2);
+            axes[axis] = packed / (axis < 3 ? 4096.0 : 16.0);
+        }
+        synchronized (this) {
+            try {
+                if (liveCaptureOutput == null || elapsed <= lastLiveElapsed) {
+                    if (liveCaptureOutput != null) liveCaptureOutput.close();
+                    File directory = new File(getFilesDir(), "live-experiments");
+                    if (!directory.exists()) directory.mkdirs();
+                    File target = new File(directory, "ble-" + System.currentTimeMillis() + ".csv");
+                    liveCaptureOutput = new BufferedOutputStream(new FileOutputStream(target));
+                    liveCaptureOutput.write(
+                            "timestamp_us,ax,ay,az,gx,gy,gz\n".getBytes(StandardCharsets.UTF_8));
+                    preferences.edit().putString("last_live_file", target.getAbsolutePath()).apply();
+                    liveCaptureSamples = 0;
+                }
+                String line = String.format(Locale.US,
+                        "%d,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f\n", elapsed,
+                        axes[0], axes[1], axes[2], axes[3], axes[4], axes[5]);
+                liveCaptureOutput.write(line.getBytes(StandardCharsets.UTF_8));
+                lastLiveElapsed = elapsed;
+                ++liveCaptureSamples;
+                mainHandler.removeCallbacks(liveCaptureIdleCloseRunnable);
+                mainHandler.postDelayed(liveCaptureIdleCloseRunnable, 1500);
+                if (liveCaptureSamples % 50 == 0) {
+                    liveCaptureOutput.flush();
+                    preferences.edit().putInt("last_live_samples", liveCaptureSamples).apply();
+                    runOnUiThread(() -> {
+                        if (offlineStoreState != null)
+                            offlineStoreState.setText("● BLE 实时接收中 · " +
+                                    liveCaptureSamples + " 个样本\n已直接保存到手机");
+                    });
+                }
+            } catch (Exception error) {
+                try { if (liveCaptureOutput != null) liveCaptureOutput.close(); }
+                catch (Exception ignored) { }
+                liveCaptureOutput = null;
+            }
+        }
+    }
+
+    private synchronized void closeLiveCapture() {
+        mainHandler.removeCallbacks(liveCaptureIdleCloseRunnable);
+        try { if (liveCaptureOutput != null) liveCaptureOutput.close(); }
+        catch (Exception ignored) { }
+        liveCaptureOutput = null;
+        lastLiveElapsed = -1;
+    }
+
+    private void finishLiveCaptureAfterIdle() {
+        final int completedSamples;
+        synchronized (this) {
+            if (liveCaptureOutput == null) return;
+            completedSamples = liveCaptureSamples;
+            closeLiveCapture();
+        }
+        preferences.edit().putInt("last_live_samples", completedSamples).apply();
+        if (offlineStoreState != null) {
+            offlineStoreState.setText("● BLE 实时实验已保存 · " + completedSamples +
+                    " 个样本\n可在数据页导入或分享");
+            offlineStoreState.setTextColor(GREEN);
+        }
+    }
+
+    private void handleOfflineBleChunk(byte[] value, int code) {
+        if (code != BluetoothGatt.GATT_SUCCESS || value == null || value.length < 1) {
+            bleTransferPhase = "idle";
+            closeOfflineSync(true);
+            runOnUiThread(() -> status("BLE 离线数据读取失败：" + code, false));
+            return;
+        }
+        try {
+            int type = value[0] & 0xFF;
+            if (type == 0x20) {
+                if (value.length > 1) {
+                    offlineSyncOutput.write(value, 1, value.length - 1);
+                    offlineSyncBytes += value.length - 1;
+                }
+                if (bluetoothGatt == null || experimentDataCharacteristic == null ||
+                        !hasBlePermissions() ||
+                        !bluetoothGatt.readCharacteristic(experimentDataCharacteristic))
+                    throw new IOException("无法继续读取 BLE 数据");
+            } else if (type == 0x21) {
+                offlineSyncOutput.close();
+                offlineSyncOutput = null;
+                bleTransferPhase = "idle";
+                finishOfflineSync();
+            } else {
+                throw new IOException("未知离线数据帧 " + type);
+            }
+        } catch (Exception error) {
+            bleTransferPhase = "idle";
+            closeOfflineSync(true);
+            runOnUiThread(() -> status("BLE 离线同步中断：" + error.getMessage(), false));
+        }
     }
     private void writeBleCommand(String command) {
         writeBleCommand(command, false);
@@ -2449,6 +2849,15 @@ public class MainActivity extends Activity {
                 status("BLE " + bleTransferKind + " 传输完成", true);
                 if (completion != null) completion.run();
             });
+        } else if ("offline_open".equals(bleTransferPhase) && uuid.equals(COMMAND_UUID)) {
+            bleTransferPhase = "offline_read";
+            if (bluetoothGatt == null || experimentDataCharacteristic == null ||
+                    !hasBlePermissions() ||
+                    !bluetoothGatt.readCharacteristic(experimentDataCharacteristic)) {
+                bleTransferPhase = "idle";
+                closeOfflineSync(true);
+                runOnUiThread(() -> status("无法开始 BLE 离线数据读取", false));
+            }
         } else if ("idle".equals(bleTransferPhase) && uuid.equals(COMMAND_UUID)) {
             if (bluetoothGatt == null || statusCharacteristic == null ||
                     !hasBlePermissions() || !bluetoothGatt.readCharacteristic(statusCharacteristic)) {
@@ -2498,6 +2907,8 @@ public class MainActivity extends Activity {
             bluetoothGatt.disconnect();
             bluetoothGatt.close();
         }
+        closeLiveCapture();
+        closeOfflineSync(false);
         super.onDestroy();
     }
 

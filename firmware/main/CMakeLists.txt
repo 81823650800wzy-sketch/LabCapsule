@@ -3,6 +3,8 @@ idf_component_register(
         "labcapsule_main.c"
         "connectivity.c"
         "device_config.c"
+        "input_hub.c"
+        "offline_store.c"
         "sensor_hub.c"
         "wallpaper.c"
     INCLUDE_DIRS "."
@@ -16,6 +18,7 @@ idf_component_register(
         app_update
         bt
         esp_event
+        fatfs
         esp_http_server
         esp_lcd
         json
@@ -26,4 +29,5 @@ idf_component_register(
         esp_wifi
         mqtt
         nvs_flash
+        wear_levelling
 )

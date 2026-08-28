@@ -27,6 +27,8 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "labcapsule_control.h"
+#include "input_hub.h"
+#include "offline_store.h"
 #include "sensor_hub.h"
 #include "wallpaper.h"
 
@@ -246,7 +248,8 @@ static void serial_emit(const char *format, ...)
 
     uart_write_bytes(UART_NUM_0, buffer, (size_t)length);
     if (s_usb_serial_ready) {
-        usb_serial_jtag_write_bytes(buffer, (size_t)length, pdMS_TO_TICKS(20));
+        /* Never let an absent native-USB host throttle a 100-500 Hz experiment. */
+        usb_serial_jtag_write_bytes(buffer, (size_t)length, 0);
     }
 }
 
@@ -711,13 +714,23 @@ static void display_render_state(device_state_t state)
     display_text(24, 144, state_name(state), state == STATE_RECORDING ? 3 : 4, accent);
     display_text(24, 218, s_mpu_ready ? "MPU LINK OK" : "MPU LINK LOST", 2,
                  s_mpu_ready ? theme.text : theme.secondary);
-    display_text(24, 250, s_mock_enabled ? "SIMULATION ON" : "SENSOR MODE", 2,
-                 theme.muted);
+    offline_store_info_t offline;
+    offline_store_get_info(&offline);
+    char storage_text[32];
+    if (offline.recording && offline.current_samples > 0) {
+        snprintf(storage_text, sizeof(storage_text), "CACHE %lu LIVE",
+                 (unsigned long)offline.current_samples);
+    } else {
+        snprintf(storage_text, sizeof(storage_text), "LOCAL %lu RUNS",
+                 (unsigned long)offline.sessions);
+    }
+    display_text(24, 246, storage_text, 2,
+                 offline.full ? theme.secondary : theme.muted);
 
     char config_text[32];
     snprintf(config_text, sizeof(config_text), "%luHZ  %luSEC",
              (unsigned long)s_sample_rate_hz, (unsigned long)s_duration_seconds);
-    display_text(24, 280, config_text, 2, theme.text);
+    display_text(24, 278, config_text, 2, theme.text);
 }
 
 static void display_render_settings(void)
@@ -898,6 +911,13 @@ static esp_err_t start_recording(uint32_t rate_hz, uint32_t duration_seconds)
         return ESP_FAIL;
     }
 
+    /* Open the offline session before exposing RECORDING to the sampler task.
+     * Otherwise the first one or two samples can race ahead of file creation. */
+    esp_err_t storage_result = offline_store_start(rate_hz, duration_seconds);
+    if (storage_result != ESP_OK)
+        serial_emit("WARN,OFFLINE_STORAGE_UNAVAILABLE,%s",
+                    esp_err_to_name(storage_result));
+
     portENTER_CRITICAL(&s_state_lock);
     s_sample_rate_hz = rate_hz;
     s_duration_seconds = duration_seconds;
@@ -921,6 +941,9 @@ static void stop_recording(bool aborted)
         return;
     }
     set_state(aborted ? STATE_ABORTED : STATE_COMPLETE);
+    esp_err_t storage_result = offline_store_finish(aborted);
+    if (storage_result != ESP_OK && storage_result != ESP_ERR_INVALID_STATE)
+        serial_emit("WARN,OFFLINE_FINALIZE_FAILED,%s", esp_err_to_name(storage_result));
     serial_emit("OK,%s,SAMPLES=%lu", aborted ? "ABORT" : "STOP",
                 (unsigned long)s_sample_count);
 }
@@ -1155,6 +1178,10 @@ static void sampling_task(void *argument)
         int64_t elapsed_us = esp_timer_get_time() - s_recording_started_us;
         if (elapsed_us >= (int64_t)s_duration_seconds * 1000000LL) {
             set_state(STATE_COMPLETE);
+            esp_err_t storage_result = offline_store_finish(false);
+            if (storage_result != ESP_OK && storage_result != ESP_ERR_INVALID_STATE)
+                serial_emit("WARN,OFFLINE_FINALIZE_FAILED,%s",
+                            esp_err_to_name(storage_result));
             serial_emit("OK,COMPLETE,SAMPLES=%lu", (unsigned long)s_sample_count);
             continue;
         }
@@ -1172,6 +1199,10 @@ static void sampling_task(void *argument)
             serial_emit("DATA,%lld,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f",
                         (long long)elapsed_us, sample.ax, sample.ay, sample.az,
                         sample.gx, sample.gy, sample.gz);
+            bool streamed = connectivity_stream_motion((uint32_t)elapsed_us,
+                    sample.ax, sample.ay, sample.az, sample.gx, sample.gy, sample.gz);
+            if (!streamed) offline_store_enqueue((uint32_t)elapsed_us,
+                    sample.ax, sample.ay, sample.az, sample.gx, sample.gy, sample.gz);
         } else {
             set_state(STATE_ERROR);
             serial_emit("ERR,MPU_READ_FAILED,%s", esp_err_to_name(result));
@@ -1218,26 +1249,33 @@ static void display_task(void *argument)
     }
 }
 
-static void handle_button_press(gpio_num_t pin)
+static void handle_input_action(input_action_t action, const char *source, void *context)
 {
+    (void)context;
     device_state_t state = get_state();
     display_request_refresh();
+    serial_emit("INPUT,%s,SOURCE=%s", action == INPUT_ACTION_UP ? "UP" :
+                action == INPUT_ACTION_DOWN ? "DOWN" :
+                action == INPUT_ACTION_LEFT ? "LEFT" :
+                action == INPUT_ACTION_RIGHT ? "RIGHT" :
+                action == INPUT_ACTION_OK ? "OK" : "BACK",
+                source ? source : "unknown");
 
     if (state == STATE_RECORDING) {
-        if (pin == PIN_BUTTON_OK) {
+        if (action == INPUT_ACTION_OK) {
             stop_recording(false);
-        } else if (pin == PIN_BUTTON_BACK) {
+        } else if (action == INPUT_ACTION_BACK) {
             stop_recording(true);
         }
         return;
     }
 
     if (s_display_view == DISPLAY_VIEW_SETTINGS) {
-        if (pin == PIN_BUTTON_OK || pin == PIN_BUTTON_RIGHT) {
+        if (action == INPUT_ACTION_OK || action == INPUT_ACTION_RIGHT) {
             s_display_view = DISPLAY_VIEW_DEVELOPER;
             s_developer_page = 0;
             serial_emit("UI,DEVELOPER,PAGE=1");
-        } else if (pin == PIN_BUTTON_BACK || pin == PIN_BUTTON_LEFT) {
+        } else if (action == INPUT_ACTION_BACK || action == INPUT_ACTION_LEFT) {
             s_display_view = DISPLAY_VIEW_STATUS;
             serial_emit("UI,HOME");
         }
@@ -1245,16 +1283,16 @@ static void handle_button_press(gpio_num_t pin)
     }
 
     if (s_display_view == DISPLAY_VIEW_DEVELOPER) {
-        if (pin == PIN_BUTTON_BACK) {
+        if (action == INPUT_ACTION_BACK) {
             s_display_view = DISPLAY_VIEW_SETTINGS;
             serial_emit("UI,SETTINGS");
-        } else if (pin == PIN_BUTTON_LEFT || pin == PIN_BUTTON_UP) {
+        } else if (action == INPUT_ACTION_LEFT || action == INPUT_ACTION_UP) {
             s_developer_page = s_developer_page == 0 ? 3 : s_developer_page - 1;
             serial_emit("UI,DEVELOPER,PAGE=%u", (unsigned)(s_developer_page + 1));
-        } else if (pin == PIN_BUTTON_RIGHT || pin == PIN_BUTTON_DOWN) {
+        } else if (action == INPUT_ACTION_RIGHT || action == INPUT_ACTION_DOWN) {
             s_developer_page = (uint8_t)((s_developer_page + 1) % 4);
             serial_emit("UI,DEVELOPER,PAGE=%u", (unsigned)(s_developer_page + 1));
-        } else if (pin == PIN_BUTTON_OK && s_developer_page == 3) {
+        } else if (action == INPUT_ACTION_OK && s_developer_page == 3) {
             s_display_view = DISPLAY_VIEW_COLOR_TEST;
             serial_emit("UI,COLOR_TEST");
         }
@@ -1262,7 +1300,8 @@ static void handle_button_press(gpio_num_t pin)
     }
 
     if (s_display_view == DISPLAY_VIEW_COLOR_TEST) {
-        if (pin == PIN_BUTTON_OK || pin == PIN_BUTTON_BACK || pin == PIN_BUTTON_LEFT) {
+        if (action == INPUT_ACTION_OK || action == INPUT_ACTION_BACK ||
+            action == INPUT_ACTION_LEFT) {
             s_display_view = DISPLAY_VIEW_DEVELOPER;
             s_developer_page = 3;
             serial_emit("UI,DEVELOPER,PAGE=4");
@@ -1271,26 +1310,26 @@ static void handle_button_press(gpio_num_t pin)
     }
 
     if (s_display_view == DISPLAY_VIEW_WALLPAPER) {
-        if (pin == PIN_BUTTON_BACK || pin == PIN_BUTTON_OK) {
+        if (action == INPUT_ACTION_BACK || action == INPUT_ACTION_OK) {
             s_display_view = DISPLAY_VIEW_STATUS;
             serial_emit("UI,HOME");
         }
         return;
     }
 
-    if (pin == PIN_BUTTON_OK) {
+    if (action == INPUT_ACTION_OK) {
         start_recording(s_sample_rate_hz, s_duration_seconds);
-    } else if (pin == PIN_BUTTON_BACK) {
+    } else if (action == INPUT_ACTION_BACK) {
         s_display_view = DISPLAY_VIEW_SETTINGS;
         serial_emit("UI,SETTINGS");
     } else {
-        if (pin == PIN_BUTTON_UP && s_duration_seconds < MAX_DURATION_SECONDS - 5U) {
+        if (action == INPUT_ACTION_UP && s_duration_seconds < MAX_DURATION_SECONDS - 5U) {
             s_duration_seconds += 5U;
-        } else if (pin == PIN_BUTTON_DOWN && s_duration_seconds > 5U) {
+        } else if (action == INPUT_ACTION_DOWN && s_duration_seconds > 5U) {
             s_duration_seconds -= 5U;
-        } else if (pin == PIN_BUTTON_LEFT) {
+        } else if (action == INPUT_ACTION_LEFT) {
             s_sample_rate_hz = s_sample_rate_hz <= 100U ? 50U : s_sample_rate_hz / 2U;
-        } else if (pin == PIN_BUTTON_RIGHT) {
+        } else if (action == INPUT_ACTION_RIGHT) {
             s_sample_rate_hz = s_sample_rate_hz >= 250U ? 500U : s_sample_rate_hz * 2U;
         }
         serial_emit("CONFIG,RATE=%lu,DURATION=%lu", (unsigned long)s_sample_rate_hz,
@@ -1316,10 +1355,14 @@ void labcapsule_build_status_json(char *buffer, size_t buffer_size)
     if (!buffer || buffer_size == 0) {
         return;
     }
+    offline_store_info_t offline;
+    offline_store_get_info(&offline);
     snprintf(buffer, buffer_size,
              "{\"version\":\"%s\",\"state\":\"%s\",\"view\":\"%s\","
              "\"mpu\":\"%s\",\"mock\":%s,\"rate\":%lu,\"duration\":%lu,"
              "\"samples\":%lu,\"backlight\":%s,\"brightness\":%u,\"wallpaper\":%s,"
+             "\"inputDrivers\":%u,\"offlineSessions\":%lu,"
+             "\"offlineSamples\":%lu,\"offlineRecording\":%s,"
              "\"style\":{\"preset\":%u,\"wallpaperOpacity\":%u,"
              "\"panelOpacity\":%u,\"hudOpacity\":%u}}",
              LABCAPSULE_VERSION, state_name(get_state()), display_view_name(s_display_view),
@@ -1327,6 +1370,8 @@ void labcapsule_build_status_json(char *buffer, size_t buffer_size)
              (unsigned long)s_sample_rate_hz, (unsigned long)s_duration_seconds,
              (unsigned long)s_sample_count, s_backlight_commanded_on ? "true" : "false",
              (unsigned)s_backlight_brightness, wallpaper_available() ? "true" : "false",
+             (unsigned)input_hub_driver_count(), (unsigned long)offline.sessions,
+             (unsigned long)offline.samples, offline.recording ? "true" : "false",
              (unsigned)s_visual_preset, (unsigned)s_wallpaper_opacity,
              (unsigned)s_panel_opacity, (unsigned)s_hud_opacity);
 }
@@ -1607,18 +1652,18 @@ esp_err_t labcapsule_remote_action(const char *action, char *response, size_t re
         }
         labcapsule_set_brightness((uint8_t)brightness);
     } else {
-        gpio_num_t virtual_button = GPIO_NUM_NC;
-        if (strcmp(normalized, "UP") == 0) virtual_button = PIN_BUTTON_UP;
-        else if (strcmp(normalized, "DOWN") == 0) virtual_button = PIN_BUTTON_DOWN;
-        else if (strcmp(normalized, "LEFT") == 0) virtual_button = PIN_BUTTON_LEFT;
-        else if (strcmp(normalized, "RIGHT") == 0) virtual_button = PIN_BUTTON_RIGHT;
-        else if (strcmp(normalized, "OK") == 0) virtual_button = PIN_BUTTON_OK;
-        else if (strcmp(normalized, "BACK") == 0) virtual_button = PIN_BUTTON_BACK;
-        if (virtual_button == GPIO_NUM_NC) {
+        input_action_t virtual_action = INPUT_ACTION_COUNT;
+        if (strcmp(normalized, "UP") == 0) virtual_action = INPUT_ACTION_UP;
+        else if (strcmp(normalized, "DOWN") == 0) virtual_action = INPUT_ACTION_DOWN;
+        else if (strcmp(normalized, "LEFT") == 0) virtual_action = INPUT_ACTION_LEFT;
+        else if (strcmp(normalized, "RIGHT") == 0) virtual_action = INPUT_ACTION_RIGHT;
+        else if (strcmp(normalized, "OK") == 0) virtual_action = INPUT_ACTION_OK;
+        else if (strcmp(normalized, "BACK") == 0) virtual_action = INPUT_ACTION_BACK;
+        if (virtual_action == INPUT_ACTION_COUNT) {
             snprintf(response, response_size, "unknown action");
             return ESP_ERR_NOT_SUPPORTED;
         }
-        handle_button_press(virtual_button);
+        input_hub_emit(virtual_action, "remote");
     }
     display_request_refresh();
     snprintf(response, response_size, "applied");
@@ -1626,35 +1671,24 @@ esp_err_t labcapsule_remote_action(const char *action, char *response, size_t re
     return ESP_OK;
 }
 
-static void button_task(void *argument)
+static input_action_mask_t gpio_buttons_poll(void *context)
+{
+    (void)context;
+    input_action_mask_t pressed = 0;
+    if (gpio_get_level(PIN_BUTTON_UP) == 0) pressed |= INPUT_ACTION_BIT(INPUT_ACTION_UP);
+    if (gpio_get_level(PIN_BUTTON_DOWN) == 0) pressed |= INPUT_ACTION_BIT(INPUT_ACTION_DOWN);
+    if (gpio_get_level(PIN_BUTTON_LEFT) == 0) pressed |= INPUT_ACTION_BIT(INPUT_ACTION_LEFT);
+    if (gpio_get_level(PIN_BUTTON_RIGHT) == 0) pressed |= INPUT_ACTION_BIT(INPUT_ACTION_RIGHT);
+    if (gpio_get_level(PIN_BUTTON_OK) == 0) pressed |= INPUT_ACTION_BIT(INPUT_ACTION_OK);
+    if (gpio_get_level(PIN_BUTTON_BACK) == 0) pressed |= INPUT_ACTION_BIT(INPUT_ACTION_BACK);
+    return pressed;
+}
+
+static void input_task(void *argument)
 {
     (void)argument;
-    const gpio_num_t pins[] = {
-        PIN_BUTTON_UP, PIN_BUTTON_DOWN, PIN_BUTTON_LEFT,
-        PIN_BUTTON_RIGHT, PIN_BUTTON_OK, PIN_BUTTON_BACK,
-    };
-    bool stable_pressed[sizeof(pins) / sizeof(pins[0])] = {false};
-    bool sampled_pressed[sizeof(pins) / sizeof(pins[0])] = {false};
-    uint8_t stable_counts[sizeof(pins) / sizeof(pins[0])] = {0};
-
     while (true) {
-        for (size_t i = 0; i < sizeof(pins) / sizeof(pins[0]); ++i) {
-            bool pressed = gpio_get_level(pins[i]) == 0;
-            if (pressed == sampled_pressed[i]) {
-                if (stable_counts[i] < 3) {
-                    ++stable_counts[i];
-                }
-            } else {
-                sampled_pressed[i] = pressed;
-                stable_counts[i] = 0;
-            }
-            if (stable_counts[i] >= 3 && stable_pressed[i] != sampled_pressed[i]) {
-                stable_pressed[i] = sampled_pressed[i];
-                if (stable_pressed[i]) {
-                    handle_button_press(pins[i]);
-                }
-            }
-        }
+        input_hub_poll();
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
@@ -1672,6 +1706,12 @@ void app_main(void)
     esp_err_t wallpaper_result = wallpaper_init();
     if (wallpaper_result != ESP_OK) {
         ESP_LOGW(TAG, "Wallpaper storage unavailable: %s", esp_err_to_name(wallpaper_result));
+    }
+
+    esp_err_t offline_result = offline_store_init();
+    if (offline_result != ESP_OK) {
+        ESP_LOGW(TAG, "Offline storage unavailable: %s", esp_err_to_name(offline_result));
+        serial_emit("WARN,OFFLINE_STORAGE_INIT_FAILED,%s", esp_err_to_name(offline_result));
     }
 
     esp_err_t display_result = display_init();
@@ -1692,13 +1732,21 @@ void app_main(void)
     ESP_ERROR_CHECK(sensor_hub_init(s_i2c_bus));
     sensor_hub_set_primary_ready("mpu6050", s_mpu_ready);
 
+    ESP_ERROR_CHECK(input_hub_init(handle_input_action, NULL));
+    const input_driver_t gpio_driver = {
+        .id = "gpio-buttons",
+        .poll = gpio_buttons_poll,
+        .debounce_ms = 30,
+    };
+    ESP_ERROR_CHECK(input_hub_register(&gpio_driver));
+
     set_state(STATE_READY);
     display_render_state(STATE_READY);
 
     xTaskCreate(serial_task, "serial_commands", 4096, NULL, 8, NULL);
     xTaskCreate(sampling_task, "motion_sampling", 4096, NULL, 9, NULL);
     xTaskCreate(display_task, "display_state", 4096, NULL, 4, NULL);
-    xTaskCreate(button_task, "buttons", 3072, NULL, 5, NULL);
+    xTaskCreate(input_task, "input_hub", 3072, NULL, 5, NULL);
 
     esp_err_t connectivity_result = connectivity_start();
     if (connectivity_result == ESP_OK) {
