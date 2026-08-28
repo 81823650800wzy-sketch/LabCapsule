@@ -109,6 +109,7 @@ typedef enum {
     DISPLAY_VIEW_COLOR_TEST,
     DISPLAY_VIEW_WALLPAPER,
     DISPLAY_VIEW_MEDIA,
+    DISPLAY_VIEW_IDLE,
 } display_view_t;
 
 typedef struct {
@@ -132,6 +133,9 @@ static volatile bool s_mock_enabled = false;
 static volatile display_view_t s_display_view = DISPLAY_VIEW_STATUS;
 static volatile uint8_t s_developer_page = 0;
 static volatile uint32_t s_display_revision = 1;
+static volatile bool s_idle_mode;
+static char s_idle_title[20] = "DEVICE IDLE";
+static char s_idle_message[36] = "READY FOR PHONE OR PC";
 
 static bool s_usb_serial_ready = false;
 static bool s_mpu_ready = false;
@@ -733,6 +737,58 @@ static void display_render_state(device_state_t state)
     display_text(24, 278, config_text, 2, theme.text);
 }
 
+static unsigned usage_percent(size_t total, size_t free_bytes)
+{
+    if (total == 0 || free_bytes >= total) return 0;
+    return (unsigned)((total - free_bytes) * 100U / total);
+}
+
+static void display_render_idle(void)
+{
+    if (!s_display_ready) return;
+    visual_palette_t theme = visual_palette();
+    size_t internal_total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    offline_store_info_t offline;
+    offline_store_get_info(&offline);
+    char line[36];
+
+    display_prepare_background(theme.base);
+    display_fill_rect_alpha(0, 0, TFT_WIDTH, 78, theme.panel, s_panel_opacity);
+    display_fill_rect_alpha(12, 90, 216, 64, theme.panel, s_panel_opacity);
+    display_fill_rect_alpha(12, 166, 216, 138, theme.panel, s_panel_opacity);
+    display_fill_rect_alpha(0, 0, TFT_WIDTH, 8, theme.accent, s_hud_opacity);
+    display_text(16, 22, "IDLE DASH", 3, theme.text);
+    snprintf(line, sizeof(line), "UP %lluSEC",
+             (unsigned long long)(esp_timer_get_time() / 1000000ULL));
+    display_text(16, 58, line, 1, theme.muted);
+
+    display_text(20, 102, s_idle_title, 2, theme.accent);
+    display_text(20, 136, s_idle_message, 1, theme.text);
+
+    snprintf(line, sizeof(line), "RAM %uPCT  %luK FREE",
+             usage_percent(internal_total, internal_free),
+             (unsigned long)(internal_free / 1024U));
+    display_text(20, 182, line, 1, theme.text);
+    snprintf(line, sizeof(line), "PSRAM %uPCT  %luK FREE",
+             usage_percent(psram_total, psram_free),
+             (unsigned long)(psram_free / 1024U));
+    display_text(20, 206, line, 1, theme.text);
+    unsigned store_percent = offline.bytes_capacity == 0 ? 0 :
+            (unsigned)(offline.bytes_used * 100ULL / offline.bytes_capacity);
+    snprintf(line, sizeof(line), "STORE %uPCT  %lu RUNS", store_percent,
+             (unsigned long)offline.sessions);
+    display_text(20, 230, line, 1, offline.full ? theme.secondary : theme.text);
+    snprintf(line, sizeof(line), "LINK B%d W%d M%d",
+             connectivity_ble_connected() ? 1 : 0,
+             connectivity_sta_connected() ? 1 : 0,
+             connectivity_remote_connected() ? 1 : 0);
+    display_text(20, 254, line, 2, theme.accent);
+    display_text(20, 286, "OK EXPERIMENT", 2, theme.muted);
+}
+
 static void display_render_settings(void)
 {
     visual_palette_t theme = visual_palette();
@@ -845,6 +901,9 @@ static void display_render_current(void)
             display_render_state(get_state());
             s_live_background_override = NULL;
             break;
+        case DISPLAY_VIEW_IDLE:
+            display_render_idle();
+            break;
         case DISPLAY_VIEW_STATUS:
         default:
             display_render_state(get_state());
@@ -918,6 +977,8 @@ static esp_err_t start_recording(uint32_t rate_hz, uint32_t duration_seconds)
         serial_emit("WARN,OFFLINE_STORAGE_UNAVAILABLE,%s",
                     esp_err_to_name(storage_result));
 
+    s_idle_mode = false;
+    s_display_view = DISPLAY_VIEW_STATUS;
     portENTER_CRITICAL(&s_state_lock);
     s_sample_rate_hz = rate_hz;
     s_duration_seconds = duration_seconds;
@@ -991,6 +1052,7 @@ static void handle_display_command(char **save_pointer)
         display_request_refresh();
         serial_emit("OK,DISPLAY,SETTINGS");
     } else if (strcmp(action, "HOME") == 0 || strcmp(action, "STATUS") == 0) {
+        s_idle_mode = false;
         s_display_view = DISPLAY_VIEW_STATUS;
         display_request_refresh();
         serial_emit("OK,DISPLAY,HOME");
@@ -1068,6 +1130,19 @@ static void handle_command(char *line)
         display_request_refresh();
         serial_emit("OK,DISPLAY,DEVELOPER");
         emit_display_diagnostics();
+    } else if (strcmp(command, "MODE") == 0) {
+        char *mode = strtok_r(NULL, ", ", &save_pointer);
+        if (mode) for (char *p = mode; *p; ++p)
+            *p = (char)toupper((unsigned char)*p);
+        if (!mode || (strcmp(mode, "IDLE") != 0 && strcmp(mode, "EXPERIMENT") != 0)) {
+            serial_emit("ERR,MODE,EXPECTED=IDLE|EXPERIMENT");
+        } else if (labcapsule_set_idle_mode(strcmp(mode, "IDLE") == 0) != ESP_OK) {
+            serial_emit("ERR,MODE,RECORDING_ACTIVE");
+        }
+    } else if (strcmp(command, "NOTICE") == 0) {
+        char *title = strtok_r(NULL, ",", &save_pointer);
+        char *message = strtok_r(NULL, ",", &save_pointer);
+        labcapsule_set_idle_notice(title, message);
     } else if (strcmp(command, "START") == 0) {
         char *rate_text = strtok_r(NULL, ", ", &save_pointer);
         char *duration_text = strtok_r(NULL, ", ", &save_pointer);
@@ -1101,6 +1176,8 @@ static void handle_command(char *line)
         serial_emit("COMMANDS,PING|STATUS|START[,RATE,DURATION]|STOP|ABORT|MOCK,ON|OFF");
         serial_emit("COMMANDS,DISPLAY[,DEV|TEST|WALLPAPER|SETTINGS|HOME|INVERT|BL,ON|OFF]");
         serial_emit("COMMANDS,STYLE,PRESET,WALL,PANEL,HUD");
+        serial_emit("COMMANDS,MODE,IDLE|EXPERIMENT");
+        serial_emit("COMMANDS,NOTICE,TITLE,MESSAGE");
     } else {
         serial_emit("ERR,UNKNOWN_COMMAND,%s", command);
     }
@@ -1228,13 +1305,17 @@ static void display_task(void *argument)
     uint32_t last_revision = 0;
     display_view_t last_view = (display_view_t)-1;
     uint8_t last_page = 0xFF;
+    TickType_t last_idle_refresh = 0;
 
     while (true) {
         device_state_t state = get_state();
+        TickType_t now = xTaskGetTickCount();
+        bool idle_refresh_due = s_display_view == DISPLAY_VIEW_IDLE &&
+                now - last_idle_refresh >= pdMS_TO_TICKS(1000);
         if (state != last_state || s_mpu_ready != last_mpu || s_mock_enabled != last_mock ||
             s_sample_rate_hz != last_rate || s_duration_seconds != last_duration ||
             s_display_revision != last_revision || s_display_view != last_view ||
-            s_developer_page != last_page) {
+            s_developer_page != last_page || idle_refresh_due) {
             display_render_current();
             last_state = state;
             last_mpu = s_mpu_ready;
@@ -1244,6 +1325,7 @@ static void display_task(void *argument)
             last_revision = s_display_revision;
             last_view = s_display_view;
             last_page = s_developer_page;
+            if (s_display_view == DISPLAY_VIEW_IDLE) last_idle_refresh = now;
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -1266,6 +1348,17 @@ static void handle_input_action(input_action_t action, const char *source, void 
             stop_recording(false);
         } else if (action == INPUT_ACTION_BACK) {
             stop_recording(true);
+        }
+        return;
+    }
+
+    if (s_display_view == DISPLAY_VIEW_IDLE) {
+        if (action == INPUT_ACTION_OK) {
+            labcapsule_set_idle_mode(false);
+        } else if (action == INPUT_ACTION_BACK) {
+            s_idle_mode = false;
+            s_display_view = DISPLAY_VIEW_SETTINGS;
+            serial_emit("UI,SETTINGS");
         }
         return;
     }
@@ -1345,6 +1438,7 @@ static const char *display_view_name(display_view_t view)
         case DISPLAY_VIEW_COLOR_TEST: return "test";
         case DISPLAY_VIEW_WALLPAPER: return "wallpaper";
         case DISPLAY_VIEW_MEDIA: return "media";
+        case DISPLAY_VIEW_IDLE: return "idle";
         case DISPLAY_VIEW_STATUS:
         default: return "home";
     }
@@ -1357,23 +1451,87 @@ void labcapsule_build_status_json(char *buffer, size_t buffer_size)
     }
     offline_store_info_t offline;
     offline_store_get_info(&offline);
+    size_t internal_total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     snprintf(buffer, buffer_size,
              "{\"version\":\"%s\",\"state\":\"%s\",\"view\":\"%s\","
+             "\"operationMode\":\"%s\",\"noticeTitle\":\"%s\","
+             "\"noticeMessage\":\"%s\","
              "\"mpu\":\"%s\",\"mock\":%s,\"rate\":%lu,\"duration\":%lu,"
              "\"samples\":%lu,\"backlight\":%s,\"brightness\":%u,\"wallpaper\":%s,"
              "\"inputDrivers\":%u,\"offlineSessions\":%lu,"
              "\"offlineSamples\":%lu,\"offlineRecording\":%s,"
+             "\"hardware\":{\"uptimeSeconds\":%llu,"
+             "\"internalFree\":%lu,\"internalTotal\":%lu,"
+             "\"psramFree\":%lu,\"psramTotal\":%lu,"
+             "\"storageUsed\":%llu,\"storageCapacity\":%llu,"
+             "\"bleConnected\":%s,\"staConnected\":%s,\"remoteConnected\":%s},"
              "\"style\":{\"preset\":%u,\"wallpaperOpacity\":%u,"
              "\"panelOpacity\":%u,\"hudOpacity\":%u}}",
              LABCAPSULE_VERSION, state_name(get_state()), display_view_name(s_display_view),
+             s_idle_mode ? "idle" : "experiment", s_idle_title, s_idle_message,
              s_mpu_ready ? "ok" : "missing", s_mock_enabled ? "true" : "false",
              (unsigned long)s_sample_rate_hz, (unsigned long)s_duration_seconds,
              (unsigned long)s_sample_count, s_backlight_commanded_on ? "true" : "false",
              (unsigned)s_backlight_brightness, wallpaper_available() ? "true" : "false",
              (unsigned)input_hub_driver_count(), (unsigned long)offline.sessions,
              (unsigned long)offline.samples, offline.recording ? "true" : "false",
+             (unsigned long long)(esp_timer_get_time() / 1000000ULL),
+             (unsigned long)internal_free, (unsigned long)internal_total,
+             (unsigned long)psram_free, (unsigned long)psram_total,
+             (unsigned long long)offline.bytes_used,
+             (unsigned long long)offline.bytes_capacity,
+             connectivity_ble_connected() ? "true" : "false",
+             connectivity_sta_connected() ? "true" : "false",
+             connectivity_remote_connected() ? "true" : "false",
+             (unsigned)s_visual_preset, (unsigned)s_wallpaper_opacity,
+               (unsigned)s_panel_opacity, (unsigned)s_hud_opacity);
+}
+
+void labcapsule_build_ble_device_json(char *buffer, size_t buffer_size)
+{
+    if (!buffer || buffer_size == 0) return;
+    snprintf(buffer, buffer_size,
+             "{\"version\":\"%s\",\"state\":\"%s\",\"view\":\"%s\","
+             "\"operationMode\":\"%s\",\"mpu\":\"%s\",\"backlight\":%s,"
+             "\"brightness\":%u,\"wallpaper\":%s,\"style\":{"
+             "\"preset\":%u,\"wallpaperOpacity\":%u,\"panelOpacity\":%u,"
+             "\"hudOpacity\":%u}}",
+             LABCAPSULE_VERSION, state_name(get_state()), display_view_name(s_display_view),
+             s_idle_mode ? "idle" : "experiment", s_mpu_ready ? "ok" : "missing",
+             s_backlight_commanded_on ? "true" : "false",
+             (unsigned)s_backlight_brightness,
+             wallpaper_available() ? "true" : "false",
              (unsigned)s_visual_preset, (unsigned)s_wallpaper_opacity,
              (unsigned)s_panel_opacity, (unsigned)s_hud_opacity);
+}
+
+void labcapsule_build_hardware_json(char *buffer, size_t buffer_size)
+{
+    if (!buffer || buffer_size == 0) return;
+    offline_store_info_t offline;
+    offline_store_get_info(&offline);
+    size_t internal_total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    snprintf(buffer, buffer_size,
+             "{\"ok\":true,\"type\":\"hardware\",\"operationMode\":\"%s\","
+             "\"uptimeSeconds\":%llu,\"internalFree\":%lu,\"internalTotal\":%lu,"
+             "\"psramFree\":%lu,\"psramTotal\":%lu,"
+             "\"storageUsed\":%llu,\"storageCapacity\":%llu,"
+             "\"bleConnected\":%s,\"staConnected\":%s,\"remoteConnected\":%s}",
+             s_idle_mode ? "idle" : "experiment",
+             (unsigned long long)(esp_timer_get_time() / 1000000ULL),
+             (unsigned long)internal_free, (unsigned long)internal_total,
+             (unsigned long)psram_free, (unsigned long)psram_total,
+             (unsigned long long)offline.bytes_used,
+             (unsigned long long)offline.bytes_capacity,
+             connectivity_ble_connected() ? "true" : "false",
+             connectivity_sta_connected() ? "true" : "false",
+             connectivity_remote_connected() ? "true" : "false");
 }
 
 void labcapsule_show_wallpaper(void)
@@ -1575,12 +1733,53 @@ esp_err_t labcapsule_start_experiment(uint32_t rate_hz, uint32_t duration_second
     return start_recording(rate_hz, duration_seconds);
 }
 
+static void sanitize_idle_text(const char *source, char *target, size_t capacity,
+                               const char *fallback)
+{
+    if (!target || capacity == 0) return;
+    size_t written = 0;
+    bool prior_space = false;
+    for (size_t index = 0; source && source[index] && written + 1 < capacity; ++index) {
+        unsigned char value = (unsigned char)source[index];
+        char output = '\0';
+        if (value < 128 && isalnum(value)) output = (char)toupper(value);
+        else if (value == '-' || value == '.' || value == ':') output = (char)value;
+        else if (value < 128 && isspace(value)) output = ' ';
+        else if (value >= 128) output = ' ';
+        if (!output || (output == ' ' && (written == 0 || prior_space))) continue;
+        target[written++] = output;
+        prior_space = output == ' ';
+    }
+    while (written > 0 && target[written - 1] == ' ') --written;
+    target[written] = '\0';
+    if (written == 0 && fallback) strlcpy(target, fallback, capacity);
+}
+
+esp_err_t labcapsule_set_idle_mode(bool idle)
+{
+    if (idle && get_state() == STATE_RECORDING) return ESP_ERR_INVALID_STATE;
+    s_idle_mode = idle;
+    s_display_view = idle ? DISPLAY_VIEW_IDLE : DISPLAY_VIEW_STATUS;
+    display_request_refresh();
+    serial_emit("MODE,%s", idle ? "IDLE" : "EXPERIMENT");
+    return ESP_OK;
+}
+
+esp_err_t labcapsule_set_idle_notice(const char *title, const char *message)
+{
+    sanitize_idle_text(title, s_idle_title, sizeof(s_idle_title), "DEVICE IDLE");
+    sanitize_idle_text(message, s_idle_message, sizeof(s_idle_message), "READY FOR LINK");
+    display_request_refresh();
+    serial_emit("NOTICE,%s,%s", s_idle_title, s_idle_message);
+    return ESP_OK;
+}
+
 esp_err_t labcapsule_remote_action(const char *action, char *response, size_t response_size)
 {
     if (!action || !response || response_size == 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    char normalized[48];
+    char normalized[160];
     size_t index = 0;
     while (action[index] && index < sizeof(normalized) - 1) {
         char value = action[index];
@@ -1618,7 +1817,27 @@ esp_err_t labcapsule_remote_action(const char *action, char *response, size_t re
         snprintf(response, response_size, result == ESP_OK ? "experiment started" :
                  "experiment rejected");
         return result;
+    } else if (strcmp(normalized, "MODE:IDLE") == 0) {
+        esp_err_t result = labcapsule_set_idle_mode(true);
+        snprintf(response, response_size, result == ESP_OK ? "idle dashboard enabled" :
+                 "cannot enter idle while recording");
+        return result;
+    } else if (strcmp(normalized, "MODE:EXPERIMENT") == 0) {
+        esp_err_t result = labcapsule_set_idle_mode(false);
+        snprintf(response, response_size, "experiment console enabled");
+        return result;
+    } else if (strncmp(normalized, "NOTICE:", 7) == 0) {
+        char *message = strchr(normalized + 7, '|');
+        if (!message) {
+            snprintf(response, response_size, "expected NOTICE:title|message");
+            return ESP_ERR_INVALID_ARG;
+        }
+        *message++ = '\0';
+        esp_err_t result = labcapsule_set_idle_notice(normalized + 7, message);
+        snprintf(response, response_size, "idle notice updated");
+        return result;
     } else if (strcmp(normalized, "HOME") == 0 || strcmp(normalized, "STATUS") == 0) {
+        s_idle_mode = false;
         s_display_view = DISPLAY_VIEW_STATUS;
     } else if (strcmp(normalized, "SETTINGS") == 0) {
         s_display_view = DISPLAY_VIEW_SETTINGS;

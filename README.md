@@ -2,7 +2,16 @@
 
 > Ask a question. Run an experiment.
 
-LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前版本为 **V0.5.0 Alpha / Offline-capable Motion Experiment Prototype**，已经打通“自然语言问题 → 实验协议 → 六轴采集 → 在线直传或离线缓存 → CSV/分析”的设备侧和 Android 控制链路。
+LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前版本为 **V0.6.0 Alpha / Connected Experiment Companion**，已经打通“自然语言问题 → 实验协议 → 六轴采集 → 在线直传或离线缓存 → CSV/分析”，并加入闲置信息面板、硬件负载、手机通知镜像与可调速动态壁纸。
+
+## V0.6.0 新增
+
+- 设备可在“闲置信息”和“实验直传”两种工作模式间切换。闲置屏每秒显示运行时间、内部 RAM、PSRAM、离线存储、BLE、外部 Wi-Fi、MQTT 和一条通知摘要；实验启动时自动返回直传界面。
+- APK 首页与折叠的设备设置均可切换模式、填写闲置提示并读取硬件使用情况。Android 通知访问为可选授权，开启后仅在闲置模式转发摘要；隐私模式只显示应用名，实验和 GIF 播放期间自动暂停镜像。
+- GIF 播放速度可在 25%–300% 间连续调整，播放中立即生效并由前台服务持久保存。100% 使用预处理后的原时间轴，链路来不及发送时仍由 BLE/Wi-Fi 实际带宽限制。
+- 图片/GIF 裁剪增加 100%–800% 缩放滑杆，保留单指平移和双指缩放，并加大编辑区域；原文件仍在手机端裁剪、抽帧、量化和差分编码，不写入 ESP32。
+- BLE 新增 `MODE:IDLE`、`MODE:EXPERIMENT`、`NOTICE:title|message`、`HARDWARE`；HTTP 新增 `POST /api/mode`。蓝牙状态生成改为无动态分配的紧凑路径，修复模式切换时的堆损坏重启。
+- 2026-08-28 真机回归：模式/硬件往返连续 3 次通过；Mock 链路 100 Hz × 2 秒收到 200/200 个 BLE 实时样本且未新增离线会话；原有 3 组、507 个离线样本完整导出。
 
 ## V0.5.0 已实现
 
@@ -50,7 +59,7 @@ V0.4.0 的界面与媒体能力继续保留：
    idf.py -p COM8 flash monitor
    ```
 
-2. 安装 `release/LabCapsule-0.5.0.apk`。首次进入“设置 → 设备与连接”，推荐选择：
+2. 安装 `release/LabCapsule-0.6.0.apk`。首次进入“设置 → 设备与连接”，推荐选择：
 
    - BLE：点击扫描并允许“附近设备”权限；连接成功后直接点“蓝牙一键配网”；
    - 恢复热点：只在排障时连接 `LabCapsule-XXXX`，密码 `labcapsule`，地址 `http://192.168.4.1`。
@@ -59,7 +68,7 @@ V0.4.0 的界面与媒体能力继续保留：
 
 4. 在“AI”页填写 API Endpoint、模型和 Key，生成协议后点击“发送并开始实验”。Key 由 Android Keystore 加密，仅在手机端使用。
 
-完整操作见 [V0.5.0 离线实验与硬件扩展指南](docs/V0.5.0_OFFLINE_HARDWARE_GUIDE_ZH.md)、[V0.4.0 实验、数据与后台 GIF 指南](docs/V0.4.0_EXPERIMENT_GIF_GUIDE_ZH.md)、[V0.3.3 蓝牙配网与连接排障](docs/V0.3.3_BLE_WIFI_QUICKSTART_ZH.md) 和 [V0.3.2 壁纸与界面指南](docs/V0.3.2_WALLPAPER_STYLE_GUIDE_ZH.md)。
+完整操作见 [V0.6.0 工作模式、通知与 GIF 指南](docs/V0.6.0_IDLE_GIF_MODE_GUIDE_ZH.md)、[V0.5.0 离线实验与硬件扩展指南](docs/V0.5.0_OFFLINE_HARDWARE_GUIDE_ZH.md)、[V0.4.0 实验、数据与后台 GIF 指南](docs/V0.4.0_EXPERIMENT_GIF_GUIDE_ZH.md) 和 [V0.3.3 蓝牙配网与连接排障](docs/V0.3.3_BLE_WIFI_QUICKSTART_ZH.md)。
 
 ## 冻结引脚
 
@@ -97,13 +106,14 @@ SPEC_V0.1.md             初始产品规格（历史基线）
 
 ## 当前实机状态
 
-2026-08-28 已在 COM8 的 ESP32-S3 rev 0.2 / 16 MiB Flash / 8 MiB Octal PSRAM 上完成 V0.5.0 构建、完整分区烧录和实机验证，串口启动标识为 `BOOT,LABCAPSULE,0.5.0-alpha`。100 Hz × 2 秒离线实验得到串口 200 条、缓存 200 条、丢样 0；BLE 在线实验收到 200/200 个通知且不新增离线会话；3 个缓存会话共 8,208 字节已通过 BLE 完整导出并逐头校验。BLE `SENSORS` 返回 I²C `0x68`，但 `WHO_AM_I=0x70` 与标准 MPU6050 标识不一致，正式采集前仍应确认模块型号。纯 5 GHz 网络无法被 ESP32-S3 Station 使用，设备会保持 BLE 可用并在失败四次后恢复热点。
+2026-08-28 已在 COM8 的 ESP32-S3 rev 0.2 / 16 MiB Flash / 8 MiB Octal PSRAM 上完成 V0.6.0 构建、完整烧录和实机验证，串口启动标识为 `BOOT,LABCAPSULE,0.6.0-alpha`。BLE 模式/通知/硬件状态往返与连续稳定性测试通过；Mock 在线实验收到 200/200 个通知且不新增离线会话；3 个缓存会话共 507 个样本、8,208 字节已通过 BLE 完整导出并逐头校验。I²C `0x68` 当前返回 `WHO_AM_I=0x70`，与标准 MPU6050 标识不一致，真实实验前仍应检查模块型号和接线。纯 5 GHz 网络无法被 ESP32-S3 Station 使用，设备会保持 BLE 可用并在失败四次后恢复热点。
 
 ## 安全边界
 
 - APK 中的 API Key、Wi-Fi 和 MQTT 密码使用 Android Keystore 加密保存。
 - 设备状态接口不回传密码；MQTT 支持 `mqtts://` 并使用 ESP-IDF CA 证书包。
-- 恢复热点与局域网 HTTP API 面向受信任本地网络，V0.5.0 尚未提供逐设备 HTTP 登录或托管云端中继服务。
+- 恢复热点与局域网 HTTP API 面向受信任本地网络，V0.6.0 尚未提供逐设备 HTTP 登录或托管云端中继服务。
+- 手机通知读取必须由用户在 Android 系统设置中单独授权；通知正文只在闲置模式下发送到所选设备通道，可随时关闭或启用只显示应用名的隐私模式。
 - Android 系统不允许普通应用静默安装 APK；自动更新会检查并下载，最终安装仍需用户确认。
 
 ## License

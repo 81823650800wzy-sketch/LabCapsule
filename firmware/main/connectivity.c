@@ -367,51 +367,47 @@ void connectivity_build_status_json(char *buffer, size_t buffer_size)
              (unsigned)s_sta_last_disconnect_reason);
 }
 
+bool connectivity_ble_connected(void)
+{
+    return s_ble_connection_handle != UINT16_MAX;
+}
+
+bool connectivity_sta_connected(void)
+{
+    return s_sta_connected;
+}
+
+bool connectivity_remote_connected(void)
+{
+    return s_remote_connected;
+}
+
 static void ble_build_status_response(void)
 {
-    char device_status[640];
-    char network_status[256];
-    labcapsule_build_status_json(device_status, sizeof(device_status));
-    connectivity_build_status_json(network_status, sizeof(network_status));
-    cJSON *device = cJSON_Parse(device_status);
-    cJSON *style = device ? cJSON_GetObjectItemCaseSensitive(device, "style") : NULL;
-    const cJSON *state = device ? cJSON_GetObjectItemCaseSensitive(device, "state") : NULL;
-    const cJSON *view = device ? cJSON_GetObjectItemCaseSensitive(device, "view") : NULL;
-    const cJSON *mpu = device ? cJSON_GetObjectItemCaseSensitive(device, "mpu") : NULL;
-    const cJSON *backlight = device
-            ? cJSON_GetObjectItemCaseSensitive(device, "backlight") : NULL;
-    const cJSON *brightness = device
-            ? cJSON_GetObjectItemCaseSensitive(device, "brightness") : NULL;
-    const cJSON *wallpaper = device
-            ? cJSON_GetObjectItemCaseSensitive(device, "wallpaper") : NULL;
-    const cJSON *preset = style
-            ? cJSON_GetObjectItemCaseSensitive(style, "preset") : NULL;
-    const cJSON *wallpaper_opacity = style
-            ? cJSON_GetObjectItemCaseSensitive(style, "wallpaperOpacity") : NULL;
-    const cJSON *panel_opacity = style
-            ? cJSON_GetObjectItemCaseSensitive(style, "panelOpacity") : NULL;
-    const cJSON *hud_opacity = style
-            ? cJSON_GetObjectItemCaseSensitive(style, "hudOpacity") : NULL;
+    char device_status[256];
+    char network_status[188];
+    labcapsule_build_ble_device_json(device_status, sizeof(device_status));
+    wifi_mode_t wifi_mode = WIFI_MODE_NULL;
+    esp_wifi_get_mode(&wifi_mode);
+    const labcapsule_config_t *config = device_config_get();
+    bool recovery_ap_active = wifi_mode == WIFI_MODE_AP || wifi_mode == WIFI_MODE_APSTA;
+    snprintf(network_status, sizeof(network_status),
+             "{\"recoveryAp\":\"%s\",\"recoveryApActive\":%s,"
+             "\"staConfigured\":%s,\"staConnected\":%s,\"staIp\":\"%s\","
+             "\"remoteConnected\":%s,\"lastDisconnectReason\":%u}",
+             s_ap_ssid, recovery_ap_active ? "true" : "false",
+             config->wifi_ssid[0] ? "true" : "false",
+             s_sta_connected ? "true" : "false", s_sta_ip,
+             s_remote_connected ? "true" : "false",
+             (unsigned)s_sta_last_disconnect_reason);
     snprintf(s_ble_response, sizeof(s_ble_response),
-             "{\"ok\":true,\"type\":\"status\",\"device\":{"
-             "\"version\":\"%s\",\"state\":\"%s\",\"view\":\"%s\","
-             "\"mpu\":\"%s\",\"backlight\":%s,\"brightness\":%d,"
-             "\"wallpaper\":%s,\"style\":{\"preset\":%d,"
-             "\"wallpaperOpacity\":%d,\"panelOpacity\":%d,"
-             "\"hudOpacity\":%d}},\"network\":%s}",
-             LABCAPSULE_VERSION,
-             cJSON_IsString(state) ? state->valuestring : "UNKNOWN",
-             cJSON_IsString(view) ? view->valuestring : "home",
-             cJSON_IsString(mpu) ? mpu->valuestring : "unknown",
-             cJSON_IsTrue(backlight) ? "true" : "false",
-             cJSON_IsNumber(brightness) ? brightness->valueint : 0,
-             cJSON_IsTrue(wallpaper) ? "true" : "false",
-             cJSON_IsNumber(preset) ? preset->valueint : 0,
-             cJSON_IsNumber(wallpaper_opacity) ? wallpaper_opacity->valueint : 82,
-             cJSON_IsNumber(panel_opacity) ? panel_opacity->valueint : 76,
-             cJSON_IsNumber(hud_opacity) ? hud_opacity->valueint : 100,
-             network_status);
-    cJSON_Delete(device);
+             "{\"ok\":true,\"type\":\"status\",\"device\":%s,\"network\":%s}",
+             device_status, network_status);
+}
+
+static void ble_build_hardware_response(void)
+{
+    labcapsule_build_hardware_json(s_ble_response, sizeof(s_ble_response));
 }
 
 static void ble_build_offline_response(void)
@@ -448,9 +444,9 @@ static bool ble_decode_base64(const char *encoded, char *decoded, size_t decoded
 
 static esp_err_t status_handler(httpd_req_t *request)
 {
-    char device_status[640];
+    char device_status[1200];
     char network_status[384];
-    char response[1200];
+    char response[1800];
     labcapsule_build_status_json(device_status, sizeof(device_status));
     connectivity_build_status_json(network_status, sizeof(network_status));
     snprintf(response, sizeof(response),
@@ -530,7 +526,7 @@ static esp_err_t network_handler(httpd_req_t *request)
 static esp_err_t display_config_handler(httpd_req_t *request)
 {
     if (request->method == HTTP_GET) {
-        char status[640];
+        char status[1200];
         labcapsule_build_status_json(status, sizeof(status));
         return http_json(request, NULL, status);
     }
@@ -603,6 +599,51 @@ static esp_err_t sensors_handler(httpd_req_t *request)
     sensor_hub_discover();
     sensor_hub_build_json(sensors, sizeof(sensors));
     snprintf(response, sizeof(response), "{\"ok\":true,\"hub\":%s}", sensors);
+    return http_json(request, NULL, response);
+}
+
+static esp_err_t mode_handler(httpd_req_t *request)
+{
+    if (request->content_len <= 0 || request->content_len >= 384) {
+        return http_json(request, "400 Bad Request",
+                         "{\"ok\":false,\"error\":\"missing mode payload\"}");
+    }
+    char body[384];
+    size_t received_total = 0;
+    while (received_total < (size_t)request->content_len) {
+        int received = httpd_req_recv(request, body + received_total,
+                                      request->content_len - received_total);
+        if (received == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (received <= 0) return ESP_FAIL;
+        received_total += (size_t)received;
+    }
+    body[received_total] = '\0';
+    cJSON *root = cJSON_Parse(body);
+    const cJSON *mode = root ? cJSON_GetObjectItemCaseSensitive(root, "mode") : NULL;
+    const cJSON *title = root ? cJSON_GetObjectItemCaseSensitive(root, "title") : NULL;
+    const cJSON *message = root ? cJSON_GetObjectItemCaseSensitive(root, "message") : NULL;
+    if (!cJSON_IsString(mode) || !mode->valuestring) {
+        cJSON_Delete(root);
+        return http_json(request, "400 Bad Request",
+                         "{\"ok\":false,\"error\":\"mode must be idle or experiment\"}");
+    }
+    if (cJSON_IsString(title) || cJSON_IsString(message)) {
+        labcapsule_set_idle_notice(cJSON_IsString(title) ? title->valuestring : NULL,
+                                   cJSON_IsString(message) ? message->valuestring : NULL);
+    }
+    esp_err_t result = strcmp(mode->valuestring, "idle") == 0
+            ? labcapsule_set_idle_mode(true)
+            : strcmp(mode->valuestring, "experiment") == 0
+                    ? labcapsule_set_idle_mode(false) : ESP_ERR_INVALID_ARG;
+    cJSON_Delete(root);
+    if (result != ESP_OK) {
+        return http_json(request, "409 Conflict",
+                         "{\"ok\":false,\"error\":\"mode change rejected\"}");
+    }
+    char status[1200];
+    char response[1320];
+    labcapsule_build_status_json(status, sizeof(status));
+    snprintf(response, sizeof(response), "{\"ok\":true,\"device\":%s}", status);
     return http_json(request, NULL, response);
 }
 
@@ -850,7 +891,7 @@ static esp_err_t http_server_start(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.stack_size = 8192;
-    config.max_uri_handlers = 14;
+    config.max_uri_handlers = 15;
     httpd_handle_t server = NULL;
     ESP_RETURN_ON_ERROR(httpd_start(&server, &config), TAG, "HTTP server start failed");
 
@@ -881,6 +922,9 @@ static esp_err_t http_server_start(void)
     const httpd_uri_t sensors_uri = {
         .uri = "/api/sensors", .method = HTTP_GET, .handler = sensors_handler,
     };
+    const httpd_uri_t mode_uri = {
+        .uri = "/api/mode", .method = HTTP_POST, .handler = mode_handler,
+    };
     const httpd_uri_t media_uri = {
         .uri = "/api/media/frame", .method = HTTP_POST, .handler = media_frame_handler,
     };
@@ -905,6 +949,7 @@ static esp_err_t http_server_start(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &display_get_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &display_post_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &sensors_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &mode_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &media_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &experiment_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &offline_get_uri));
@@ -922,7 +967,7 @@ static void mqtt_event_handler(void *argument, esp_event_base_t base, int32_t ev
     if (event_id == MQTT_EVENT_CONNECTED) {
         s_remote_connected = true;
         esp_mqtt_client_subscribe(event->client, s_mqtt_command_topic, 1);
-        char status[640];
+        char status[1200];
         labcapsule_build_status_json(status, sizeof(status));
         esp_mqtt_client_publish(event->client, s_mqtt_status_topic, status, 0, 1, 1);
         ESP_LOGI(TAG, "Remote MQTT connected");
@@ -1166,6 +1211,11 @@ static int ble_access(uint16_t connection_handle, uint16_t attribute_handle,
         command[copied] = '\0';
         if (strcmp(command, "STATUS") == 0) {
             ble_build_status_response();
+            ble_gatts_chr_updated(s_ble_status_handle);
+            return 0;
+        }
+        if (strcmp(command, "HARDWARE") == 0) {
+            ble_build_hardware_response();
             ble_gatts_chr_updated(s_ble_status_handle);
             return 0;
         }

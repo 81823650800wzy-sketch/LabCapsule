@@ -17,3 +17,8 @@ void connectivity_build_status_json(char *buffer, size_t buffer_size);
  */
 bool connectivity_stream_motion(uint32_t elapsed_us, float ax, float ay, float az,
                                 float gx, float gy, float gz);
+
+/** Lightweight link indicators for the on-device idle dashboard. */
+bool connectivity_ble_connected(void);
+bool connectivity_sta_connected(void);
+bool connectivity_remote_connected(void);

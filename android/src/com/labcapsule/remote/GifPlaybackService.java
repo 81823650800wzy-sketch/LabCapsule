@@ -21,11 +21,13 @@ import java.util.zip.CRC32;
 public final class GifPlaybackService extends Service {
     public static final String ACTION_START = "com.labcapsule.remote.GIF_START";
     public static final String ACTION_PREPARE = "com.labcapsule.remote.GIF_PREPARE";
+    public static final String ACTION_SPEED = "com.labcapsule.remote.GIF_SPEED";
     public static final String ACTION_STOP = "com.labcapsule.remote.GIF_STOP";
     public static final String EXTRA_FILE = "file";
     public static final String EXTRA_TRANSPORT = "transport";
     public static final String EXTRA_ENDPOINT = "endpoint";
     public static final String EXTRA_BLE_ADDRESS = "ble_address";
+    public static final String EXTRA_SPEED_PERCENT = "speed_percent";
     public static final int CLIP_MAGIC = 0x4C434734;
     public static final int CLIP_VERSION = 1;
 
@@ -40,6 +42,7 @@ public final class GifPlaybackService extends Service {
     private int generation;
     private String clipPath, endpoint, bleAddress;
     private int transport;
+    private volatile int speedPercent = 100;
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
     private BluetoothGatt gatt;
@@ -67,6 +70,7 @@ public final class GifPlaybackService extends Service {
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
+        SharedPreferences preferences = getSharedPreferences("labcapsule", MODE_PRIVATE);
         if (intent != null && ACTION_STOP.equals(intent.getAction())) {
             stopPlayback("已停止");
             stopSelf();
@@ -84,17 +88,30 @@ public final class GifPlaybackService extends Service {
             }, 120000);
             return START_NOT_STICKY;
         }
-        SharedPreferences preferences = getSharedPreferences("labcapsule", MODE_PRIVATE);
+        if (intent != null && ACTION_SPEED.equals(intent.getAction())) {
+            speedPercent = Math.max(25, Math.min(300,
+                    intent.getIntExtra(EXTRA_SPEED_PERCENT,
+                            preferences.getInt("gif_speed_percent", 100))));
+            preferences.edit().putInt("gif_speed_percent", speedPercent).apply();
+            if (running) updateState(true, "GIF 后台播放 · 速度 " + speedPercent + "%");
+            else stopSelf();
+            return running ? START_STICKY : START_NOT_STICKY;
+        }
         if (intent != null) {
             clipPath = intent.getStringExtra(EXTRA_FILE);
             endpoint = intent.getStringExtra(EXTRA_ENDPOINT);
             bleAddress = intent.getStringExtra(EXTRA_BLE_ADDRESS);
             transport = intent.getIntExtra(EXTRA_TRANSPORT, 0);
+            speedPercent = Math.max(25, Math.min(300,
+                    intent.getIntExtra(EXTRA_SPEED_PERCENT,
+                            preferences.getInt("gif_speed_percent", 100))));
         } else {
             clipPath = preferences.getString("gif_clip", "");
             endpoint = preferences.getString("gif_endpoint", "");
             bleAddress = preferences.getString("gif_ble_address", "");
             transport = preferences.getInt("gif_transport", 0);
+            speedPercent = Math.max(25, Math.min(300,
+                    preferences.getInt("gif_speed_percent", 100)));
         }
         startForeground(NOTIFICATION_ID, notification("正在启动后台播放器…"));
         if (clipPath == null || !new File(clipPath).isFile()) {
@@ -109,7 +126,8 @@ public final class GifPlaybackService extends Service {
         preferences.edit().putString("gif_clip", clipPath)
                 .putString("gif_endpoint", endpoint == null ? "" : endpoint)
                 .putString("gif_ble_address", bleAddress == null ? "" : bleAddress)
-                .putInt("gif_transport", transport).apply();
+                .putInt("gif_transport", transport)
+                .putInt("gif_speed_percent", speedPercent).apply();
         acquireLocks();
         updateState(true, transport == 1 ? "BLE 后台播放器正在连接" : "Wi‑Fi 后台播放中");
         if (transport == 1) connectBle(token); else worker.execute(() -> playWifi(token));
@@ -172,11 +190,12 @@ public final class GifPlaybackService extends Service {
             ClipFrame frame = clip.bootstrap;
             while (running && token == generation) {
                 long started = SystemClock.elapsedRealtime();
-                if (frame.data.length > 0) postHttpFrame(frame, clip.intervalMs);
+                int frameInterval = frameIntervalMs(clip);
+                if (frame.data.length > 0) postHttpFrame(frame, frameInterval);
                 ++displayed;
                 if (displayed % 12 == 0)
                     updateState(true, "Wi‑Fi 后台播放 · 已发送 " + displayed + " 帧");
-                long remaining = clip.intervalMs - (SystemClock.elapsedRealtime() - started);
+                long remaining = frameInterval - (SystemClock.elapsedRealtime() - started);
                 if (remaining > 0) Thread.sleep(remaining);
                 frame = clip.nextLoopFrame();
             }
@@ -281,7 +300,7 @@ public final class GifPlaybackService extends Service {
                 } else writeNextBleChunk();
             } else if ("end".equals(blePhase) && uuid.equals(FILE_CONTROL_UUID)) {
                 blePhase = "idle";
-                long remaining = bleClip.intervalMs -
+                long remaining = frameIntervalMs(bleClip) -
                         (SystemClock.elapsedRealtime() - bleFrameStarted);
                 handler.postDelayed(() -> sendNextBleFrame(generation), Math.max(20, remaining));
             }
@@ -293,7 +312,7 @@ public final class GifPlaybackService extends Service {
             if (bleClip != null) bleClip.close();
             bleClip = new ClipReader(new File(clipPath));
             bleFrame = bleClip.bootstrap;
-            updateState(true, "BLE 后台播放中 · 稀疏差分已启用");
+            updateState(true, "BLE 后台播放中 · " + speedPercent + "% · 稀疏差分");
             sendBleFrame(bleFrame);
         } catch (Exception error) { scheduleBleReconnect(generation, shortMessage(error)); }
     }
@@ -303,7 +322,7 @@ public final class GifPlaybackService extends Service {
         try {
             ClipFrame frame = bleClip.nextLoopFrame();
             if (frame.data.length == 0) {
-                handler.postDelayed(() -> sendNextBleFrame(token), bleClip.intervalMs);
+                handler.postDelayed(() -> sendNextBleFrame(token), frameIntervalMs(bleClip));
             } else sendBleFrame(frame);
         } catch (Exception error) { scheduleBleReconnect(token, shortMessage(error)); }
     }
@@ -316,7 +335,7 @@ public final class GifPlaybackService extends Service {
         crc.update(frame.data);
         String begin = String.format(Locale.US,
                 "BEGIN:FRAME:%d:%d:%08X:%s:%d:%d:%d:%d", frame.data.length,
-                bleClip.intervalMs, crc.getValue(), frame.encoding, frame.x, frame.y,
+                frameIntervalMs(bleClip), crc.getValue(), frame.encoding, frame.x, frame.y,
                 frame.width, frame.height);
         blePhase = "begin";
         if (!write(fileControl, begin.getBytes(StandardCharsets.UTF_8)))
@@ -329,6 +348,11 @@ public final class GifPlaybackService extends Service {
         byte[] data = new byte[blePending];
         System.arraycopy(bleFrame.data, bleOffset, data, 0, blePending);
         if (!write(fileData, data)) scheduleBleReconnect(generation, "传输队列失败");
+    }
+
+    private int frameIntervalMs(ClipReader clip) {
+        if (clip == null) return 100;
+        return Math.max(20, clip.intervalMs * 100 / Math.max(25, speedPercent));
     }
 
     @SuppressWarnings("deprecation")

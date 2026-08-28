@@ -1,4 +1,4 @@
-# LabCapsule ESP-IDF Firmware 0.5.0-alpha
+# LabCapsule ESP-IDF Firmware 0.6.0-alpha
 
 目标硬件：ESP32-S3，16 MiB Flash、8 MiB Octal PSRAM、ESP-IDF 5.5.4。
 
@@ -11,7 +11,7 @@ idf.py build
 idf.py -p COM8 flash monitor
 ```
 
-首次安装、从旧分区表升级到 0.5.0 时必须执行一次完整 `flash`，写入新增的 `offline` 分区。之后可以在 APK 中选择 `LabCapsule-0.5.0-ota.bin` 经 Wi-Fi/BLE 更新。不要为普通升级运行 `erase-flash`，它会清除 NVS 配置、持久壁纸和离线实验。
+首次安装、从 0.4.x 及更早分区表升级时必须执行一次完整 `flash`，写入 `offline` 分区。0.5.0 可直接使用 `LabCapsule-0.6.0-ota.bin` 经 Wi-Fi/BLE 更新。不要为普通升级运行 `erase-flash`，它会清除 NVS 配置、持久壁纸和离线实验。
 
 ## 分区与内存
 
@@ -51,6 +51,7 @@ idf.py -p COM8 flash monitor
 | POST | `/api/control?action=home` | 屏幕、按键和亮度动作 |
 | GET/POST | `/api/display` | 读取/保存主题和壁纸、面板、HUD 透明度 |
 | POST | `/api/experiment?rate=200&duration=20` | 校验并开始实验 |
+| POST | `/api/mode` | 切换 `idle/experiment` 并设置闲置通知摘要 |
 | GET | `/api/offline` | 流式导出所有离线 `LCB1` 会话 |
 | POST | `/api/offline` | 清空已完成的离线会话 |
 | POST | `/api/media/frame?duration=100&enc=delta332&x=0&y=0&w=240&h=320` | 临时整帧/局部差分帧，不写 Flash |
@@ -88,7 +89,9 @@ idf.py -p COM8 flash monitor
 | `0007` | file data | RGB565 分片 |
 | `0008` | experiment data | 在线样本通知及离线会话分片读取 |
 
-BLE 配网命令为 `WIFI:<base64-ssid>:<base64-password>`，使用标准 Base64 且不换行。SSID/密码不会出现在状态回包中。`STATUS` 回包包含精简设备渲染状态和完整网络状态；`SENSORS` 会重新扫描 GPIO8/9 并只返回当前有响应的 I²C 设备。ESP32-S3 只能使用 2.4 GHz Wi-Fi，纯 5 GHz 环境应保留 BLE 通道。
+BLE 配网命令为 `WIFI:<base64-ssid>:<base64-password>`，使用标准 Base64 且不换行。SSID/密码不会出现在状态回包中。`STATUS` 回包包含精简设备渲染状态和完整网络状态；`HARDWARE` 返回运行时间、内部 RAM、PSRAM、离线存储和三种连接状态；`MODE:IDLE` / `MODE:EXPERIMENT` 切换工作模式；`NOTICE:title|message` 更新闲置摘要。`SENSORS` 会重新扫描 GPIO8/9 并只返回当前有响应的 I²C 设备。ESP32-S3 只能使用 2.4 GHz Wi-Fi，纯 5 GHz 环境应保留 BLE 通道。
+
+BLE GATT 回调栈不再生成大状态后再用 cJSON 二次解析，而是直接构建小型设备/硬件 JSON。该无动态分配路径用于避免模式切换和频繁状态读取造成堆压力。
 
 离线命令为 `OFFLINE:INFO`、`OFFLINE:OPEN`、`OFFLINE:CLOSE`、`OFFLINE:CLEAR`。打开导出后重复读取 `0008`：首字节 `0x20` 表示后续是数据，`0x21` 表示结束。在线通知首字节为 `0x10`，后接 `elapsed_us:uint32` 和六个 `int16`；加速度除以 4096，角速度除以 16。只有 BLE 通知或 MQTT 数据队列接受当前样本时才视为在线，否则该样本进入离线缓存。
 
@@ -130,6 +133,8 @@ STOP
 ABORT
 MOCK,ON|OFF
 DISPLAY[,DEV|TEST|WALLPAPER|SETTINGS|HOME|INVERT|BL,ON|OFF]
+MODE,IDLE|EXPERIMENT
+NOTICE,TITLE,MESSAGE
 HELP
 ```
 

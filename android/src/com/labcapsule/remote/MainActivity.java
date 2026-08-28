@@ -42,12 +42,14 @@ import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
 
 public class MainActivity extends Activity {
-    private static final String APP_VERSION = "0.5.0";
+    private static final String APP_VERSION = "0.6.0";
     private static final String REPOSITORY = "81823650800wzy-sketch/LabCapsule";
     private static final String WIFI_GUIDE_URL = "https://github.com/" + REPOSITORY +
             "/blob/main/docs/V0.3.3_BLE_WIFI_QUICKSTART_ZH.md";
     private static final String V040_GUIDE_URL = "https://github.com/" + REPOSITORY +
             "/blob/main/docs/V0.4.0_EXPERIMENT_GIF_GUIDE_ZH.md";
+    private static final String V060_GUIDE_URL = "https://github.com/" + REPOSITORY +
+            "/blob/main/docs/V0.6.0_IDLE_GIF_MODE_GUIDE_ZH.md";
     private static final int REQUEST_FIRMWARE = 1001, REQUEST_MEDIA = 1002,
             REQUEST_BLE_PERMISSIONS = 1003, REQUEST_NOTIFICATION_PERMISSION = 1004,
             REQUEST_CSV = 1005;
@@ -77,11 +79,11 @@ public class MainActivity extends Activity {
     private TextView globalStatus, mediaInfo, firmwareInfo, updateInfo, aiResult,
             externalWifiState, externalWifiIp, externalWifiHint, sensorResult,
             screenMonitorState, historyView, activeProtocolView, gifServiceState,
-            analysisResultView, offlineStoreState;
+            analysisResultView, offlineStoreState, operationModeState, hardwareUsageState;
     private ProgressBar globalProgress;
     private EditText deviceUrlInput, wifiSsid, wifiPassword, mqttUri, mqttUser, mqttPassword,
             mqttTopic, brightnessInput, aiEndpoint, aiModel, aiKey, aiQuestion,
-            experimentRateInput, experimentDurationInput;
+            experimentRateInput, experimentDurationInput, idleTitleInput, idleMessageInput;
     private CheckBox keepRecoveryAp, remoteEnabled;
     private Spinner transportSpinner;
     private ImageView mediaPreview;
@@ -97,7 +99,7 @@ public class MainActivity extends Activity {
     private String latestApkUrl, latestFirmwareUrl;
     private String currentProtocol;
     private int currentSection, visualPreset, wallpaperOpacity, panelOpacity,
-            hudOpacity, appGlassOpacity;
+            hudOpacity, appGlassOpacity, gifSpeedPercent;
     private final Runnable styleSyncRunnable = () -> sendVisualStyle(false);
 
     private BluetoothAdapter bluetoothAdapter;
@@ -135,6 +137,8 @@ public class MainActivity extends Activity {
         panelOpacity = preferences.getInt("panel_opacity", 76);
         hudOpacity = preferences.getInt("hud_opacity", 100);
         appGlassOpacity = preferences.getInt("app_glass_opacity", 86);
+        gifSpeedPercent = Math.max(25, Math.min(300,
+                preferences.getInt("gif_speed_percent", 100)));
         applyThemePalette(visualPreset);
         Window window = getWindow();
         window.setStatusBarColor(Color.TRANSPARENT);
@@ -251,6 +255,20 @@ public class MainActivity extends Activity {
         connection.setPadding(0, dp(8), 0, 0);
         hero.addView(connection);
 
+        LinearLayout mode = card(root, null);
+        section(mode, "设备工作模式", "闲置时展示连接通知与硬件负载；实验时实时直传数据");
+        operationModeState = label("idle".equals(preferences.getString(
+                "operation_mode", "experiment")) ? "● 闲置信息模式" : "● 实验直传模式",
+                15, BLUE, true);
+        hardwareUsageState = label(preferences.getString("hardware_summary",
+                "硬件利用率尚未读取"), 13, MUTED, false);
+        hardwareUsageState.setPadding(0, dp(5), 0, dp(6));
+        mode.addView(operationModeState);
+        mode.addView(hardwareUsageState);
+        mode.addView(row(button("闲置信息", false, v -> showIdleModeDialog()),
+                button("实验直传", true, v -> setOperationMode("experiment", "", "")),
+                button("刷新负载", false, v -> fetchHardwareStatus())));
+
         LinearLayout quick = card(root, null);
         section(quick, "快速实验", "预设会生成真实 Experiment Protocol 并立即下发");
         quick.addView(button("桌面振动 · 200 Hz / 20 s", true,
@@ -349,6 +367,7 @@ public class MainActivity extends Activity {
         media.addView(mediaInfo);
         transportSpinner = transportSelector();
         media.addView(transportSpinner, matchWrap(dp(4)));
+        addGifSpeedSlider(media);
         media.addView(row(button("选择并裁剪", false, v -> chooseMedia()),
                 button("重新裁剪", false, v -> reopenCropEditor()),
                 button("设为设备壁纸", true, v -> saveWallpaper())));
@@ -437,6 +456,11 @@ public class MainActivity extends Activity {
         runner.addView(row(button("开始采集", true, v -> startCustomExperiment()),
                 button("停止", false, v -> sendAction("stop")),
                 button("中止", false, v -> sendAction("abort"))), matchWrap(dp(7)));
+        runner.addView(label("实验模式会把数据直接发送到已连接的手机、电脑或 MQTT；"
+                + "无人接收的样本自动进入设备离线缓存。", 12,
+                Color.rgb(36, 36, 36), false), matchWrap(dp(6)));
+        runner.addView(button("切换为实验直传模式", false,
+                v -> setOperationMode("experiment", "", "")), matchWrap(dp(5)));
         activeProtocolView = label(preferences.getString("last_protocol_json",
                 "尚未下发实验协议"), 12, Color.rgb(28, 28, 28), false);
         activeProtocolView.setTextIsSelectable(true);
@@ -531,7 +555,8 @@ public class MainActivity extends Activity {
                 throw new Exception("协议采样率或时长超出安全范围");
             recordExperiment(protocol);
             preferences.edit().putString("last_protocol_name", name)
-                    .putString("last_protocol_json", protocol.toString(2)).apply();
+                    .putString("last_protocol_json", protocol.toString(2))
+                    .putString("operation_mode", "experiment").apply();
             if (activeProtocolView != null) activeProtocolView.setText(protocol.toString(2));
             status("正在下发实验协议：" + name, true);
             if (selectedTransport() == 1) {
@@ -689,10 +714,10 @@ public class MainActivity extends Activity {
         updates.addView(row(button("检查更新", false, v -> checkForUpdates(false)),
                 button("下载新版 APK", true, v -> downloadLatestApk())));
         LinearLayout about = card(root, null);
-        section(about, "关于", "LabCapsule V0.5.0 · Autonomous Experiment Prototype");
+        section(about, "关于", "LabCapsule V0.6.0 · Connected Experiment Companion");
         about.addView(label("默认语言：简体中文\n协议：HTTP + MQTT + BLE GATT\n屏幕：240×320 RGB565 双缓冲\n仓库：github.com/" + REPOSITORY, 13, MUTED, false));
-        about.addView(button("查看 V0.4 实验与后台 GIF 指南", false,
-                v -> openUrl(V040_GUIDE_URL)), matchWrap(dp(7)));
+        about.addView(button("查看 V0.6 工作模式、通知与 GIF 指南", false,
+                v -> openUrl(V060_GUIDE_URL)), matchWrap(dp(7)));
         return page;
     }
 
@@ -743,6 +768,31 @@ public class MainActivity extends Activity {
         body.addView(row(button("主页", false, v -> sendAction("home")),
                 button("设置页", false, v -> sendAction("settings")),
                 button("开发诊断", false, v -> sendAction("developer"))), matchWrap(dp(6)));
+        section(body, "闲置 / 实验模式", "手机或电脑连接后可让屏幕持续发挥作用");
+        operationModeState = label("● 等待读取设备工作模式", 14, MUTED, true);
+        hardwareUsageState = label(preferences.getString("hardware_summary",
+                "硬件利用率尚未读取"), 12, MUTED, false);
+        body.addView(operationModeState, matchWrap(dp(4)));
+        body.addView(hardwareUsageState, matchWrap(dp(4)));
+        body.addView(row(button("进入闲置面板", false, v -> showIdleModeDialog()),
+                button("进入实验直传", true,
+                        v -> setOperationMode("experiment", "", ""))), matchWrap(dp(5)));
+        body.addView(button("刷新硬件使用情况", false,
+                v -> fetchHardwareStatus()), matchWrap(dp(5)));
+        CheckBox notificationRelay = check("闲置时镜像手机系统通知",
+                preferences.getBoolean("notification_relay_enabled", false));
+        notificationRelay.setOnCheckedChangeListener((button, checked) -> {
+            preferences.edit().putBoolean("notification_relay_enabled", checked).apply();
+            if (checked && !notificationRelayGranted()) openNotificationAccess();
+        });
+        CheckBox notificationPrivacy = check("通知隐私模式（只显示应用名）",
+                preferences.getBoolean("notification_relay_private", false));
+        notificationPrivacy.setOnCheckedChangeListener((button, checked) ->
+                preferences.edit().putBoolean("notification_relay_private", checked).apply());
+        body.addView(notificationRelay, matchWrap(dp(7)));
+        body.addView(notificationPrivacy);
+        body.addView(button("打开 Android 通知访问授权", false,
+                v -> openNotificationAccess()), matchWrap(dp(5)));
         renderExternalWifi(preferences.getBoolean("sta_configured", false),
                 preferences.getBoolean("sta_connected", false),
                 preferences.getString("sta_ip", "0.0.0.0"),
@@ -765,6 +815,7 @@ public class MainActivity extends Activity {
         body.addView(mediaInfo);
         transportSpinner = transportSelector();
         body.addView(transportSpinner, matchWrap(dp(4)));
+        addGifSpeedSlider(body);
         body.addView(row(button("选择并裁剪", false, v -> chooseMedia()),
                 button("重新裁剪", false, v -> reopenCropEditor()),
                 button("保存壁纸", true, v -> saveWallpaper())), matchWrap(dp(6)));
@@ -857,6 +908,48 @@ public class MainActivity extends Activity {
             @Override public void onStopTrackingTouch(SeekBar seekBar) { }
         });
         parent.addView(slider, matchWrap(0));
+    }
+
+    private void addGifSpeedSlider(LinearLayout parent) {
+        TextView valueLabel = label("GIF 播放速度  " + gifSpeedPercent + "%", 13,
+                INK, true);
+        valueLabel.setPadding(0, dp(9), 0, 0);
+        parent.addView(valueLabel);
+        SeekBar slider = new SeekBar(this);
+        slider.setMax(275);
+        slider.setProgress(gifSpeedPercent - 25);
+        if (Build.VERSION.SDK_INT >= 21) {
+            slider.getProgressDrawable().setTint(BLUE);
+            slider.getThumb().setTint(SECONDARY);
+        }
+        slider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar seekBar, int progress,
+                                                     boolean fromUser) {
+                int speed = progress + 25;
+                valueLabel.setText("GIF 播放速度  " + speed + "%");
+                if (fromUser) gifSpeedPercent = speed;
+            }
+            @Override public void onStartTrackingTouch(SeekBar seekBar) { }
+            @Override public void onStopTrackingTouch(SeekBar seekBar) {
+                setGifSpeed(seekBar.getProgress() + 25, true);
+            }
+        });
+        parent.addView(slider, matchWrap(0));
+        TextView hint = label("100% 按 GIF 原时间轴播放；提高速度可补偿链路延迟，"
+                + "实际上限仍受画面复杂度和 BLE/Wi‑Fi 带宽影响。", 12, MUTED, false);
+        parent.addView(hint);
+    }
+
+    private void setGifSpeed(int speed, boolean notifyUser) {
+        gifSpeedPercent = Math.max(25, Math.min(300, speed));
+        preferences.edit().putInt("gif_speed_percent", gifSpeedPercent).apply();
+        if (preferences.getBoolean("gif_service_running", false)) {
+            Intent change = new Intent(this, GifPlaybackService.class)
+                    .setAction(GifPlaybackService.ACTION_SPEED)
+                    .putExtra(GifPlaybackService.EXTRA_SPEED_PERCENT, gifSpeedPercent);
+            startService(change);
+        }
+        if (notifyUser) status("GIF 播放速度已设为 " + gifSpeedPercent + "%", true);
     }
 
     private void scheduleVisualStyleSync() {
@@ -1099,6 +1192,145 @@ public class MainActivity extends Activity {
     private void fetchStatus() {
         requestDeviceStatus(false);
     }
+
+    private void showIdleModeDialog() {
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(dp(18), dp(6), dp(18), 0);
+        idleTitleInput = input(preferences.getString("idle_title", "PHONE CONNECTED"),
+                "屏幕标题（建议英文）", false);
+        idleMessageInput = input(preferences.getString("idle_message", "READY FOR NOTICES"),
+                "通知摘要（建议英文）", false);
+        layout.addView(idleTitleInput, matchWrap(0));
+        layout.addView(idleMessageInput, matchWrap(dp(6)));
+        CheckBox notificationRelay = check("同步后续手机通知到闲置屏幕",
+                preferences.getBoolean("notification_relay_enabled", false));
+        layout.addView(notificationRelay, matchWrap(dp(5)));
+        layout.addView(label("设备当前内置字体支持英文、数字和 - . :；中文会在屏幕上简化为空格。"
+                + "APK 中仍保留原文字段。", 12, MUTED, false), matchWrap(dp(6)));
+        new AlertDialog.Builder(this).setTitle("进入闲置信息模式")
+                .setView(layout).setNegativeButton("取消", null)
+                .setPositiveButton("显示到设备", (dialog, which) -> {
+                    String title = idleTitleInput.getText().toString().trim();
+                    String message = idleMessageInput.getText().toString().trim();
+                    preferences.edit().putString("idle_title", title)
+                            .putString("idle_message", message)
+                            .putBoolean("notification_relay_enabled",
+                                    notificationRelay.isChecked()).apply();
+                    setOperationMode("idle", title, message);
+                    if (notificationRelay.isChecked() && !notificationRelayGranted())
+                        openNotificationAccess();
+                }).show();
+    }
+
+    private boolean notificationRelayGranted() {
+        String enabled = Settings.Secure.getString(getContentResolver(),
+                "enabled_notification_listeners");
+        return enabled != null && enabled.contains(new ComponentName(this,
+                NotificationRelayService.class).flattenToString());
+    }
+
+    private void openNotificationAccess() {
+        try {
+            startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS));
+            status("请允许 LabCapsule 读取通知；仅在闲置模式转发摘要", true);
+        } catch (Exception error) {
+            status("无法打开通知访问设置：" + error.getMessage(), false);
+        }
+    }
+
+    private static String deviceDisplayText(String source, int maximum) {
+        if (source == null) return "";
+        StringBuilder result = new StringBuilder();
+        boolean priorSpace = false;
+        for (int index = 0; index < source.length() && result.length() < maximum; ++index) {
+            char value = Character.toUpperCase(source.charAt(index));
+            char output = ((value >= 'A' && value <= 'Z') ||
+                    (value >= '0' && value <= '9') || value == '-' || value == '.' || value == ':')
+                    ? value : ' ';
+            if (output == ' ' && (result.length() == 0 || priorSpace)) continue;
+            result.append(output);
+            priorSpace = output == ' ';
+        }
+        return result.toString().trim();
+    }
+
+    private void setOperationMode(String mode, String title, String message) {
+        boolean idle = "idle".equals(mode);
+        String safeTitle = deviceDisplayText(title, 16);
+        String safeMessage = deviceDisplayText(message, 32);
+        if (safeTitle.isEmpty()) safeTitle = "DEVICE IDLE";
+        if (safeMessage.isEmpty()) safeMessage = "READY FOR LINK";
+        if (selectedTransport() == 1) {
+            if (!bleReady) { status("请先连接 BLE", false); return; }
+            preferences.edit().putString("operation_mode", mode).apply();
+            if (idle) {
+                writeBleCommand("NOTICE:" + safeTitle + "|" + safeMessage);
+                mainHandler.postDelayed(() -> writeBleCommand("MODE:IDLE"), 750);
+                mainHandler.postDelayed(this::fetchHardwareStatus, 1500);
+            } else {
+                writeBleCommand("MODE:EXPERIMENT");
+                mainHandler.postDelayed(this::fetchHardwareStatus, 750);
+            }
+            status(idle ? "正在切换闲置信息模式…" : "正在切换实验直传模式…", true);
+            return;
+        }
+        try {
+            JSONObject payload = new JSONObject().put("mode", mode)
+                    .put("title", title == null ? "" : title)
+                    .put("message", message == null ? "" : message);
+            http("POST", "/api/mode", payload.toString().getBytes(StandardCharsets.UTF_8),
+                    "application/json", result -> {
+                        preferences.edit().putString("operation_mode", mode).apply();
+                        handleStatusPayload(result, true);
+                        status(idle ? "设备已进入闲置信息模式" : "设备已进入实验直传模式", true);
+                    });
+        } catch (Exception error) {
+            status("模式参数无效：" + error.getMessage(), false);
+        }
+    }
+
+    private void fetchHardwareStatus() {
+        if (selectedTransport() == 1) {
+            writeBleCommand("HARDWARE", true);
+        } else {
+            requestDeviceStatus(true);
+        }
+    }
+
+    private void handleHardwarePayload(JSONObject hardware, String mode) {
+        if (hardware == null) return;
+        long internalFree = hardware.optLong("internalFree");
+        long internalTotal = hardware.optLong("internalTotal");
+        long psramFree = hardware.optLong("psramFree");
+        long psramTotal = hardware.optLong("psramTotal");
+        long storageUsed = hardware.optLong("storageUsed");
+        long storageCapacity = hardware.optLong("storageCapacity");
+        long uptime = hardware.optLong("uptimeSeconds");
+        int ramUsed = internalTotal <= 0 ? 0 :
+                (int)((internalTotal - internalFree) * 100 / internalTotal);
+        int psramUsed = psramTotal <= 0 ? 0 :
+                (int)((psramTotal - psramFree) * 100 / psramTotal);
+        int storagePercent = storageCapacity <= 0 ? 0 :
+                (int)(storageUsed * 100 / storageCapacity);
+        String summary = "内部 RAM " + ramUsed + "% · PSRAM " + psramUsed +
+                "% · 实验存储 " + storagePercent + "%\n运行 " + uptime +
+                " 秒 · BLE " + (hardware.optBoolean("bleConnected") ? "在线" : "离线") +
+                " · Wi‑Fi " + (hardware.optBoolean("staConnected") ? "在线" : "离线") +
+                " · 远程 " + (hardware.optBoolean("remoteConnected") ? "在线" : "离线");
+        preferences.edit().putString("hardware_summary", summary)
+                .putString("operation_mode", mode == null ? "experiment" : mode).apply();
+        if (hardwareUsageState != null) {
+            hardwareUsageState.setText(summary);
+            hardwareUsageState.setTextColor(GREEN);
+        }
+        if (operationModeState != null) {
+            boolean idle = "idle".equals(mode);
+            operationModeState.setText(idle ? "● 闲置信息模式" : "● 实验直传模式");
+            operationModeState.setTextColor(idle ? BLUE : GREEN);
+        }
+    }
+
     private void requestDeviceStatus(boolean quiet) {
         if (!quiet) status("正在连接设备…", true);
         if (selectedTransport() == 1) {
@@ -1137,6 +1369,20 @@ public class MainActivity extends Activity {
             JSONObject device = root.optJSONObject("device");
             if (device != null) preferences.edit().putLong("last_sample_count",
                     device.optLong("samples", preferences.getLong("last_sample_count", 0))).apply();
+            if (device != null) {
+                String operationMode = device.optString("operationMode", "experiment");
+                JSONObject hardware = device.optJSONObject("hardware");
+                if (hardware != null) handleHardwarePayload(hardware, operationMode);
+                else {
+                    preferences.edit().putString("operation_mode", operationMode).apply();
+                    if (operationModeState != null) {
+                        boolean idle = "idle".equals(operationMode);
+                        operationModeState.setText(idle ? "● 闲置信息模式" :
+                                "● 实验直传模式");
+                        operationModeState.setTextColor(idle ? BLUE : GREEN);
+                    }
+                }
+            }
             if (device != null && device.has("offlineSessions")) {
                 JSONObject offline = new JSONObject()
                         .put("sessions", device.optLong("offlineSessions"))
@@ -1176,6 +1422,10 @@ public class MainActivity extends Activity {
                     (network != null && network.optBoolean("staConnected")) +
                     " · staIp=" + (network == null ? "未知" :
                     network.optString("staIp", "0.0.0.0")), true);
+            if (!quiet && selectedTransport() == 1 && device != null &&
+                    device.optJSONObject("hardware") == null) {
+                mainHandler.postDelayed(this::fetchHardwareStatus, 450);
+            }
         } catch (Exception error) {
             if (!quiet) status("设备在线，但状态格式无法解析：" + error.getMessage(), false);
         }
@@ -1703,13 +1953,34 @@ public class MainActivity extends Activity {
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
         layout.setPadding(dp(16), dp(8), dp(16), 0);
-        TextView guide = label("拖动调整位置，双指缩放。白色框就是设备最终显示区域。", 13,
+        TextView guide = label("单指拖动、双指缩放，也可使用下方缩放滑杆。白色框就是设备最终显示区域。", 13,
                 MUTED, false);
         guide.setPadding(0, 0, 0, dp(8));
         layout.addView(guide);
         CropImageView editor = new CropImageView(this);
         editor.setImage(source);
-        layout.addView(editor, new LinearLayout.LayoutParams(-1, dp(430)));
+        layout.addView(editor, new LinearLayout.LayoutParams(-1, dp(350)));
+        TextView zoomValue = label("裁剪缩放  100%", 13, INK, true);
+        zoomValue.setPadding(0, dp(7), 0, 0);
+        layout.addView(zoomValue);
+        SeekBar zoomSlider = new SeekBar(this);
+        zoomSlider.setMax(700);
+        zoomSlider.setProgress(0);
+        if (Build.VERSION.SDK_INT >= 21) {
+            zoomSlider.getProgressDrawable().setTint(BLUE);
+            zoomSlider.getThumb().setTint(SECONDARY);
+        }
+        zoomSlider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar seekBar, int progress,
+                                                     boolean fromUser) {
+                int percent = progress + 100;
+                zoomValue.setText("裁剪缩放  " + percent + "%");
+                if (fromUser) editor.setZoomPercent(percent);
+            }
+            @Override public void onStartTrackingTouch(SeekBar seekBar) { }
+            @Override public void onStopTrackingTouch(SeekBar seekBar) { }
+        });
+        layout.addView(zoomSlider, matchWrap(0));
         AlertDialog cropDialog = new AlertDialog.Builder(this).setTitle("裁剪为 240 × 320")
                 .setView(layout).setNegativeButton("取消", null)
                 .setNeutralButton("复位", null)
@@ -1728,7 +1999,11 @@ public class MainActivity extends Activity {
                     status("裁剪已确认；当前显示的是壁纸 + HUD 合成预览", true);
                 }).create();
         cropDialog.setOnShowListener(dialog -> cropDialog.getButton(AlertDialog.BUTTON_NEUTRAL)
-                .setOnClickListener(v -> editor.resetImage()));
+                .setOnClickListener(v -> {
+                    editor.resetImage();
+                    zoomSlider.setProgress(0);
+                    zoomValue.setText("裁剪缩放  100%");
+                }));
         cropDialog.show();
     }
     private void reopenCropEditor() {
@@ -2103,12 +2378,14 @@ public class MainActivity extends Activity {
                 .putExtra(GifPlaybackService.EXTRA_FILE, clip.getAbsolutePath())
                 .putExtra(GifPlaybackService.EXTRA_TRANSPORT, transport)
                 .putExtra(GifPlaybackService.EXTRA_ENDPOINT, endpoint)
-                .putExtra(GifPlaybackService.EXTRA_BLE_ADDRESS, address);
+                .putExtra(GifPlaybackService.EXTRA_BLE_ADDRESS, address)
+                .putExtra(GifPlaybackService.EXTRA_SPEED_PERCENT, gifSpeedPercent);
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(service); else startService(service);
         gifStreaming = false;
         String description = String.format(Locale.US,
-                "后台 GIF 已启动 · %d 帧缓存 · %.1f fps · 每轮 %,d B",
-                frames, 1000f / interval, bytes);
+                "后台 GIF 已启动 · %d 帧缓存 · %.1f fps · %d%% · 每轮 %,d B",
+                frames, 1000f / interval * gifSpeedPercent / 100f,
+                gifSpeedPercent, bytes);
         if (!isDestroyed()) {
             showProgress(100);
             if (mediaInfo != null)
@@ -2612,7 +2889,9 @@ public class MainActivity extends Activity {
             String payload = new String(value, StandardCharsets.UTF_8);
             try {
                 JSONObject root = new JSONObject(payload);
-                if ("sensors".equals(root.optString("type"))) {
+                if ("hardware".equals(root.optString("type"))) {
+                    handleHardwarePayload(root, root.optString("operationMode", "experiment"));
+                } else if ("sensors".equals(root.optString("type"))) {
                     handleSensorPayload(payload);
                 } else if ("offline".equals(root.optString("type"))) {
                     handleOfflinePayload(root);
@@ -3056,6 +3335,19 @@ public class MainActivity extends Activity {
             clamp();
             invalidate();
         }
+        void setZoomPercent(int percent) {
+            if (image == null || cropWindow.width() <= 0 || minimumScale <= 0) return;
+            float focusX = cropWindow.centerX();
+            float focusY = cropWindow.centerY();
+            float sourceX = (focusX - offsetX) / scale;
+            float sourceY = (focusY - offsetY) / scale;
+            float nextScale = minimumScale * Math.max(100, Math.min(800, percent)) / 100f;
+            offsetX = focusX - sourceX * nextScale;
+            offsetY = focusY - sourceY * nextScale;
+            scale = nextScale;
+            clamp();
+            invalidate();
+        }
         RectF getSourceCrop() {
             if (image == null) return new RectF();
             return new RectF(
@@ -3099,6 +3391,7 @@ public class MainActivity extends Activity {
             if (image == null) return true;
             switch (event.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN:
+                    if (getParent() != null) getParent().requestDisallowInterceptTouchEvent(true);
                     lastX = event.getX(); lastY = event.getY(); pinching = false; break;
                 case MotionEvent.ACTION_POINTER_DOWN:
                     pinchDistance = distance(event); pinching = true; break;
@@ -3111,7 +3404,7 @@ public class MainActivity extends Activity {
                             float sourceX = (focusX - offsetX) / scale;
                             float sourceY = (focusY - offsetY) / scale;
                             float nextScale = Math.max(minimumScale,
-                                    Math.min(minimumScale * 5f,
+                                    Math.min(minimumScale * 8f,
                                             scale * nextDistance / pinchDistance));
                             offsetX = focusX - sourceX * nextScale;
                             offsetY = focusY - sourceY * nextScale;
@@ -3133,7 +3426,9 @@ public class MainActivity extends Activity {
                     break;
                 case MotionEvent.ACTION_UP:
                 case MotionEvent.ACTION_CANCEL:
-                    pinching = false; break;
+                    pinching = false;
+                    if (getParent() != null) getParent().requestDisallowInterceptTouchEvent(false);
+                    break;
                 default: break;
             }
             return true;

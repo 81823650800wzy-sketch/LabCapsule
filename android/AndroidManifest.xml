@@ -41,5 +41,14 @@
             android:exported="false"
             android:stopWithTask="false"
             android:foregroundServiceType="connectedDevice" />
+        <service
+            android:name=".NotificationRelayService"
+            android:exported="false"
+            android:label="LabCapsule 手机通知镜像"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>
