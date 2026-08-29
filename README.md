@@ -2,7 +2,19 @@
 
 > Ask a question. Run an experiment.
 
-LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前版本为 **V0.7.0 Alpha / Local Media & Desktop Studio**，已经打通“自然语言问题 → 实验协议 → 六轴采集 → 在线直传或离线缓存 → CSV/分析”，并加入设备本地动态壁纸、手机/电脑双端控制、电脑硬件与通知镜像、视频和桌宠合成。
+LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前版本为 **V0.8.0 Alpha / Interactive Data & AI Pet（Desktop First）**，已经打通“自然语言问题 → 实验协议 → 六轴采集 → 在线直传或离线缓存 → CSV/分析”，并加入可精确检查的实时曲线和理解设备上下文的电脑端 AI 桌宠。V0.8 桌面端继续兼容 V0.7 固件与 Android APK。
+
+## V0.8.0 新增
+
+- Windows 实验图表扩展为 AX/AY/AZ、GX/GY/GZ、`|A|`、`|G|` 八通道；加速度与角速度使用独立 Y 轴，鼠标悬停可读取最近真实样本的横坐标、原始微秒时间戳、纵坐标与单位。
+- 支持滚轮缩放时间轴、`Ctrl + 滚轮`缩放 Y 轴、左键拖动平移、双击复位、2–60 秒/全部窗口与实时跟随。
+- 最多保留 100,000 点，约 30 FPS 合并重绘并按画布像素抽稀；显示抽稀不会影响原始 CSV 导出。
+- 新增电脑端 AI 桌宠：原创动态胶囊角色、对话、桌面悬浮层、设备/实验事件反应、运动统计上下文、本地规则回退和有界记忆。
+- OpenAI 兼容 Endpoint、模型与角色设定可配置，默认兼容 DeepSeek；API Key 使用当前 Windows 用户的 DPAPI 加密。
+- AI 没有系统命令和直接设备控制工具。开始/中止实验、网络设置与固件更新继续由用户在专用界面确认。
+- 参考 [Project AIRI](https://github.com/moeru-ai/airi) 的角色/Agent/舞台分层，按 LabCapsule 的 USB 实验链路和 240×320 小屏做轻量改良；提供共享 Pet Event Schema，为后续 Android 双端接入预留一致协议。
+
+完整说明见 [V0.8.0 交互图表与 AI 桌宠设计](docs/V0.8.0_INTERACTIVE_CHART_AI_PET_ZH.md)。
 
 ## V0.7.0 新增
 

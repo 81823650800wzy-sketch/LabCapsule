@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/81823650800wzy-sketch/LabCapsule/blob/main/docs/pet_event_v1.schema.json",
+  "title": "LabCapsule Pet Event V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "id", "timestamp", "source", "type", "payload"],
+  "properties": {
+    "schema": { "const": "labcapsule.pet.event/1" },
+    "id": { "type": "string", "minLength": 8, "maxLength": 80 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "source": { "enum": ["desktop", "android", "device", "remote"] },
+    "session": { "type": "string", "maxLength": 80 },
+    "type": {
+      "enum": [
+        "device.connected", "device.disconnected", "device.error",
+        "experiment.started", "experiment.sample_summary", "experiment.completed",
+        "experiment.aborted", "user.message", "assistant.reply", "pet.state",
+        "action.proposed", "action.confirmed", "action.rejected"
+      ]
+    },
+    "payload": {
+      "type": "object",
+      "properties": {
+        "text": { "type": "string", "maxLength": 2000 },
+        "emotion": {
+          "enum": ["idle", "happy", "curious", "thinking", "speaking",
+                   "experiment", "success", "warning", "sleeping"]
+        },
+        "deviceNotice": { "type": "boolean" },
+        "action": {
+          "enum": ["none", "show_status", "show_notice", "start_experiment",
+                   "stop_experiment", "abort_experiment", "change_network",
+                   "update_firmware"]
+        },
+        "risk": { "enum": ["passive", "confirm", "blocked"] },
+        "context": { "type": "object" }
+      },
+      "additionalProperties": true
+    }
+  }
+}
