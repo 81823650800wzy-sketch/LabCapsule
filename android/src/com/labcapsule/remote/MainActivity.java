@@ -42,7 +42,9 @@ import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
 
 public class MainActivity extends Activity {
-    private static final String APP_VERSION = "0.6.0";
+    private static final String APP_VERSION = "0.7.0";
+    private static final int DEVICE_MAX_GIF_FPS = 8;
+    private static final int DEVICE_MAX_CLIP_BYTES = 6 * 1024 * 1024;
     private static final String REPOSITORY = "81823650800wzy-sketch/LabCapsule";
     private static final String WIFI_GUIDE_URL = "https://github.com/" + REPOSITORY +
             "/blob/main/docs/V0.3.3_BLE_WIFI_QUICKSTART_ZH.md";
@@ -50,6 +52,8 @@ public class MainActivity extends Activity {
             "/blob/main/docs/V0.4.0_EXPERIMENT_GIF_GUIDE_ZH.md";
     private static final String V060_GUIDE_URL = "https://github.com/" + REPOSITORY +
             "/blob/main/docs/V0.6.0_IDLE_GIF_MODE_GUIDE_ZH.md";
+    private static final String V070_GUIDE_URL = "https://github.com/" + REPOSITORY +
+            "/blob/main/docs/V0.7.0_LOCAL_MEDIA_DESKTOP_GUIDE_ZH.md";
     private static final int REQUEST_FIRMWARE = 1001, REQUEST_MEDIA = 1002,
             REQUEST_BLE_PERMISSIONS = 1003, REQUEST_NOTIFICATION_PERMISSION = 1004,
             REQUEST_CSV = 1005;
@@ -92,6 +96,7 @@ public class MainActivity extends Activity {
     private Bitmap selectedCropSource;
     private Movie selectedMovie;
     private RectF selectedCropRect;
+    private int selectedCropBackground = Color.BLACK;
     private String selectedMediaName;
     private byte[] lastGifComparisonFrame;
     private String lastStationIp;
@@ -99,7 +104,7 @@ public class MainActivity extends Activity {
     private String latestApkUrl, latestFirmwareUrl;
     private String currentProtocol;
     private int currentSection, visualPreset, wallpaperOpacity, panelOpacity,
-            hudOpacity, appGlassOpacity, gifSpeedPercent;
+            hudOpacity, appGlassOpacity, gifFps;
     private final Runnable styleSyncRunnable = () -> sendVisualStyle(false);
 
     private BluetoothAdapter bluetoothAdapter;
@@ -137,8 +142,8 @@ public class MainActivity extends Activity {
         panelOpacity = preferences.getInt("panel_opacity", 76);
         hudOpacity = preferences.getInt("hud_opacity", 100);
         appGlassOpacity = preferences.getInt("app_glass_opacity", 86);
-        gifSpeedPercent = Math.max(25, Math.min(300,
-                preferences.getInt("gif_speed_percent", 100)));
+        gifFps = Math.max(1, Math.min(DEVICE_MAX_GIF_FPS,
+                preferences.getInt("gif_fps", 6)));
         applyThemePalette(visualPreset);
         Window window = getWindow();
         window.setStatusBarColor(Color.TRANSPARENT);
@@ -286,11 +291,12 @@ public class MainActivity extends Activity {
         String protocol = preferences.getString("last_protocol_name", "尚未开始实验");
         now.addView(label("实验：" + protocol + "\n最近样本数：" +
                 preferences.getLong("last_sample_count", 0), 15, INK, true));
-        String gifState = preferences.getBoolean("gif_service_running", false)
-                ? preferences.getString("gif_service_message", "GIF 后台播放中")
-                : "GIF 后台播放器未运行";
+        boolean deviceGifPlaying = preferences.getBoolean("device_gif_playing", false);
+        String gifState = deviceGifPlaying
+                ? "设备本地 GIF 正在播放 · " + gifFps + " FPS · 退出 APK 不受影响"
+                : "设备本地 GIF 未播放";
         gifServiceState = label(gifState, 13,
-                preferences.getBoolean("gif_service_running", false) ? GREEN : MUTED, false);
+                deviceGifPlaying ? GREEN : MUTED, false);
         gifServiceState.setPadding(0, dp(8), 0, 0);
         now.addView(gifServiceState);
         now.addView(row(button("刷新设备", true, v -> fetchStatus()),
@@ -372,8 +378,8 @@ public class MainActivity extends Activity {
                 button("重新裁剪", false, v -> reopenCropEditor()),
                 button("设为设备壁纸", true, v -> saveWallpaper())));
         media.addView(row(button("临时单帧", false, v -> sendSelectedFrame()),
-                button("播放 GIF", true, v -> startGifStream()),
-                button("停止播放", false, v -> stopGifStream())));
+                button("上传并播放 GIF", true, v -> startGifStream()),
+                button("停止设备 GIF", false, v -> stopGifStream())));
 
         LinearLayout monitor = card(root, null);
         section(monitor, "实时屏幕镜像", "严格 240×320 比例；每秒同步设备页面、状态与 HUD");
@@ -714,10 +720,10 @@ public class MainActivity extends Activity {
         updates.addView(row(button("检查更新", false, v -> checkForUpdates(false)),
                 button("下载新版 APK", true, v -> downloadLatestApk())));
         LinearLayout about = card(root, null);
-        section(about, "关于", "LabCapsule V0.6.0 · Connected Experiment Companion");
-        about.addView(label("默认语言：简体中文\n协议：HTTP + MQTT + BLE GATT\n屏幕：240×320 RGB565 双缓冲\n仓库：github.com/" + REPOSITORY, 13, MUTED, false));
-        about.addView(button("查看 V0.6 工作模式、通知与 GIF 指南", false,
-                v -> openUrl(V060_GUIDE_URL)), matchWrap(dp(7)));
+        section(about, "关于", "LabCapsule V0.7.0 · Local Media & Desktop Studio");
+        about.addView(label("默认语言：简体中文\n协议：USB + HTTP + MQTT + BLE GATT\n屏幕：240×320 RGB565 双缓冲\n仓库：github.com/" + REPOSITORY, 13, MUTED, false));
+        about.addView(button("查看 V0.7 本地媒体与桌面工作室指南", false,
+                v -> openUrl(V070_GUIDE_URL)), matchWrap(dp(7)));
         return page;
     }
 
@@ -808,8 +814,8 @@ public class MainActivity extends Activity {
                 panelOpacity, hudOpacity);
         mediaPreview.setBackground(roundRect(CANVAS, 10, BLUE));
         body.addView(mediaPreview, new LinearLayout.LayoutParams(-1, -2));
-        mediaInfo = label(preferences.getBoolean("gif_service_running", false)
-                ? preferences.getString("gif_service_message", "GIF 后台播放中")
+        mediaInfo = label(preferences.getBoolean("device_gif_playing", false)
+                ? "设备本地 GIF 正在播放；退出 APK 不会停止"
                 : "选择图片或 GIF，确认 240×320 裁剪后再发送", 13, MUTED, false);
         mediaInfo.setPadding(0, dp(8), 0, dp(5));
         body.addView(mediaInfo);
@@ -820,8 +826,8 @@ public class MainActivity extends Activity {
                 button("重新裁剪", false, v -> reopenCropEditor()),
                 button("保存壁纸", true, v -> saveWallpaper())), matchWrap(dp(6)));
         body.addView(row(button("临时单帧", false, v -> sendSelectedFrame()),
-                button("后台播放 GIF", true, v -> startGifStream()),
-                button("停止 GIF", false, v -> stopGifStream())), matchWrap(dp(6)));
+                button("上传并播放 GIF", true, v -> startGifStream()),
+                button("停止设备 GIF", false, v -> stopGifStream())), matchWrap(dp(6)));
 
         screenMonitorState = label(screenMonitorActive ? "● 实时同步中" : "● 屏幕镜像未启动",
                 13, screenMonitorActive ? GREEN : MUTED, true);
@@ -911,13 +917,13 @@ public class MainActivity extends Activity {
     }
 
     private void addGifSpeedSlider(LinearLayout parent) {
-        TextView valueLabel = label("GIF 播放速度  " + gifSpeedPercent + "%", 13,
+        TextView valueLabel = label("GIF 设备播放帧率  " + gifFps + " FPS", 13,
                 INK, true);
         valueLabel.setPadding(0, dp(9), 0, 0);
         parent.addView(valueLabel);
         SeekBar slider = new SeekBar(this);
-        slider.setMax(275);
-        slider.setProgress(gifSpeedPercent - 25);
+        slider.setMax(DEVICE_MAX_GIF_FPS - 1);
+        slider.setProgress(gifFps - 1);
         if (Build.VERSION.SDK_INT >= 21) {
             slider.getProgressDrawable().setTint(BLUE);
             slider.getThumb().setTint(SECONDARY);
@@ -925,31 +931,32 @@ public class MainActivity extends Activity {
         slider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(SeekBar seekBar, int progress,
                                                      boolean fromUser) {
-                int speed = progress + 25;
-                valueLabel.setText("GIF 播放速度  " + speed + "%");
-                if (fromUser) gifSpeedPercent = speed;
+                int fps = progress + 1;
+                valueLabel.setText("GIF 设备播放帧率  " + fps + " FPS");
+                if (fromUser) gifFps = fps;
             }
             @Override public void onStartTrackingTouch(SeekBar seekBar) { }
             @Override public void onStopTrackingTouch(SeekBar seekBar) {
-                setGifSpeed(seekBar.getProgress() + 25, true);
+                setGifFps(seekBar.getProgress() + 1, true);
             }
         });
         parent.addView(slider, matchWrap(0));
-        TextView hint = label("100% 按 GIF 原时间轴播放；提高速度可补偿链路延迟，"
-                + "实际上限仍受画面复杂度和 BLE/Wi‑Fi 带宽影响。", 12, MUTED, false);
+        TextView hint = label("1–8 FPS 对应当前 10 MHz 屏幕总线的可靠实际刷新范围。"
+                + "GIF 上传一次后由设备本地播放，调节不再受手机后台传输速度影响。",
+                12, MUTED, false);
         parent.addView(hint);
     }
 
-    private void setGifSpeed(int speed, boolean notifyUser) {
-        gifSpeedPercent = Math.max(25, Math.min(300, speed));
-        preferences.edit().putInt("gif_speed_percent", gifSpeedPercent).apply();
-        if (preferences.getBoolean("gif_service_running", false)) {
-            Intent change = new Intent(this, GifPlaybackService.class)
-                    .setAction(GifPlaybackService.ACTION_SPEED)
-                    .putExtra(GifPlaybackService.EXTRA_SPEED_PERCENT, gifSpeedPercent);
-            startService(change);
+    private void setGifFps(int fps, boolean notifyUser) {
+        gifFps = Math.max(1, Math.min(DEVICE_MAX_GIF_FPS, fps));
+        preferences.edit().putInt("gif_fps", gifFps).apply();
+        if (selectedTransport() == 1) {
+            if (bleReady) writeBleCommand("GIF_FPS:" + gifFps, !notifyUser);
+            else if (notifyUser) status("帧率已保存；连接 BLE 后再同步到设备", true);
+        } else {
+            sendAction("gif_fps:" + gifFps);
         }
-        if (notifyUser) status("GIF 播放速度已设为 " + gifSpeedPercent + "%", true);
+        if (notifyUser) status("设备 GIF 帧率已设为 " + gifFps + " FPS", true);
     }
 
     private void scheduleVisualStyleSync() {
@@ -1370,6 +1377,21 @@ public class MainActivity extends Activity {
             if (device != null) preferences.edit().putLong("last_sample_count",
                     device.optLong("samples", preferences.getLong("last_sample_count", 0))).apply();
             if (device != null) {
+                boolean gifPlaying = device.optBoolean("gifPlaying", false);
+                int deviceFps = Math.max(1, Math.min(DEVICE_MAX_GIF_FPS,
+                        device.optInt("gifFps", gifFps)));
+                String currentMedia = device.optString("currentMedia",
+                        gifPlaying ? "gif" : (device.optBoolean("wallpaper") ? "image" : "none"));
+                preferences.edit().putBoolean("device_gif_playing", gifPlaying)
+                        .putString("current_media", currentMedia)
+                        .putInt("gif_fps", deviceFps).apply();
+                gifFps = deviceFps;
+                if (gifServiceState != null) {
+                    gifServiceState.setText(gifPlaying
+                            ? "设备本地 GIF 正在播放 · " + deviceFps + " FPS · 退出 APK 不受影响"
+                            : "设备当前媒体：" + ("image".equals(currentMedia) ? "静态壁纸" : "无动画"));
+                    gifServiceState.setTextColor(gifPlaying ? GREEN : MUTED);
+                }
                 String operationMode = device.optString("operationMode", "experiment");
                 JSONObject hardware = device.optJSONObject("hardware");
                 if (hardware != null) handleHardwarePayload(hardware, operationMode);
@@ -1960,12 +1982,22 @@ public class MainActivity extends Activity {
         CropImageView editor = new CropImageView(this);
         editor.setImage(source);
         layout.addView(editor, new LinearLayout.LayoutParams(-1, dp(350)));
+        Spinner fillSelector = spinner(new String[]{"留白底图：黑色", "留白底图：白色"});
+        fillSelector.setSelection(selectedCropBackground == Color.WHITE ? 1 : 0);
+        fillSelector.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(AdapterView<?> parent, View view,
+                                                  int position, long id) {
+                editor.setBackgroundFill(position == 1 ? Color.WHITE : Color.BLACK);
+            }
+            @Override public void onNothingSelected(AdapterView<?> parent) { }
+        });
+        layout.addView(fillSelector, matchWrap(dp(7)));
         TextView zoomValue = label("裁剪缩放  100%", 13, INK, true);
         zoomValue.setPadding(0, dp(7), 0, 0);
         layout.addView(zoomValue);
         SeekBar zoomSlider = new SeekBar(this);
-        zoomSlider.setMax(700);
-        zoomSlider.setProgress(0);
+        zoomSlider.setMax(775);
+        zoomSlider.setProgress(75);
         if (Build.VERSION.SDK_INT >= 21) {
             zoomSlider.getProgressDrawable().setTint(BLUE);
             zoomSlider.getThumb().setTint(SECONDARY);
@@ -1973,7 +2005,7 @@ public class MainActivity extends Activity {
         zoomSlider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(SeekBar seekBar, int progress,
                                                      boolean fromUser) {
-                int percent = progress + 100;
+                int percent = progress + 25;
                 zoomValue.setText("裁剪缩放  " + percent + "%");
                 if (fromUser) editor.setZoomPercent(percent);
             }
@@ -1986,7 +2018,10 @@ public class MainActivity extends Activity {
                 .setNeutralButton("复位", null)
                 .setPositiveButton("确认裁剪", (dialog, which) -> {
                     RectF crop = editor.getSourceCrop();
-                    Bitmap preview = cropBitmap(source, crop, 240, 320);
+                    selectedCropBackground = fillSelector.getSelectedItemPosition() == 1
+                            ? Color.WHITE : Color.BLACK;
+                    Bitmap preview = cropBitmap(source, crop, 240, 320,
+                            selectedCropBackground);
                     selectedCropSource = source;
                     selectedCropRect = new RectF(crop);
                     selectedMovie = movie;
@@ -2001,7 +2036,7 @@ public class MainActivity extends Activity {
         cropDialog.setOnShowListener(dialog -> cropDialog.getButton(AlertDialog.BUTTON_NEUTRAL)
                 .setOnClickListener(v -> {
                     editor.resetImage();
-                    zoomSlider.setProgress(0);
+                    zoomSlider.setProgress(75);
                     zoomValue.setText("裁剪缩放  100%");
                 }));
         cropDialog.show();
@@ -2011,14 +2046,25 @@ public class MainActivity extends Activity {
         showCropEditor(selectedCropSource, selectedMovie,
                 selectedMediaName == null ? "媒体" : selectedMediaName);
     }
-    private static Bitmap cropBitmap(Bitmap source, RectF crop, int width, int height) {
+    private static Bitmap cropBitmap(Bitmap source, RectF crop, int width, int height,
+                                     int background) {
         Bitmap result = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
         Canvas canvas = new Canvas(result);
-        Rect sourceRect = new Rect(Math.max(0, (int) Math.floor(crop.left)),
-                Math.max(0, (int) Math.floor(crop.top)),
-                Math.min(source.getWidth(), (int) Math.ceil(crop.right)),
-                Math.min(source.getHeight(), (int) Math.ceil(crop.bottom)));
-        canvas.drawBitmap(source, sourceRect, new RectF(0, 0, width, height),
+        canvas.drawColor(background);
+        if (crop == null || crop.width() <= 0 || crop.height() <= 0) return result;
+        RectF intersection = new RectF(crop);
+        if (!intersection.intersect(0, 0, source.getWidth(), source.getHeight())) return result;
+        Rect sourceRect = new Rect(Math.max(0, (int)Math.floor(intersection.left)),
+                Math.max(0, (int)Math.floor(intersection.top)),
+                Math.min(source.getWidth(), (int)Math.ceil(intersection.right)),
+                Math.min(source.getHeight(), (int)Math.ceil(intersection.bottom)));
+        float xScale = width / crop.width();
+        float yScale = height / crop.height();
+        RectF destination = new RectF((intersection.left - crop.left) * xScale,
+                (intersection.top - crop.top) * yScale,
+                (intersection.right - crop.left) * xScale,
+                (intersection.bottom - crop.top) * yScale);
+        canvas.drawBitmap(source, sourceRect, destination,
                 new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG));
         return result;
     }
@@ -2037,7 +2083,7 @@ public class MainActivity extends Activity {
         RectF crop = selectedCropRect == null
                 ? new RectF(0, 0, source.getWidth(), source.getHeight())
                 : new RectF(selectedCropRect);
-        Bitmap result = cropBitmap(source, crop, 240, 320);
+        Bitmap result = cropBitmap(source, crop, 240, 320, selectedCropBackground);
         source.recycle();
         return result;
     }
@@ -2236,11 +2282,17 @@ public class MainActivity extends Activity {
             byte[] data = bitmapToRgb565(frame);
             if (transport == 1) runOnUiThread(() ->
                     startBleFile("WALLPAPER", data, 0,
-                            () -> status("壁纸已保存，并作为设备界面底层", true)));
+                            () -> {
+                                preferences.edit().putBoolean("device_gif_playing", false)
+                                        .putString("current_media", "image").apply();
+                                status("壁纸已保存，并作为设备界面底层", true);
+                            }));
             else {
                 try {
                     String response = httpBlocking("POST", endpoint + "/api/wallpaper",
                             data, "application/octet-stream", 45000);
+                    preferences.edit().putBoolean("device_gif_playing", false)
+                            .putString("current_media", "image").apply();
                     runOnUiThread(() -> status("壁纸已保存，并作为设备界面底层\n" +
                             response, true));
                 } catch (Exception error) {
@@ -2273,19 +2325,10 @@ public class MainActivity extends Activity {
         if (transport == 1 && address.isEmpty()) {
             status("请先连接一次 BLE，让后台播放器记住设备", false); return;
         }
-        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(
-                Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},
-                    REQUEST_NOTIFICATION_PERMISSION);
-        }
         gifStreaming = true;
         lastGifComparisonFrame = null;
-        status("正在一次性预处理 GIF；完成后退出 APK 仍会继续播放…", true);
+        status("正在手机端预处理 GIF；随后只上传一次并由设备本地播放…", true);
         showProgress(0);
-        Intent preparing = new Intent(this, GifPlaybackService.class)
-                .setAction(GifPlaybackService.ACTION_PREPARE);
-        if (Build.VERSION.SDK_INT >= 26) startForegroundService(preparing);
-        else startService(preparing);
         final Movie movie = selectedMovie;
         worker.execute(() -> prepareGifClip(movie, transport, endpoint, address));
     }
@@ -2294,10 +2337,10 @@ public class MainActivity extends Activity {
         ArrayList<MediaPacket> loopFrames = new ArrayList<>();
         try {
             int duration = Math.max(1000, movie.duration());
-            int baseInterval = transport == 1 ? 180 : 90;
-            int maximumFrames = transport == 1 ? 120 : 240;
-            int interval = Math.max(baseInterval,
-                    ((duration + maximumFrames * 20 - 1) / (maximumFrames * 20)) * 20);
+            int maximumFrames = 240;
+            int requestedInterval = Math.max(1000 / DEVICE_MAX_GIF_FPS, 1000 / gifFps);
+            int interval = Math.max(requestedInterval,
+                    (duration + maximumFrames - 1) / maximumFrames);
             int sampledFrames = Math.max(2, (duration + interval - 1) / interval);
             Bitmap first = renderCroppedMovieFrame(movie, 0);
             MediaPacket bootstrap = encodeMediaPacket(first, null, true);
@@ -2315,6 +2358,8 @@ public class MainActivity extends Activity {
                 packet.comparisonFrame = null;
                 bitmap.recycle();
                 payloadBytes += packet.data.length;
+                if (payloadBytes > DEVICE_MAX_CLIP_BYTES)
+                    throw new IOException("动画超过设备 6 MiB 上限，请降低 FPS 或减少大面积变化");
                 loopFrames.add(packet);
                 final int progress = frameIndex * 90 / sampledFrames;
                 runOnUiThread(() -> showProgress(progress));
@@ -2324,6 +2369,8 @@ public class MainActivity extends Activity {
             loopToFirst.comparisonFrame = null;
             loopBitmap.recycle();
             payloadBytes += loopToFirst.data.length;
+            if (payloadBytes > DEVICE_MAX_CLIP_BYTES)
+                throw new IOException("动画超过设备 6 MiB 上限，请降低 FPS 或减少大面积变化");
             loopFrames.add(loopToFirst);
 
             File directory = new File(getFilesDir(), "gif-clips");
@@ -2342,14 +2389,11 @@ public class MainActivity extends Activity {
             final long bytes = payloadBytes;
             final int frames = sampledFrames;
             final int frameInterval = interval;
-            runOnUiThread(() -> startGifService(clip, transport, endpoint, address,
+            runOnUiThread(() -> uploadGifClip(clip, transport, endpoint, address,
                     frames, frameInterval, bytes));
         } catch (Exception error) {
             gifStreaming = false;
             runOnUiThread(() -> {
-                Intent stop = new Intent(this, GifPlaybackService.class)
-                        .setAction(GifPlaybackService.ACTION_STOP);
-                startService(stop);
                 status("GIF 预处理失败：" + error.getMessage(), false);
             });
         }
@@ -2369,29 +2413,54 @@ public class MainActivity extends Activity {
         if (packet.data != null) output.write(packet.data);
     }
 
-    private void startGifService(File clip, int transport, String endpoint, String address,
-                                 int frames, int interval, long bytes) {
+    private void uploadGifClip(File clip, int transport, String endpoint, String address,
+                               int frames, int interval, long bytes) {
         if (!gifStreaming) return;
-        if (transport == 1) releaseActivityBle();
-        Intent service = new Intent(this, GifPlaybackService.class)
-                .setAction(GifPlaybackService.ACTION_START)
-                .putExtra(GifPlaybackService.EXTRA_FILE, clip.getAbsolutePath())
-                .putExtra(GifPlaybackService.EXTRA_TRANSPORT, transport)
-                .putExtra(GifPlaybackService.EXTRA_ENDPOINT, endpoint)
-                .putExtra(GifPlaybackService.EXTRA_BLE_ADDRESS, address)
-                .putExtra(GifPlaybackService.EXTRA_SPEED_PERCENT, gifSpeedPercent);
-        if (Build.VERSION.SDK_INT >= 26) startForegroundService(service); else startService(service);
-        gifStreaming = false;
-        String description = String.format(Locale.US,
-                "后台 GIF 已启动 · %d 帧缓存 · %.1f fps · %d%% · 每轮 %,d B",
-                frames, 1000f / interval * gifSpeedPercent / 100f,
-                gifSpeedPercent, bytes);
-        if (!isDestroyed()) {
-            showProgress(100);
-            if (mediaInfo != null)
-                mediaInfo.setText(description + "\n退出 APK 后由系统通知继续控制");
-            status(description, true);
-        }
+        worker.execute(() -> {
+            try (InputStream input = new BufferedInputStream(new FileInputStream(clip))) {
+                byte[] data = readAll(input);
+                if (data.length > DEVICE_MAX_CLIP_BYTES)
+                    throw new IOException("设备当前媒体上限为 6 MiB");
+                CRC32 crc = new CRC32();
+                crc.update(data);
+                String description = String.format(Locale.US,
+                        "设备本地 GIF · %d 帧 · %.1f FPS · %,d B",
+                        frames, 1000f / interval, bytes);
+                if (transport == 1) {
+                    runOnUiThread(() -> startBleFile("CLIP", data, 0, "rgb332",
+                            0, 0, 240, 320, () -> {
+                                gifStreaming = false;
+                                preferences.edit().putBoolean("gif_service_running", false)
+                                        .putBoolean("device_gif_playing", true)
+                                        .putString("current_media", "gif").apply();
+                                setGifFps(Math.max(1, Math.min(DEVICE_MAX_GIF_FPS,
+                                        Math.round(1000f / interval))), false);
+                                if (mediaInfo != null) mediaInfo.setText(description +
+                                        "\n文件已存入设备；关闭 APK 后仍会继续播放");
+                                status("GIF 已一次上传并由设备本地播放", true);
+                            }));
+                } else {
+                    String response = httpBlocking("POST", endpoint +
+                                    "/api/media/clip?crc=" + String.format(Locale.US, "%08X",
+                                    crc.getValue()), data, "application/octet-stream", 180000);
+                    gifStreaming = false;
+                    preferences.edit().putBoolean("gif_service_running", false)
+                            .putBoolean("device_gif_playing", true)
+                            .putString("current_media", "gif").apply();
+                    runOnUiThread(() -> {
+                        setGifFps(Math.max(1, Math.min(DEVICE_MAX_GIF_FPS,
+                                Math.round(1000f / interval))), false);
+                        showProgress(100);
+                        if (mediaInfo != null) mediaInfo.setText(description +
+                                "\n文件已存入设备；关闭 APK 后仍会继续播放");
+                        status("GIF 已存入设备并开始播放\n" + response, true);
+                    });
+                }
+            } catch (Exception error) {
+                gifStreaming = false;
+                runOnUiThread(() -> status("GIF 上传失败：" + error.getMessage(), false));
+            }
+        });
     }
 
     private void releaseActivityBle() {
@@ -2454,13 +2523,19 @@ public class MainActivity extends Activity {
     private void stopGifStreamSilently() {
         gifStreaming = false;
         lastGifComparisonFrame = null;
+        Intent legacy = new Intent(this, GifPlaybackService.class)
+                .setAction(GifPlaybackService.ACTION_STOP);
+        startService(legacy);
+        preferences.edit().putBoolean("gif_service_running", false).apply();
     }
     private void stopGifStream() {
         stopGifStreamSilently();
-        Intent stop = new Intent(this, GifPlaybackService.class)
-                .setAction(GifPlaybackService.ACTION_STOP);
-        startService(stop);
-        status("GIF 后台播放已停止", true);
+        if (selectedTransport() == 1) {
+            if (bleReady) writeBleCommand("GIF_STOP");
+            else status("请先连接 BLE 后停止设备 GIF", false);
+        } else sendAction("gif_stop");
+        preferences.edit().putBoolean("device_gif_playing", false).apply();
+        status("设备 GIF 已停止；文件仍保留，可再次播放", true);
     }
     private void startFirmwareUpdate() {
         if (selectedFirmware == null) { toast("请先选择固件"); return; }
@@ -3176,11 +3251,11 @@ public class MainActivity extends Activity {
 
     @Override protected void onDestroy() {
         stopScreenMonitorSilently();
-        // ACTION_PREPARE has already promoted the process to a foreground service. Let an
-        // in-flight one-time GIF preprocessing job finish even when the Activity is swiped
-        // away; startGifService() performs the final hand-off. The explicit Stop button sets
-        // gifStreaming=false and causes the preparation loop to cancel.
-        if (gifStreaming) worker.shutdown(); else worker.shutdownNow();
+        // Device-local media removes the need for a phone playback service. Cancel unfinished
+        // preprocessing/upload work when the UI is destroyed; completed clips keep playing
+        // autonomously on LabCapsule.
+        gifStreaming = false;
+        worker.shutdownNow();
         if (bleScanner != null && hasBlePermissions()) bleScanner.stopScan(scanCallback);
         if (bluetoothGatt != null && hasBlePermissions()) {
             bluetoothGatt.disconnect();
@@ -3304,15 +3379,20 @@ public class MainActivity extends Activity {
         private float scale = 1f, minimumScale = 1f, offsetX, offsetY;
         private float lastX, lastY, pinchDistance;
         private boolean pinching;
+        private int fillColor = Color.BLACK;
 
         CropImageView(Context context) {
             super(context);
             setBackgroundColor(Color.rgb(18, 22, 31));
         }
-        void setImage(Bitmap value) {
+          void setImage(Bitmap value) {
             image = value;
             if (getWidth() > 0) resetImage();
-        }
+          }
+          void setBackgroundFill(int color) {
+              fillColor = color == Color.WHITE ? Color.WHITE : Color.BLACK;
+              invalidate();
+          }
         @Override protected void onSizeChanged(int width, int height, int oldWidth,
                                                int oldHeight) {
             float cropWidth = Math.min(width, height * .75f);
@@ -3341,7 +3421,7 @@ public class MainActivity extends Activity {
             float focusY = cropWindow.centerY();
             float sourceX = (focusX - offsetX) / scale;
             float sourceY = (focusY - offsetY) / scale;
-            float nextScale = minimumScale * Math.max(100, Math.min(800, percent)) / 100f;
+              float nextScale = minimumScale * Math.max(25, Math.min(800, percent)) / 100f;
             offsetX = focusX - sourceX * nextScale;
             offsetY = focusY - sourceY * nextScale;
             scale = nextScale;
@@ -3350,27 +3430,30 @@ public class MainActivity extends Activity {
         }
         RectF getSourceCrop() {
             if (image == null) return new RectF();
-            return new RectF(
-                    Math.max(0, (cropWindow.left - offsetX) / scale),
-                    Math.max(0, (cropWindow.top - offsetY) / scale),
-                    Math.min(image.getWidth(), (cropWindow.right - offsetX) / scale),
-                    Math.min(image.getHeight(), (cropWindow.bottom - offsetY) / scale));
-        }
-        private void clamp() {
-            if (image == null) return;
-            float width = image.getWidth() * scale;
-            float height = image.getHeight() * scale;
-            offsetX = Math.min(cropWindow.left,
-                    Math.max(cropWindow.right - width, offsetX));
-            offsetY = Math.min(cropWindow.top,
-                    Math.max(cropWindow.bottom - height, offsetY));
-        }
+              return new RectF(
+                      (cropWindow.left - offsetX) / scale,
+                      (cropWindow.top - offsetY) / scale,
+                      (cropWindow.right - offsetX) / scale,
+                      (cropWindow.bottom - offsetY) / scale);
+          }
+          private void clamp() {
+              if (image == null) return;
+              float width = image.getWidth() * scale;
+              float height = image.getHeight() * scale;
+              float visible = Math.max(12f, Math.min(cropWindow.width(),
+                      cropWindow.height()) * .12f);
+              offsetX = Math.min(cropWindow.right - visible,
+                      Math.max(cropWindow.left - width + visible, offsetX));
+              offsetY = Math.min(cropWindow.bottom - visible,
+                      Math.max(cropWindow.top - height + visible, offsetY));
+          }
         @Override protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
             if (image == null) return;
-            canvas.save();
-            canvas.clipRect(cropWindow);
-            Matrix matrix = new Matrix();
+              canvas.save();
+              canvas.clipRect(cropWindow);
+              canvas.drawColor(fillColor);
+              Matrix matrix = new Matrix();
             matrix.setScale(scale, scale);
             matrix.postTranslate(offsetX, offsetY);
             canvas.drawBitmap(image, matrix, paint);
@@ -3403,9 +3486,9 @@ public class MainActivity extends Activity {
                             float focusY = (event.getY(0) + event.getY(1)) / 2f;
                             float sourceX = (focusX - offsetX) / scale;
                             float sourceY = (focusY - offsetY) / scale;
-                            float nextScale = Math.max(minimumScale,
-                                    Math.min(minimumScale * 8f,
-                                            scale * nextDistance / pinchDistance));
+                              float nextScale = Math.max(minimumScale * .25f,
+                                      Math.min(minimumScale * 8f,
+                                              scale * nextDistance / pinchDistance));
                             offsetX = focusX - sourceX * nextScale;
                             offsetY = focusY - sourceY * nextScale;
                             scale = nextScale;

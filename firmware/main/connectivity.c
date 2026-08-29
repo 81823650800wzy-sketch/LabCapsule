@@ -38,6 +38,7 @@
 #include "services/gatt/ble_svc_gatt.h"
 #include "sensor_hub.h"
 #include "offline_store.h"
+#include "media_store.h"
 #include "wallpaper.h"
 
 #define WIFI_AP_PASSWORD "labcapsule"
@@ -74,6 +75,7 @@ typedef enum {
     FILE_TRANSFER_NONE,
     FILE_TRANSFER_FRAME,
     FILE_TRANSFER_WALLPAPER,
+    FILE_TRANSFER_CLIP,
 } file_transfer_kind_t;
 
 static file_transfer_kind_t s_file_kind;
@@ -131,6 +133,7 @@ static void file_transfer_abort(void)
 {
     if (s_file_kind == FILE_TRANSFER_FRAME) labcapsule_media_frame_abort();
     if (s_file_kind == FILE_TRANSFER_WALLPAPER) wallpaper_upload_abort();
+    if (s_file_kind == FILE_TRANSFER_CLIP) media_store_upload_abort();
     s_file_kind = FILE_TRANSFER_NONE;
     s_file_expected = s_file_received = 0;
     s_file_crc = s_file_crc_expected = 0;
@@ -142,14 +145,18 @@ static esp_err_t file_transfer_begin(file_transfer_kind_t kind, size_t size,
                                      uint16_t x, uint16_t y, uint16_t width,
                                      uint16_t height)
 {
-    if (s_file_kind != FILE_TRANSFER_NONE || size == 0 ||
-        size > WALLPAPER_PAYLOAD_BYTES ||
+    size_t maximum = kind == FILE_TRANSFER_CLIP ? MEDIA_STORE_MAX_CLIP_BYTES :
+            WALLPAPER_PAYLOAD_BYTES;
+    if (s_file_kind != FILE_TRANSFER_NONE || size == 0 || size > maximum ||
         (kind == FILE_TRANSFER_WALLPAPER && size != WALLPAPER_PAYLOAD_BYTES)) {
         return ESP_ERR_INVALID_STATE;
     }
+    if (kind == FILE_TRANSFER_FRAME || kind == FILE_TRANSFER_WALLPAPER ||
+        kind == FILE_TRANSFER_CLIP) labcapsule_media_clip_stop();
     esp_err_t result = kind == FILE_TRANSFER_FRAME
-        ? labcapsule_media_region_begin(size, x, y, width, height, encoding)
-        : wallpaper_upload_begin(size);
+            ? labcapsule_media_region_begin(size, x, y, width, height, encoding)
+            : kind == FILE_TRANSFER_WALLPAPER ? wallpaper_upload_begin(size)
+                                              : media_store_upload_begin(size);
     if (result != ESP_OK) return result;
     s_file_kind = kind;
     s_file_expected = size;
@@ -165,7 +172,10 @@ static esp_err_t file_transfer_write(const uint8_t *data, size_t length)
     if (s_file_kind == FILE_TRANSFER_NONE || !data || length == 0 ||
         s_file_received + length > s_file_expected) return ESP_ERR_INVALID_ARG;
     esp_err_t result = s_file_kind == FILE_TRANSFER_FRAME
-        ? labcapsule_media_frame_write(data, length) : wallpaper_upload_write(data, length);
+            ? labcapsule_media_frame_write(data, length)
+            : s_file_kind == FILE_TRANSFER_WALLPAPER
+                    ? wallpaper_upload_write(data, length)
+                    : media_store_upload_write(data, length);
     if (result == ESP_OK) {
         s_file_crc = crc32_update(s_file_crc, data, length);
         s_file_received += length;
@@ -181,11 +191,19 @@ static esp_err_t file_transfer_finish(void)
         return ESP_ERR_INVALID_CRC;
     }
     esp_err_t result = s_file_kind == FILE_TRANSFER_FRAME
-        ? labcapsule_media_frame_finish(s_file_duration_ms) : wallpaper_upload_finish();
+            ? labcapsule_media_frame_finish(s_file_duration_ms)
+            : s_file_kind == FILE_TRANSFER_WALLPAPER
+                    ? wallpaper_upload_finish() : media_store_upload_finish();
     file_transfer_kind_t completed = s_file_kind;
     s_file_kind = FILE_TRANSFER_NONE;
     s_file_expected = s_file_received = 0;
-    if (result == ESP_OK && completed == FILE_TRANSFER_WALLPAPER) labcapsule_show_wallpaper();
+    if (result == ESP_OK && completed == FILE_TRANSFER_WALLPAPER) {
+        media_store_delete_clip();
+        labcapsule_show_wallpaper();
+    } else if (result == ESP_OK && completed == FILE_TRANSFER_CLIP) {
+        wallpaper_clear();
+        labcapsule_media_clip_start();
+    }
     return result;
 }
 
@@ -384,7 +402,8 @@ bool connectivity_remote_connected(void)
 
 static void ble_build_status_response(void)
 {
-    char device_status[256];
+    /* Worst-case compact V0.7 JSON is 270 bytes plus its terminator. */
+    char device_status[272];
     char network_status[188];
     labcapsule_build_ble_device_json(device_status, sizeof(device_status));
     wifi_mode_t wifi_mode = WIFI_MODE_NULL;
@@ -710,6 +729,50 @@ static esp_err_t media_frame_handler(httpd_req_t *request)
     return http_json(request, NULL, response);
 }
 
+static esp_err_t media_clip_handler(httpd_req_t *request)
+{
+    uint32_t crc = 0;
+    char query[64];
+    char value[24];
+    if (httpd_req_get_url_query_str(request, query, sizeof(query)) == ESP_OK &&
+        query_value(query, "crc", value, sizeof(value))) crc = strtoul(value, NULL, 16);
+    if (request->content_len < 29 ||
+        request->content_len > (int)MEDIA_STORE_MAX_CLIP_BYTES ||
+        file_transfer_begin(FILE_TRANSFER_CLIP, (size_t)request->content_len, 0, crc,
+                            LABCAPSULE_MEDIA_RGB332, 0, 0, 240, 320) != ESP_OK) {
+        return http_json(request, "409 Conflict",
+                         "{\"ok\":false,\"error\":\"clip upload rejected\"}");
+    }
+    uint8_t *buffer = malloc(HTTP_BUFFER_SIZE);
+    if (!buffer) {
+        file_transfer_abort();
+        return http_json(request, "500 Internal Server Error",
+                         "{\"ok\":false,\"error\":\"out of memory\"}");
+    }
+    size_t remaining = (size_t)request->content_len;
+    while (remaining > 0) {
+        size_t wanted = remaining < HTTP_BUFFER_SIZE ? remaining : HTTP_BUFFER_SIZE;
+        int received = httpd_req_recv(request, (char *)buffer, wanted);
+        if (received == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (received <= 0 || file_transfer_write(buffer, (size_t)received) != ESP_OK) {
+            free(buffer);
+            file_transfer_abort();
+            return ESP_FAIL;
+        }
+        remaining -= (size_t)received;
+    }
+    free(buffer);
+    if (file_transfer_finish() != ESP_OK) {
+        return http_json(request, "400 Bad Request",
+                         "{\"ok\":false,\"error\":\"clip validation failed\"}");
+    }
+    char response[192];
+    snprintf(response, sizeof(response),
+             "{\"ok\":true,\"stored\":\"gif\",\"bytes\":%u,\"fps\":%u}",
+             (unsigned)media_store_clip_size(), (unsigned)labcapsule_media_clip_fps());
+    return http_json(request, NULL, response);
+}
+
 static esp_err_t control_handler(httpd_req_t *request)
 {
     char query[128];
@@ -891,7 +954,7 @@ static esp_err_t http_server_start(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.stack_size = 8192;
-    config.max_uri_handlers = 15;
+    config.max_uri_handlers = 16;
     httpd_handle_t server = NULL;
     ESP_RETURN_ON_ERROR(httpd_start(&server, &config), TAG, "HTTP server start failed");
 
@@ -928,6 +991,9 @@ static esp_err_t http_server_start(void)
     const httpd_uri_t media_uri = {
         .uri = "/api/media/frame", .method = HTTP_POST, .handler = media_frame_handler,
     };
+    const httpd_uri_t media_clip_uri = {
+        .uri = "/api/media/clip", .method = HTTP_POST, .handler = media_clip_handler,
+    };
     const httpd_uri_t experiment_uri = {
         .uri = "/api/experiment", .method = HTTP_POST, .handler = experiment_handler,
     };
@@ -951,6 +1017,7 @@ static esp_err_t http_server_start(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &sensors_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &mode_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &media_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &media_clip_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &experiment_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &offline_get_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &offline_post_uri));
@@ -1381,6 +1448,10 @@ static int ble_access(uint16_t connection_handle, uint16_t attribute_handle,
                 } else if (strcmp(kind, "WALLPAPER") == 0) {
                     result = file_transfer_begin(FILE_TRANSFER_WALLPAPER, size, 0, crc,
                                                  LABCAPSULE_MEDIA_RAW565,
+                                                 0, 0, 240, 320);
+                } else if (strcmp(kind, "CLIP") == 0) {
+                    result = file_transfer_begin(FILE_TRANSFER_CLIP, size, 0, crc,
+                                                 LABCAPSULE_MEDIA_RGB332,
                                                  0, 0, 240, 320);
                 }
             }

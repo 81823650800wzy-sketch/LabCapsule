@@ -28,6 +28,7 @@
 #include "freertos/task.h"
 #include "labcapsule_control.h"
 #include "input_hub.h"
+#include "media_store.h"
 #include "offline_store.h"
 #include "sensor_hub.h"
 #include "wallpaper.h"
@@ -103,6 +104,12 @@ typedef enum {
 } serial_source_t;
 
 typedef enum {
+    SERIAL_UPLOAD_NONE = 0,
+    SERIAL_UPLOAD_WALLPAPER,
+    SERIAL_UPLOAD_CLIP,
+} serial_upload_kind_t;
+
+typedef enum {
     DISPLAY_VIEW_STATUS = 0,
     DISPLAY_VIEW_SETTINGS,
     DISPLAY_VIEW_DEVELOPER,
@@ -136,11 +143,17 @@ static volatile uint32_t s_display_revision = 1;
 static volatile bool s_idle_mode;
 static char s_idle_title[20] = "DEVICE IDLE";
 static char s_idle_message[36] = "READY FOR PHONE OR PC";
+static volatile bool s_host_link_active;
+static volatile int64_t s_host_last_heartbeat_us;
+static volatile uint8_t s_host_cpu_percent;
+static volatile uint8_t s_host_ram_percent;
+static volatile uint8_t s_host_disk_percent;
+static volatile int16_t s_host_temperature_c = -1;
 
 static bool s_usb_serial_ready = false;
 static bool s_mpu_ready = false;
 static bool s_display_ready = false;
-static bool s_display_inverted = true;
+static bool s_display_inverted = false;
 static bool s_backlight_commanded_on = false;
 static bool s_backlight_pwm_ready = false;
 static uint8_t s_backlight_brightness = 100;
@@ -170,6 +183,15 @@ static uint16_t s_media_y;
 static uint16_t s_media_width;
 static uint16_t s_media_height;
 static labcapsule_media_encoding_t s_media_encoding;
+static volatile bool s_media_clip_playing;
+static volatile uint32_t s_media_clip_generation;
+static volatile uint8_t s_media_clip_fps = 6;
+static volatile serial_upload_kind_t s_serial_upload_kind;
+static serial_source_t s_serial_upload_source;
+static size_t s_serial_upload_expected;
+static size_t s_serial_upload_received;
+static uint32_t s_serial_upload_expected_crc;
+static uint32_t s_serial_upload_crc;
 
 static const uint8_t FONT_ALPHA[26][5] = {
     {0x7e,0x11,0x11,0x11,0x7e}, {0x7f,0x49,0x49,0x49,0x36},
@@ -768,19 +790,34 @@ static void display_render_idle(void)
     display_text(20, 102, s_idle_title, 2, theme.accent);
     display_text(20, 136, s_idle_message, 1, theme.text);
 
-    snprintf(line, sizeof(line), "RAM %uPCT  %luK FREE",
-             usage_percent(internal_total, internal_free),
-             (unsigned long)(internal_free / 1024U));
-    display_text(20, 182, line, 1, theme.text);
-    snprintf(line, sizeof(line), "PSRAM %uPCT  %luK FREE",
-             usage_percent(psram_total, psram_free),
-             (unsigned long)(psram_free / 1024U));
-    display_text(20, 206, line, 1, theme.text);
-    unsigned store_percent = offline.bytes_capacity == 0 ? 0 :
-            (unsigned)(offline.bytes_used * 100ULL / offline.bytes_capacity);
-    snprintf(line, sizeof(line), "STORE %uPCT  %lu RUNS", store_percent,
-             (unsigned long)offline.sessions);
-    display_text(20, 230, line, 1, offline.full ? theme.secondary : theme.text);
+    bool host_live = s_host_link_active &&
+            esp_timer_get_time() - s_host_last_heartbeat_us < 5000000LL;
+    if (host_live) {
+        snprintf(line, sizeof(line), "PC CPU %uPCT", (unsigned)s_host_cpu_percent);
+        display_text(20, 182, line, 2, theme.text);
+        snprintf(line, sizeof(line), "RAM %uPCT  DISK %uPCT",
+                 (unsigned)s_host_ram_percent, (unsigned)s_host_disk_percent);
+        display_text(20, 212, line, 1, theme.text);
+        if (s_host_temperature_c >= 0)
+            snprintf(line, sizeof(line), "TEMP %dC  USB ONLINE", (int)s_host_temperature_c);
+        else snprintf(line, sizeof(line), "USB HOST ONLINE");
+        display_text(20, 236, line, 1, theme.secondary);
+    } else {
+        s_host_link_active = false;
+        snprintf(line, sizeof(line), "RAM %uPCT  %luK FREE",
+                 usage_percent(internal_total, internal_free),
+                 (unsigned long)(internal_free / 1024U));
+        display_text(20, 182, line, 1, theme.text);
+        snprintf(line, sizeof(line), "PSRAM %uPCT  %luK FREE",
+                 usage_percent(psram_total, psram_free),
+                 (unsigned long)(psram_free / 1024U));
+        display_text(20, 206, line, 1, theme.text);
+        unsigned store_percent = offline.bytes_capacity == 0 ? 0 :
+                (unsigned)(offline.bytes_used * 100ULL / offline.bytes_capacity);
+        snprintf(line, sizeof(line), "STORE %uPCT  %lu RUNS", store_percent,
+                 (unsigned long)offline.sessions);
+        display_text(20, 230, line, 1, offline.full ? theme.secondary : theme.text);
+    }
     snprintf(line, sizeof(line), "LINK B%d W%d M%d",
              connectivity_ble_connected() ? 1 : 0,
              connectivity_sta_connected() ? 1 : 0,
@@ -1080,7 +1117,109 @@ static void handle_display_command(char **save_pointer)
     }
 }
 
-static void handle_command(char *line)
+static uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t length)
+{
+    for (size_t index = 0; index < length; ++index) {
+        crc ^= data[index];
+        for (uint8_t bit = 0; bit < 8; ++bit) {
+            crc = (crc >> 1) ^ (0xEDB88320U & (uint32_t)-(int32_t)(crc & 1U));
+        }
+    }
+    return crc;
+}
+
+static void serial_upload_abort(void)
+{
+    if (s_serial_upload_kind == SERIAL_UPLOAD_WALLPAPER) wallpaper_upload_abort();
+    else if (s_serial_upload_kind == SERIAL_UPLOAD_CLIP) media_store_upload_abort();
+    s_serial_upload_kind = SERIAL_UPLOAD_NONE;
+    s_serial_upload_expected = 0;
+    s_serial_upload_received = 0;
+}
+
+static esp_err_t serial_upload_begin(serial_source_t source, const char *kind_text,
+                                     size_t expected, uint32_t expected_crc)
+{
+    if (s_serial_upload_kind != SERIAL_UPLOAD_NONE) return ESP_ERR_INVALID_STATE;
+    serial_upload_kind_t kind = SERIAL_UPLOAD_NONE;
+    if (strcmp(kind_text, "WALLPAPER") == 0 && expected == WALLPAPER_PAYLOAD_BYTES)
+        kind = SERIAL_UPLOAD_WALLPAPER;
+    else if (strcmp(kind_text, "CLIP") == 0 && expected >= 29 &&
+             expected <= MEDIA_STORE_MAX_CLIP_BYTES)
+        kind = SERIAL_UPLOAD_CLIP;
+    else return ESP_ERR_INVALID_SIZE;
+
+    labcapsule_media_clip_stop();
+    /* Let the playback task close the old current.lcg before atomic replacement. */
+    vTaskDelay(pdMS_TO_TICKS(60));
+    esp_err_t result = kind == SERIAL_UPLOAD_WALLPAPER
+            ? wallpaper_upload_begin(expected) : media_store_upload_begin(expected);
+    if (result != ESP_OK) return result;
+    s_serial_upload_source = source;
+    s_serial_upload_expected = expected;
+    s_serial_upload_received = 0;
+    s_serial_upload_expected_crc = expected_crc;
+    s_serial_upload_crc = 0xFFFFFFFFU;
+    s_serial_upload_kind = kind;
+    serial_emit("READY,UPLOAD,%s,BYTES=%u", kind_text, (unsigned)expected);
+    return ESP_OK;
+}
+
+static void serial_upload_finish(void)
+{
+    serial_upload_kind_t kind = s_serial_upload_kind;
+    uint32_t actual_crc = s_serial_upload_crc ^ 0xFFFFFFFFU;
+    esp_err_t result = ESP_OK;
+    if (actual_crc != s_serial_upload_expected_crc) {
+        result = ESP_ERR_INVALID_CRC;
+    } else if (kind == SERIAL_UPLOAD_WALLPAPER) {
+        result = wallpaper_upload_finish();
+    } else if (kind == SERIAL_UPLOAD_CLIP) {
+        result = media_store_upload_finish();
+    }
+    if (result != ESP_OK) {
+        serial_upload_abort();
+        serial_emit("ERR,UPLOAD,%s,CRC=%08lX,REASON=%s",
+                    kind == SERIAL_UPLOAD_CLIP ? "CLIP" : "WALLPAPER",
+                    (unsigned long)actual_crc, esp_err_to_name(result));
+        return;
+    }
+    s_serial_upload_kind = SERIAL_UPLOAD_NONE;
+    s_serial_upload_expected = 0;
+    s_serial_upload_received = 0;
+    if (kind == SERIAL_UPLOAD_WALLPAPER) {
+        media_store_delete_clip();
+        s_display_view = DISPLAY_VIEW_WALLPAPER;
+        display_request_refresh();
+        serial_emit("OK,UPLOAD,WALLPAPER,CRC=%08lX", (unsigned long)actual_crc);
+    } else {
+        wallpaper_clear();
+        serial_emit("OK,UPLOAD,CLIP,CRC=%08lX", (unsigned long)actual_crc);
+        labcapsule_media_clip_start();
+    }
+}
+
+static size_t serial_upload_write(serial_source_t source, const uint8_t *data, size_t length)
+{
+    if (s_serial_upload_kind == SERIAL_UPLOAD_NONE || source != s_serial_upload_source)
+        return 0;
+    size_t remaining = s_serial_upload_expected - s_serial_upload_received;
+    size_t consumed = length < remaining ? length : remaining;
+    esp_err_t result = s_serial_upload_kind == SERIAL_UPLOAD_WALLPAPER
+            ? wallpaper_upload_write(data, consumed)
+            : media_store_upload_write(data, consumed);
+    if (result != ESP_OK) {
+        serial_emit("ERR,UPLOAD,WRITE,%s", esp_err_to_name(result));
+        serial_upload_abort();
+        return consumed;
+    }
+    s_serial_upload_crc = crc32_update(s_serial_upload_crc, data, consumed);
+    s_serial_upload_received += consumed;
+    if (s_serial_upload_received == s_serial_upload_expected) serial_upload_finish();
+    return consumed;
+}
+
+static void handle_command(char *line, serial_source_t source)
 {
     while (*line && isspace((unsigned char)*line)) {
         ++line;
@@ -1143,6 +1282,69 @@ static void handle_command(char *line)
         char *title = strtok_r(NULL, ",", &save_pointer);
         char *message = strtok_r(NULL, ",", &save_pointer);
         labcapsule_set_idle_notice(title, message);
+    } else if (strcmp(command, "HOST") == 0) {
+        char *cpu_text = strtok_r(NULL, ", ", &save_pointer);
+        char *ram_text = strtok_r(NULL, ", ", &save_pointer);
+        char *disk_text = strtok_r(NULL, ", ", &save_pointer);
+        char *temp_text = strtok_r(NULL, ", ", &save_pointer);
+        unsigned cpu = cpu_text ? strtoul(cpu_text, NULL, 10) : 101;
+        unsigned ram = ram_text ? strtoul(ram_text, NULL, 10) : 101;
+        unsigned disk = disk_text ? strtoul(disk_text, NULL, 10) : 101;
+        long temperature = temp_text ? strtol(temp_text, NULL, 10) : -1;
+        if (cpu > 100 || ram > 100 || disk > 100 || temperature < -1 ||
+            temperature > 150) {
+            serial_emit("ERR,HOST,EXPECTED=CPU,RAM,DISK,TEMP");
+        } else {
+            s_host_cpu_percent = (uint8_t)cpu;
+            s_host_ram_percent = (uint8_t)ram;
+            s_host_disk_percent = (uint8_t)disk;
+            s_host_temperature_c = (int16_t)temperature;
+            s_host_last_heartbeat_us = esp_timer_get_time();
+            s_host_link_active = true;
+            if (get_state() != STATE_RECORDING) {
+                s_idle_mode = true;
+                s_display_view = DISPLAY_VIEW_IDLE;
+            }
+            display_request_refresh();
+            serial_emit("OK,HOST,CPU=%u,RAM=%u,DISK=%u,TEMP=%ld",
+                        cpu, ram, disk, temperature);
+        }
+    } else if (strcmp(command, "GIF") == 0) {
+        char *action = strtok_r(NULL, ", ", &save_pointer);
+        if (action) for (char *p = action; *p; ++p)
+            *p = (char)toupper((unsigned char)*p);
+        if (action && strcmp(action, "PLAY") == 0) {
+            if (labcapsule_media_clip_start() != ESP_OK) serial_emit("ERR,GIF,NOT_FOUND");
+        } else if (action && strcmp(action, "STOP") == 0) {
+            labcapsule_media_clip_stop();
+        } else if (action && strcmp(action, "DELETE") == 0) {
+            labcapsule_media_clip_stop();
+            esp_err_t result = media_store_delete_clip();
+            serial_emit(result == ESP_OK ? "OK,GIF,DELETE" : "ERR,GIF,DELETE");
+        } else if (action && strcmp(action, "FPS") == 0) {
+            char *fps_text = strtok_r(NULL, ", ", &save_pointer);
+            unsigned fps = fps_text ? strtoul(fps_text, NULL, 10) : 0;
+            if (labcapsule_media_clip_set_fps((uint8_t)fps) != ESP_OK)
+                serial_emit("ERR,GIF,FPS_RANGE=1-%u", LABCAPSULE_MEDIA_MAX_FPS);
+        } else {
+            serial_emit("GIF,STORED=%s,PLAYING=%s,FPS=%u,BYTES=%u",
+                        media_store_clip_available() ? "YES" : "NO",
+                        s_media_clip_playing ? "YES" : "NO",
+                        (unsigned)s_media_clip_fps,
+                        (unsigned)media_store_clip_size());
+        }
+    } else if (strcmp(command, "UPLOAD") == 0) {
+        char *kind = strtok_r(NULL, ", ", &save_pointer);
+        char *size_text = strtok_r(NULL, ", ", &save_pointer);
+        char *crc_text = strtok_r(NULL, ", ", &save_pointer);
+        if (kind) for (char *p = kind; *p; ++p) *p = (char)toupper((unsigned char)*p);
+        size_t size = size_text ? (size_t)strtoul(size_text, NULL, 10) : 0;
+        uint32_t crc = crc_text ? (uint32_t)strtoul(crc_text, NULL, 16) : 0;
+        esp_err_t result = kind && size_text && crc_text
+                ? serial_upload_begin(source, kind, size, crc) : ESP_ERR_INVALID_ARG;
+        if (result != ESP_OK)
+            serial_emit("ERR,UPLOAD,EXPECTED=UPLOAD,CLIP|WALLPAPER,SIZE,CRC32,%s",
+                        esp_err_to_name(result));
     } else if (strcmp(command, "START") == 0) {
         char *rate_text = strtok_r(NULL, ", ", &save_pointer);
         char *duration_text = strtok_r(NULL, ", ", &save_pointer);
@@ -1178,6 +1380,8 @@ static void handle_command(char *line)
         serial_emit("COMMANDS,STYLE,PRESET,WALL,PANEL,HUD");
         serial_emit("COMMANDS,MODE,IDLE|EXPERIMENT");
         serial_emit("COMMANDS,NOTICE,TITLE,MESSAGE");
+        serial_emit("COMMANDS,HOST,CPU,RAM,DISK,TEMP|GIF,PLAY|STOP|DELETE|FPS,N");
+        serial_emit("COMMANDS,UPLOAD,CLIP|WALLPAPER,SIZE,CRC32_THEN_BINARY");
     } else {
         serial_emit("ERR,UNKNOWN_COMMAND,%s", command);
     }
@@ -1195,7 +1399,7 @@ static void accept_serial_byte(serial_source_t source, uint8_t byte)
     if (byte == '\r' || byte == '\n') {
         if (*length > 0) {
             line[*length] = '\0';
-            handle_command(line);
+            handle_command(line, source);
             *length = 0;
         }
         return;
@@ -1219,16 +1423,24 @@ static void accept_serial_byte(serial_source_t source, uint8_t byte)
 static void serial_task(void *argument)
 {
     (void)argument;
-    uint8_t byte;
+    uint8_t buffer[512];
     while (true) {
-        int uart_bytes = uart_read_bytes(UART_NUM_0, &byte, 1, pdMS_TO_TICKS(5));
-        if (uart_bytes == 1) {
-            accept_serial_byte(SERIAL_SOURCE_UART, byte);
+        int uart_bytes = uart_read_bytes(UART_NUM_0, buffer, sizeof(buffer), pdMS_TO_TICKS(5));
+        size_t offset = 0;
+        while (offset < (size_t)uart_bytes) {
+            size_t consumed = serial_upload_write(SERIAL_SOURCE_UART, buffer + offset,
+                                                  (size_t)uart_bytes - offset);
+            if (consumed > 0) offset += consumed;
+            else accept_serial_byte(SERIAL_SOURCE_UART, buffer[offset++]);
         }
         if (s_usb_serial_ready) {
-            int usb_bytes = usb_serial_jtag_read_bytes(&byte, 1, 0);
-            if (usb_bytes == 1) {
-                accept_serial_byte(SERIAL_SOURCE_USB, byte);
+            int usb_bytes = usb_serial_jtag_read_bytes(buffer, sizeof(buffer), 0);
+            offset = 0;
+            while (offset < (size_t)usb_bytes) {
+                size_t consumed = serial_upload_write(SERIAL_SOURCE_USB, buffer + offset,
+                                                      (size_t)usb_bytes - offset);
+                if (consumed > 0) offset += consumed;
+                else accept_serial_byte(SERIAL_SOURCE_USB, buffer[offset++]);
             }
         }
     }
@@ -1463,6 +1675,8 @@ void labcapsule_build_status_json(char *buffer, size_t buffer_size)
              "\"samples\":%lu,\"backlight\":%s,\"brightness\":%u,\"wallpaper\":%s,"
              "\"inputDrivers\":%u,\"offlineSessions\":%lu,"
              "\"offlineSamples\":%lu,\"offlineRecording\":%s,"
+             "\"currentMedia\":\"%s\",\"mediaBytes\":%u,"
+             "\"gifPlaying\":%s,\"gifFps\":%u,"
              "\"hardware\":{\"uptimeSeconds\":%llu,"
              "\"internalFree\":%lu,\"internalTotal\":%lu,"
              "\"psramFree\":%lu,\"psramTotal\":%lu,"
@@ -1478,6 +1692,10 @@ void labcapsule_build_status_json(char *buffer, size_t buffer_size)
              (unsigned)s_backlight_brightness, wallpaper_available() ? "true" : "false",
              (unsigned)input_hub_driver_count(), (unsigned long)offline.sessions,
              (unsigned long)offline.samples, offline.recording ? "true" : "false",
+             media_store_clip_available() ? "gif" :
+                     (wallpaper_available() ? "image" : "none"),
+             (unsigned)media_store_clip_size(),
+             s_media_clip_playing ? "true" : "false", (unsigned)s_media_clip_fps,
              (unsigned long long)(esp_timer_get_time() / 1000000ULL),
              (unsigned long)internal_free, (unsigned long)internal_total,
              (unsigned long)psram_free, (unsigned long)psram_total,
@@ -1496,7 +1714,8 @@ void labcapsule_build_ble_device_json(char *buffer, size_t buffer_size)
     snprintf(buffer, buffer_size,
              "{\"version\":\"%s\",\"state\":\"%s\",\"view\":\"%s\","
              "\"operationMode\":\"%s\",\"mpu\":\"%s\",\"backlight\":%s,"
-             "\"brightness\":%u,\"wallpaper\":%s,\"style\":{"
+             "\"brightness\":%u,\"wallpaper\":%s,\"gifPlaying\":%s,"
+             "\"gifFps\":%u,\"style\":{"
              "\"preset\":%u,\"wallpaperOpacity\":%u,\"panelOpacity\":%u,"
              "\"hudOpacity\":%u}}",
              LABCAPSULE_VERSION, state_name(get_state()), display_view_name(s_display_view),
@@ -1504,6 +1723,7 @@ void labcapsule_build_ble_device_json(char *buffer, size_t buffer_size)
              s_backlight_commanded_on ? "true" : "false",
              (unsigned)s_backlight_brightness,
              wallpaper_available() ? "true" : "false",
+             s_media_clip_playing ? "true" : "false", (unsigned)s_media_clip_fps,
              (unsigned)s_visual_preset, (unsigned)s_wallpaper_opacity,
              (unsigned)s_panel_opacity, (unsigned)s_hud_opacity);
 }
@@ -1699,6 +1919,102 @@ void labcapsule_media_frame_abort(void)
     s_media_encoding = LABCAPSULE_MEDIA_RAW565;
 }
 
+esp_err_t labcapsule_media_clip_set_fps(uint8_t fps)
+{
+    if (fps < 1 || fps > LABCAPSULE_MEDIA_MAX_FPS) return ESP_ERR_INVALID_ARG;
+    s_media_clip_fps = fps;
+    serial_emit("OK,GIF,FPS=%u", (unsigned)fps);
+    return ESP_OK;
+}
+
+esp_err_t labcapsule_media_clip_start(void)
+{
+    if (!media_store_clip_available()) return ESP_ERR_NOT_FOUND;
+    ++s_media_clip_generation;
+    s_media_clip_playing = true;
+    s_idle_mode = false;
+    serial_emit("OK,GIF,PLAY,FPS=%u,BYTES=%u", (unsigned)s_media_clip_fps,
+                (unsigned)media_store_clip_size());
+    return ESP_OK;
+}
+
+void labcapsule_media_clip_stop(void)
+{
+    s_media_clip_playing = false;
+    ++s_media_clip_generation;
+    if (s_display_view == DISPLAY_VIEW_MEDIA) s_display_view = DISPLAY_VIEW_STATUS;
+    display_request_refresh();
+    serial_emit("OK,GIF,STOP");
+}
+
+bool labcapsule_media_clip_playing(void)
+{
+    return s_media_clip_playing;
+}
+
+uint8_t labcapsule_media_clip_fps(void)
+{
+    return s_media_clip_fps;
+}
+
+static esp_err_t display_stored_media_frame(const media_store_frame_t *frame,
+                                            const uint8_t *payload)
+{
+    if (!frame || frame->payload_size == 0) return ESP_OK;
+    esp_err_t result = labcapsule_media_region_begin(frame->payload_size, frame->x, frame->y,
+            frame->width, frame->height, frame->encoding);
+    if (result != ESP_OK) return result;
+    result = labcapsule_media_frame_write(payload, frame->payload_size);
+    if (result == ESP_OK) result = labcapsule_media_frame_finish(
+            1000U / (s_media_clip_fps ? s_media_clip_fps : 1U));
+    else labcapsule_media_frame_abort();
+    return result;
+}
+
+static void media_playback_task(void *argument)
+{
+    (void)argument;
+    while (true) {
+        if (!s_media_clip_playing || !media_store_clip_available()) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        uint32_t generation = s_media_clip_generation;
+        media_store_reader_t reader;
+        media_store_frame_t frame;
+        if (media_store_reader_open(&reader) != ESP_OK) {
+            s_media_clip_playing = false;
+            continue;
+        }
+        uint8_t source_fps = (uint8_t)((1000U + reader.interval_ms / 2U) /
+                                       reader.interval_ms);
+        if (source_fps >= 1 && source_fps <= LABCAPSULE_MEDIA_MAX_FPS)
+            s_media_clip_fps = source_fps;
+        esp_err_t result = media_store_reader_bootstrap(&reader, &frame,
+                s_media_receive_buffer, WALLPAPER_PAYLOAD_BYTES);
+        bool bootstrap = true;
+        while (result == ESP_OK && s_media_clip_playing &&
+               generation == s_media_clip_generation) {
+            int64_t started = esp_timer_get_time();
+            result = display_stored_media_frame(&frame, s_media_receive_buffer);
+            if (result != ESP_OK) break;
+            uint32_t fps = s_media_clip_fps;
+            if (fps < 1) fps = 1;
+            if (fps > LABCAPSULE_MEDIA_MAX_FPS) fps = LABCAPSULE_MEDIA_MAX_FPS;
+            int64_t remaining_us = 1000000LL / fps - (esp_timer_get_time() - started);
+            if (remaining_us > 1000) vTaskDelay(pdMS_TO_TICKS((uint32_t)(remaining_us / 1000)));
+            if (bootstrap) bootstrap = false;
+            result = media_store_reader_next(&reader, &frame, s_media_receive_buffer,
+                                             WALLPAPER_PAYLOAD_BYTES);
+        }
+        media_store_reader_close(&reader);
+        if (result != ESP_OK && generation == s_media_clip_generation) {
+            s_media_clip_playing = false;
+            serial_emit("ERR,GIF,PLAYBACK=%s", esp_err_to_name(result));
+        }
+    }
+}
+
 esp_err_t labcapsule_set_brightness(uint8_t percent)
 {
     if (percent > 100) return ESP_ERR_INVALID_ARG;
@@ -1788,7 +2104,44 @@ esp_err_t labcapsule_remote_action(const char *action, char *response, size_t re
     }
     normalized[index] = '\0';
 
-    if (strncmp(normalized, "STYLE:", 6) == 0) {
+    if (strncmp(normalized, "GIF_FPS:", 8) == 0) {
+        unsigned fps = (unsigned)strtoul(normalized + 8, NULL, 10);
+        esp_err_t result = labcapsule_media_clip_set_fps((uint8_t)fps);
+        snprintf(response, response_size, result == ESP_OK ? "GIF FPS applied" :
+                 "GIF FPS must be 1..8");
+        return result;
+    } else if (strcmp(normalized, "GIF_PLAY") == 0) {
+        esp_err_t result = labcapsule_media_clip_start();
+        snprintf(response, response_size, result == ESP_OK ? "stored GIF playing" :
+                 "stored GIF not found");
+        return result;
+    } else if (strcmp(normalized, "GIF_STOP") == 0) {
+        labcapsule_media_clip_stop();
+        snprintf(response, response_size, "stored GIF stopped");
+        return ESP_OK;
+    } else if (strncmp(normalized, "HOST:", 5) == 0) {
+        unsigned cpu = 0, ram = 0, disk = 0;
+        int temperature = -1;
+        if (sscanf(normalized + 5, "%u:%u:%u:%d", &cpu, &ram, &disk,
+                   &temperature) != 4 || cpu > 100 || ram > 100 || disk > 100 ||
+            temperature < -1 || temperature > 150) {
+            snprintf(response, response_size, "expected HOST:cpu:ram:disk:temp");
+            return ESP_ERR_INVALID_ARG;
+        }
+        s_host_cpu_percent = (uint8_t)cpu;
+        s_host_ram_percent = (uint8_t)ram;
+        s_host_disk_percent = (uint8_t)disk;
+        s_host_temperature_c = (int16_t)temperature;
+        s_host_last_heartbeat_us = esp_timer_get_time();
+        s_host_link_active = true;
+        if (get_state() != STATE_RECORDING) {
+            s_idle_mode = true;
+            s_display_view = DISPLAY_VIEW_IDLE;
+        }
+        display_request_refresh();
+        snprintf(response, response_size, "host telemetry applied");
+        return ESP_OK;
+    } else if (strncmp(normalized, "STYLE:", 6) == 0) {
         unsigned preset = 0, wallpaper_opacity = 0, panel_opacity = 0, hud_opacity = 0;
         if (sscanf(normalized + 6, "%u:%u:%u:%u", &preset, &wallpaper_opacity,
                    &panel_opacity, &hud_opacity) != 4) {
@@ -1933,6 +2286,14 @@ void app_main(void)
         serial_emit("WARN,OFFLINE_STORAGE_INIT_FAILED,%s", esp_err_to_name(offline_result));
     }
 
+    esp_err_t media_store_result = media_store_init();
+    if (media_store_result != ESP_OK) {
+        ESP_LOGW(TAG, "Current media storage unavailable: %s",
+                 esp_err_to_name(media_store_result));
+        serial_emit("WARN,MEDIA_STORAGE_INIT_FAILED,%s",
+                    esp_err_to_name(media_store_result));
+    }
+
     esp_err_t display_result = display_init();
     if (display_result != ESP_OK) {
         ESP_LOGE(TAG, "Display init failed: %s", esp_err_to_name(display_result));
@@ -1966,6 +2327,8 @@ void app_main(void)
     xTaskCreate(sampling_task, "motion_sampling", 4096, NULL, 9, NULL);
     xTaskCreate(display_task, "display_state", 4096, NULL, 4, NULL);
     xTaskCreate(input_task, "input_hub", 3072, NULL, 5, NULL);
+    xTaskCreate(media_playback_task, "media_playback", 4096, NULL, 5, NULL);
+    if (media_store_clip_available()) labcapsule_media_clip_start();
 
     esp_err_t connectivity_result = connectivity_start();
     if (connectivity_result == ESP_OK) {

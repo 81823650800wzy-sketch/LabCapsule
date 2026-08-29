@@ -6,7 +6,8 @@
 
 #include "esp_err.h"
 
-#define LABCAPSULE_VERSION "0.6.0-alpha"
+#define LABCAPSULE_VERSION "0.7.0-alpha"
+#define LABCAPSULE_MEDIA_MAX_FPS 8U
 
 typedef enum {
     LABCAPSULE_MEDIA_RAW565 = 0,
@@ -37,6 +38,13 @@ esp_err_t labcapsule_media_region_begin(size_t payload_size, uint16_t x, uint16_
 esp_err_t labcapsule_media_frame_write(const uint8_t *data, size_t length);
 esp_err_t labcapsule_media_frame_finish(uint32_t duration_ms);
 void labcapsule_media_frame_abort(void);
+
+/** Control the one persisted device-side GIF/video clip. */
+esp_err_t labcapsule_media_clip_start(void);
+void labcapsule_media_clip_stop(void);
+esp_err_t labcapsule_media_clip_set_fps(uint8_t fps);
+bool labcapsule_media_clip_playing(void);
+uint8_t labcapsule_media_clip_fps(void);
 
 /** Set PWM backlight brightness in the inclusive 0..100 range. */
 esp_err_t labcapsule_set_brightness(uint8_t percent);

@@ -13,6 +13,7 @@
 
 esp_err_t wallpaper_init(void);
 bool wallpaper_available(void);
+esp_err_t wallpaper_clear(void);
 esp_err_t wallpaper_upload_begin(size_t payload_size);
 esp_err_t wallpaper_upload_write(const uint8_t *data, size_t length);
 esp_err_t wallpaper_upload_finish(void);

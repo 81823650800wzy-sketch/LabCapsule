@@ -69,6 +69,12 @@ bool wallpaper_available(void)
            header_valid(&header);
 }
 
+esp_err_t wallpaper_clear(void)
+{
+    if (!s_partition) return ESP_ERR_INVALID_STATE;
+    return esp_partition_erase_range(s_partition, 0, WALLPAPER_DATA_OFFSET);
+}
+
 esp_err_t wallpaper_upload_begin(size_t payload_size)
 {
     if (!s_partition || payload_size != WALLPAPER_PAYLOAD_BYTES || s_upload_active) {

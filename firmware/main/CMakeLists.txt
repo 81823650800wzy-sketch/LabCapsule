@@ -4,6 +4,7 @@ idf_component_register(
         "connectivity.c"
         "device_config.c"
         "input_hub.c"
+        "media_store.c"
         "offline_store.c"
         "sensor_hub.c"
         "wallpaper.c"
