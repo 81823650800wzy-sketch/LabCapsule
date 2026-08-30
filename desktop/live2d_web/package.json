@@ -1,0 +1,19 @@
+{
+  "name": "labcapsule-live2d-stage",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "build": "esbuild src/player.js --bundle --minify --format=iife --outfile=dist/player.bundle.js"
+  },
+  "dependencies": {
+    "@pixi/unsafe-eval": "6.5.10",
+    "pixi-live2d-display": "0.4.0",
+    "pixi.js": "6.5.10"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.9"
+  },
+  "overrides": {
+    "gh-pages": "6.3.0"
+  }
+}

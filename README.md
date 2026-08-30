@@ -2,7 +2,19 @@
 
 > Ask a question. Run an experiment.
 
-LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前版本为 **V0.9.0 Alpha / Network Avatar（Desktop First）**，已经打通“自然语言问题 → 实验协议 → 六轴采集 → 在线直传或离线缓存 → CSV/分析”，并加入可精确检查的实时曲线、理解设备上下文的 AI 桌宠和安全的网络形象导入。V0.9.0 桌面端继续兼容 V0.7 固件与 Android APK。
+LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前版本为 **V0.10.0 Alpha / Unified Pet Package（Desktop First）**，已经打通“自然语言问题 → 实验协议 → 六轴采集 → 在线直传或离线缓存 → CSV/分析”，并加入可精确检查的实时曲线、理解设备上下文的 AI 桌宠和可移植统一桌宠角色包。V0.10.0 桌面端继续兼容 V0.7 固件与 Android APK。
+
+## V0.10.0 新增
+
+- 新增桌宠角色包 V1：一个文件夹统一名称、人格、欢迎语和唯一主形象，AI 主舞台、桌面悬浮层与屏幕工作室不再分别选择角色。
+- 应用可直接选择一个桌宠文件夹，或扫描其第一层包含多个角色包的桌宠库；只有一张 PNG/JPG/WebP/GIF 的文件夹也可零配置识别。
+- Live2D Cubism `model3.json` 文件夹可零配置识别，运行前校验 moc3、PNG 纹理、physics/pose/display-info 与 motion3 依赖；独立 WebGL 舞台和透明置顶悬浮舞台共用同一动态模型。
+- LabCapsule 不分发 Cubism Core；首次播放由用户本人确认适用条款后，才从 Live2D 官方地址加载固定版本 Core。第三方样本模型不会进入仓库、EXE 或 Release。
+- 自动扫描 `%APPDATA%\LabCapsule\pets`、仓库 `pets` 和 EXE 同级 `pets`；选择会持久化并在启动时重新校验，文件失效时安全回退。
+- 新增仓库 Skill `skills/labcapsule-pet-creator`，包含图片/GIF/Live2D 创建与验证脚本、角色包规范和分层测试清单；创建过程拒绝覆盖非空目录。
+- 新增机器可读 JSON Schema、非法 UTF-8/路径逃逸/重复 ID 隔离、统一形象 GUI 烟雾测试和完整中文验收手册。
+
+完整制作、安装与测试步骤见 [V0.10.0 统一桌宠测试手册](docs/V0.10.0_UNIFIED_PET_PACKAGE_TEST_ZH.md)。
 
 ## V0.9.0 新增
 
@@ -144,6 +156,7 @@ desktop/                 Windows 可视化控制器、媒体处理器与 EXE 构
 firmware/                ESP-IDF 5.5 固件、分区表和默认配置
 docs/                    架构、使用指南和开发日志
 release/                 可发布 APK、OTA bin 与校验值
+skills/                  可复用的桌宠角色包制作与验收 Skill
 SPEC_V0.1.md             初始产品规格（历史基线）
 ```
 

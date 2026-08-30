@@ -4,3 +4,4 @@ Pillow>=10,<13
 imageio>=2.34,<3
 imageio-ffmpeg>=0.5,<1
 winsdk>=1.0.0b10; platform_system == "Windows"
+pywebview>=5,<7; platform_system == "Windows"

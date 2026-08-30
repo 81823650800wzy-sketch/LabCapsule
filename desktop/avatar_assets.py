@@ -126,6 +126,29 @@ def _inspect_image(blob: bytes) -> tuple[str, int, int, int]:
         raise ValueError(f"文件不是可解码的图片：{error}") from error
 
 
+def inspect_local_avatar(path: str | Path) -> AvatarAsset:
+    """Validate a local image with the same limits used for network avatars."""
+    source = Path(path).expanduser().resolve()
+    if not source.is_file():
+        raise ValueError("桌宠主形象文件不存在")
+    size = source.stat().st_size
+    if size < 1:
+        raise ValueError("桌宠主形象为空文件")
+    if size > MAX_DOWNLOAD_BYTES:
+        raise ValueError(f"桌宠主形象超过 {MAX_DOWNLOAD_BYTES // 1024 // 1024} MiB 上限")
+    blob = source.read_bytes()
+    image_format, width, height, frames = _inspect_image(blob)
+    content_types = {
+        "PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp", "GIF": "image/gif",
+    }
+    return AvatarAsset(
+        path=str(source), source_url="", final_url="",
+        sha256=hashlib.sha256(blob).hexdigest(), format=image_format,
+        content_type=content_types[image_format], bytes=len(blob),
+        width=width, height=height, frames=frames,
+    )
+
+
 def download_avatar(
     url: str,
     cache_dir: str | Path = AVATAR_CACHE_DIR,

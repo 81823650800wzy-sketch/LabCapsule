@@ -13,6 +13,8 @@ import math
 from pathlib import Path
 import queue
 import re
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -31,9 +33,12 @@ from avatar_assets import (AVATAR_CACHE_DIR, DICEBEAR_CC0_PRESETS, DecodedAvatar
 from interactive_chart import InteractiveMotionChart
 from media_codec import HEIGHT, MAX_FPS, WIDTH, build_media, compose_frame, load_frames
 from pet_agent import CharacterProfile, PetAgentRuntime, PetAvatarCanvas, PetOverlay, PetReply, PetSettings
+from pet_packages import (PET_SELECTION_PATH, PetPackage, avatar_asset_for_package, clear_selected_pet,
+                          discover_pet_packages, save_selected_pet, selected_pet_package)
+from live2d_runtime import has_live2d_consent, player_command, save_live2d_consent
 
 
-APP_VERSION = "0.9.0"
+APP_VERSION = "0.10.0"
 BAUD_RATE = 460800
 ROOT = Path(__file__).resolve().parent
 
@@ -237,6 +242,9 @@ class Studio(tk.Tk):
         self.pet_settings = PetSettings.load()
         self.pet_runtime = PetAgentRuntime(self.pet_settings)
         self.pet_overlay: PetOverlay | None = None
+        self.active_pet_package: PetPackage | None = None
+        self.live2d_processes: list[tuple[str, subprocess.Popen]] = []
+        self.live2d_license_window: tk.Toplevel | None = None
         self.pet_emotion = "idle"
         self.avatar_decoded: DecodedAvatar | None = None
         self.avatar_library_window: tk.Toplevel | None = None
@@ -244,10 +252,12 @@ class Studio(tk.Tk):
         self.avatar_url_var = tk.StringVar(value=self.pet_settings.avatar_url)
         self.avatar_seed_var = tk.StringVar(value="LabCapsule")
         self.avatar_preset_var = tk.StringVar(value=next(iter(DICEBEAR_CC0_PRESETS)))
+        self.pet_package_var = tk.StringVar()
+        self.pet_package_choices: dict[str, PetPackage] = {}
         self._style()
         self._layout()
         self.refresh_ports()
-        self.after(150, self._restore_cached_avatar)
+        self.after(150, self._restore_selected_pet_or_avatar)
         self.after(50, self._pump)
         self.after(1000, self._heartbeat)
 
@@ -506,7 +516,7 @@ class Studio(tk.Tk):
         self.pet_avatar_source_label = ttk.Label(
             avatar_card, text="形象：内置矢量 · 本机渲染", style="Muted.TLabel", wraplength=230)
         self.pet_avatar_source_label.pack(anchor="center", pady=(0, 5))
-        ttk.Button(avatar_card, text="网络形象库 / URL", style="Accent.TButton",
+        ttk.Button(avatar_card, text="统一桌宠管理", style="Accent.TButton",
                    command=self.show_avatar_library).pack(fill="x", pady=3)
         ttk.Button(avatar_card, text="将当前形象送到屏幕工作室",
                    command=self.send_avatar_to_screen_studio).pack(fill="x", pady=3)
@@ -583,22 +593,54 @@ class Studio(tk.Tk):
             return
         window = tk.Toplevel(self)
         self.avatar_library_window = window
-        window.title("网络形象库 · 安全导入")
-        window.geometry("660x690")
-        window.minsize(590, 620)
+        window.title("统一桌宠管理 · 文件夹与网络")
+        window.geometry("680x700")
+        window.minsize(610, 560)
         window.configure(bg=self.BG)
         window.transient(self)
         window.protocol("WM_DELETE_WINDOW", self._close_avatar_library)
 
-        header = tk.Frame(window, bg=self.BG, padx=18, pady=14)
+        shell = tk.Frame(window, bg=self.BG)
+        shell.pack(fill="both", expand=True)
+        canvas = tk.Canvas(shell, bg=self.BG, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(shell, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        content = tk.Frame(canvas, bg=self.BG)
+        content_window = canvas.create_window((0, 0), window=content, anchor="nw")
+        content.bind("<Configure>", lambda _event: canvas.configure(
+            scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(
+            content_window, width=event.width))
+        window.bind("<MouseWheel>", lambda event: canvas.yview_scroll(
+            -1 if event.delta > 0 else 1, "units"))
+
+        header = tk.Frame(content, bg=self.BG, padx=18, pady=10)
         header.pack(fill="x")
-        tk.Label(header, text="NETWORK AVATAR / LIBRARY", bg=self.BG, fg=self.INK,
+        tk.Label(header, text="UNIFIED PET / LIBRARY", bg=self.BG, fg=self.INK,
                  font=("Bahnschrift", 17, "bold")).pack(anchor="w")
-        tk.Label(header, text="下载、解码和缩放都在电脑端完成；不会给形象文件代码执行权限。",
+        tk.Label(header, text="一个角色包统一 AI 身份与桌面舞台；图片/GIF 可交给 240×320 屏幕工作室。",
                  bg=self.BG, fg=self.CYAN, font=("Microsoft YaHei UI", 9)).pack(anchor="w", pady=(4, 0))
 
-        preset = ttk.LabelFrame(window, text="通用预设 · DiceBear CC0", style="Card.TLabelframe")
-        preset.pack(fill="x", padx=18, pady=6)
+        local = ttk.LabelFrame(content, text="本地统一桌宠角色包", style="Card.TLabelframe")
+        local.pack(fill="x", padx=18, pady=4)
+        self.pet_package_box = ttk.Combobox(local, textvariable=self.pet_package_var,
+                                            state="readonly")
+        self.pet_package_box.pack(fill="x")
+        local_buttons = tk.Frame(local, bg=self.PANEL)
+        local_buttons.pack(fill="x", pady=(7, 0))
+        ttk.Button(local_buttons, text="选择桌宠 / 库文件夹", style="Accent.TButton",
+                   command=self.choose_pet_package_folder).pack(side="left")
+        ttk.Button(local_buttons, text="应用所选统一桌宠",
+                   command=self.apply_selected_pet_package).pack(side="left", padx=6)
+        self.pet_package_status = ttk.Label(
+            local, text="可选择含 pet.json 的桌宠文件夹，或包含多个桌宠子文件夹的库。",
+            style="Muted.TLabel", wraplength=610)
+        self.pet_package_status.pack(anchor="w", pady=(6, 0))
+
+        preset = ttk.LabelFrame(content, text="通用预设 · DiceBear CC0", style="Card.TLabelframe")
+        preset.pack(fill="x", padx=18, pady=4)
         ttk.Combobox(preset, textvariable=self.avatar_preset_var,
                      values=tuple(DICEBEAR_CC0_PRESETS), state="readonly").pack(fill="x")
         seed_row = tk.Frame(preset, bg=self.PANEL)
@@ -609,8 +651,8 @@ class Studio(tk.Tk):
         ttk.Button(seed_row, text="生成并应用", style="Accent.TButton",
                    command=self.apply_dicebear_avatar).pack(side="left")
 
-        direct = ttk.LabelFrame(window, text="任意网络图片直链", style="Card.TLabelframe")
-        direct.pack(fill="x", padx=18, pady=6)
+        direct = ttk.LabelFrame(content, text="任意网络图片直链", style="Card.TLabelframe")
+        direct.pack(fill="x", padx=18, pady=4)
         ttk.Entry(direct, textvariable=self.avatar_url_var).pack(fill="x")
         direct_buttons = tk.Frame(direct, bg=self.PANEL)
         direct_buttons.pack(fill="x", pady=(8, 0))
@@ -627,11 +669,11 @@ class Studio(tk.Tk):
             style="Muted.TLabel", wraplength=590)
         self.avatar_library_status.pack(anchor="w")
 
-        resources = ttk.LabelFrame(window, text="官方形象与授权入口", style="Card.TLabelframe")
-        resources.pack(fill="both", expand=True, padx=18, pady=6)
+        resources = ttk.LabelFrame(content, text="官方形象与授权入口", style="Card.TLabelframe")
+        resources.pack(fill="x", padx=18, pady=(4, 18))
         ttk.Label(resources,
-                  text="CC0 预设可直接生成稳定 PNG。VRoid / Live2D 必须逐个检查模型条款；"
-                       "当前版本接受它们导出的 PNG、WebP 或 GIF，不直接运行 VRM / moc3。",
+                  text="CC0 预设可直接生成稳定 PNG。Live2D 可直接识别 model3.json / moc3 / "
+                       "motion3.json 运行时资源；首次运行前须由用户确认 Cubism SDK 条款。",
                   style="Muted.TLabel", wraplength=590).pack(anchor="w", pady=(0, 8))
         links = (
             ("DiceBear 风格目录", "https://www.dicebear.com/styles/"),
@@ -639,9 +681,13 @@ class Studio(tk.Tk):
             ("VRoid Studio", "https://vroid.com/en/studio"),
             ("VRoid Hub", "https://hub.vroid.com/en"),
             ("Live2D 示例与条款", "https://www.live2d.com/en/learn/sample/"),
-            ("LabCapsule 网络形象说明",
+            ("Live2D 文件类型", "https://docs.live2d.com/en/cubism-editor-manual/"
+                                "file-type-and-extension/"),
+            ("Cubism SDK 许可", "https://www.live2d.com/en/sdk/license/"),
+            ("可扩展应用许可", "https://www.live2d.com/en/sdk/license/expandable/"),
+            ("LabCapsule 统一桌宠手册",
              "https://github.com/81823650800wzy-sketch/LabCapsule/blob/main/docs/"
-             "V0.9.0_NETWORK_AVATAR_GUIDE_ZH.md"),
+             "V0.10.0_UNIFIED_PET_PACKAGE_TEST_ZH.md"),
         )
         link_grid = tk.Frame(resources, bg=self.PANEL)
         link_grid.pack(fill="x")
@@ -649,12 +695,37 @@ class Studio(tk.Tk):
             ttk.Button(link_grid, text=label,
                        command=lambda target=url: webbrowser.open(target)).grid(
                            row=index // 3, column=index % 3, sticky="ew", padx=3, pady=3)
+        ttk.Button(link_grid, text="Live2D 播放层第三方许可",
+                   command=self._show_live2d_notices).grid(
+                       row=len(links) // 3, column=len(links) % 3,
+                       sticky="ew", padx=3, pady=3)
         for index in range(3):
             link_grid.columnconfigure(index, weight=1)
         ttk.Label(resources,
                   text="安全提示：请粘贴图片文件本身的地址，不要粘贴网页、ZIP 或带账户凭据的链接。"
                        "下载失败时，已缓存的当前形象不会被覆盖。",
                   style="Muted.TLabel", wraplength=590).pack(anchor="w", pady=(10, 0))
+        self._scan_default_pet_folders()
+
+    def _show_live2d_notices(self):
+        notice_path = ROOT / "live2d_web" / "THIRD_PARTY_NOTICES.md"
+        try:
+            contents = notice_path.read_text(encoding="utf-8")
+        except OSError as error:
+            messagebox.showerror("无法读取第三方许可", str(error))
+            return
+        window = tk.Toplevel(self)
+        window.title("Live2D 播放层第三方许可")
+        window.geometry("720x600")
+        window.configure(bg=self.BG)
+        text_box = tk.Text(window, bg="#0f141c", fg=self.INK, insertbackground=self.INK,
+                           wrap="word", padx=16, pady=16, font=("Consolas", 9))
+        text_box.insert("1.0", contents)
+        text_box.configure(state="disabled")
+        scrollbar = ttk.Scrollbar(window, orient="vertical", command=text_box.yview)
+        text_box.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        text_box.pack(fill="both", expand=True)
 
     def _close_avatar_library(self):
         if self.avatar_library_window is not None:
@@ -667,6 +738,268 @@ class Studio(tk.Tk):
             self.avatar_library_status.configure(text=text)
             if progress is not None:
                 self.avatar_progress["value"] = progress
+
+    def _set_pet_package_choices(self, packages: list[PetPackage], errors: list[str],
+                                 source: str):
+        self.pet_package_choices = {package.display_name: package for package in packages}
+        values = tuple(self.pet_package_choices)
+        self.pet_package_box["values"] = values
+        if values:
+            self.pet_package_var.set(values[0])
+            detail = f"识别到 {len(values)} 个桌宠 · {source}"
+        else:
+            self.pet_package_var.set("")
+            detail = f"未识别到桌宠 · {source}"
+        if errors:
+            detail += "；" + "；".join(errors[:3])
+        self.pet_package_status.configure(text=detail)
+
+    def _scan_default_pet_folders(self):
+        roots = [PET_SELECTION_PATH.parent / "pets", ROOT.parent / "pets"]
+        if getattr(sys, "frozen", False):
+            roots.append(Path(sys.executable).resolve().parent / "pets")
+        selected = selected_pet_package()
+        if selected is not None:
+            roots.insert(0, Path(selected.folder).parent)
+        packages: list[PetPackage] = []
+        errors: list[str] = []
+        seen: set[tuple[str, str]] = set()
+        for root in roots:
+            if not root.is_dir():
+                continue
+            found, found_errors = discover_pet_packages(root)
+            for package in found:
+                key = package.package_id, package.folder
+                if key not in seen:
+                    seen.add(key)
+                    packages.append(package)
+            errors.extend(found_errors)
+        self._set_pet_package_choices(packages, errors, "默认桌宠目录")
+        if selected is not None:
+            match = next((label for label, package in self.pet_package_choices.items()
+                          if package.package_id == selected.package_id
+                          and package.folder == selected.folder), None)
+            if match:
+                self.pet_package_var.set(match)
+
+    def choose_pet_package_folder(self):
+        folder = filedialog.askdirectory(title="选择桌宠角色包或桌宠库文件夹")
+        if not folder:
+            return
+        packages, errors = discover_pet_packages(folder)
+        self._set_pet_package_choices(packages, errors, folder)
+        if not packages:
+            messagebox.showwarning(
+                "没有可用桌宠",
+                "请选择包含 pet.json 的角色包，或仅含一个 PNG/JPG/WebP/GIF / "
+                "Live2D model3.json 的文件夹。")
+
+    def apply_selected_pet_package(self):
+        package = self.pet_package_choices.get(self.pet_package_var.get())
+        if package is None:
+            messagebox.showwarning("未选择桌宠", "请先选择桌宠文件夹并在列表中选择一个角色包。")
+            return
+        if self.avatar_download_active:
+            self.pet_package_status.configure(text="已有形象正在处理，请稍候。")
+            return
+        if package.visual_kind == "live2d":
+            self._apply_live2d_package(package)
+            return
+        self.avatar_download_active = True
+        self.pet_package_status.configure(text=f"正在校验并载入 {package.name}…")
+
+        def worker():
+            try:
+                asset = avatar_asset_for_package(package)
+                self.events.put(("pet_package_done", (package, decode_avatar(asset, 240))))
+            except Exception as error:
+                self.events.put(("pet_package_error", str(error)))
+
+        threading.Thread(target=worker, daemon=True, name="pet-package-load").start()
+
+    def _apply_pet_package_decoded(self, package: PetPackage, decoded: DecodedAvatar,
+                                   persist: bool = True):
+        self._stop_live2d_players()
+        clear_cached_avatar(AVATAR_CACHE_DIR)
+        self._apply_avatar_decoded(decoded, f"{package.name} · 统一角色包")
+        self.active_pet_package = package
+        self._apply_pet_package_profile(package)
+        if persist:
+            save_selected_pet(package)
+        license_text = f" · {package.license}" if package.license else ""
+        if hasattr(self, "pet_package_status"):
+            self.pet_package_status.configure(
+                text=f"已应用 {package.name} [{package.package_id}]{license_text}；"
+                     "三个舞台使用同一主形象。")
+        self._pet_append("event", f"统一桌宠“{package.name}”已应用：形象、名称、人格和欢迎语同步。")
+
+    def _apply_pet_package_profile(self, package: PetPackage):
+        profile = CharacterProfile(name=package.name, persona=package.persona,
+                                   greeting=package.greeting)
+        self.pet_settings.profile = profile
+        self.pet_settings.avatar_url = ""
+        self.pet_settings.avatar_source_name = package.name
+        self.pet_runtime.update_settings(self.pet_settings)
+        self.pet_name_var.set(profile.name)
+        self.pet_persona.delete("1.0", "end")
+        self.pet_persona.insert("1.0", profile.persona)
+
+    def _apply_live2d_package(self, package: PetPackage):
+        if has_live2d_consent():
+            self._activate_live2d_package(package)
+            return
+        self._show_live2d_consent(package)
+
+    def _show_live2d_consent(self, package: PetPackage):
+        if self.live2d_license_window is not None and self.live2d_license_window.winfo_exists():
+            self.live2d_license_window.deiconify()
+            self.live2d_license_window.lift()
+            return
+        window = tk.Toplevel(self)
+        self.live2d_license_window = window
+        window.title("启用 Live2D Cubism 运行时")
+        window.geometry("620x460")
+        window.minsize(560, 420)
+        window.configure(bg=self.BG)
+        window.transient(self)
+        window.grab_set()
+
+        def close_window():
+            if window.winfo_exists():
+                window.grab_release()
+                window.destroy()
+            self.live2d_license_window = None
+
+        window.protocol("WM_DELETE_WINDOW", close_window)
+        body = tk.Frame(window, bg=self.BG, padx=24, pady=20)
+        body.pack(fill="both", expand=True)
+        tk.Label(body, text="LIVE2D / RUNTIME CONSENT", bg=self.BG, fg=self.INK,
+                 font=("Bahnschrift", 18, "bold")).pack(anchor="w")
+        tk.Label(
+            body,
+            text=(f"即将用 Live2D Cubism Web 运行时打开“{package.name}”。\n\n"
+                  "LabCapsule 不随应用分发 Cubism Core；播放器会在启动时从 Live2D 官方地址"
+                  "载入固定版本 Core。模型文件只通过本机 127.0.0.1 提供，不上传到网络。\n\n"
+                  "Hiyori 等示例模型仍受各自条款约束；允许本机开发测试不等同于允许重新分发。"
+                  "若产品允许用户任意选择模型，正式发布前还需核对 Expandable Application 许可。"),
+            bg=self.BG, fg=self.MUTED, justify="left", wraplength=560,
+            font=("Microsoft YaHei UI", 10)).pack(anchor="w", pady=(14, 12))
+        links = tk.Frame(body, bg=self.BG)
+        links.pack(fill="x")
+        for label, url in (
+            ("查看文件类型手册", "https://docs.live2d.com/en/cubism-editor-manual/"
+                                 "file-type-and-extension/"),
+            ("查看 SDK 许可", "https://www.live2d.com/en/sdk/license/"),
+            ("查看可扩展应用许可", "https://www.live2d.com/en/sdk/license/expandable/"),
+        ):
+            ttk.Button(links, text=label, command=lambda target=url: webbrowser.open(target)).pack(
+                side="left", padx=(0, 6))
+        accepted = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            body, variable=accepted,
+            text="我已阅读并同意适用于当前开发测试的 Live2D / Cubism 条款，且有权使用所选模型",
+        ).pack(anchor="w", pady=(18, 8))
+        feedback = ttk.Label(body, text="必须由你亲自勾选后才能启用。",
+                             style="Muted.TLabel")
+        feedback.pack(anchor="w")
+
+        def confirm():
+            if not accepted.get():
+                feedback.configure(text="尚未勾选确认；播放器没有启动。", foreground=self.RED)
+                return
+            try:
+                save_live2d_consent()
+            except Exception as error:
+                messagebox.showerror("无法保存许可确认", str(error), parent=window)
+                return
+            close_window()
+            self._activate_live2d_package(package)
+
+        actions = tk.Frame(body, bg=self.BG)
+        actions.pack(fill="x", side="bottom")
+        ttk.Button(actions, text="取消", command=close_window).pack(side="right")
+        ttk.Button(actions, text="确认并启动", style="Accent.TButton",
+                   command=confirm).pack(side="right", padx=8)
+
+    def _activate_live2d_package(self, package: PetPackage, persist: bool = True,
+                                 autolaunch: bool = True):
+        if package.visual_kind != "live2d" or not package.live2d_model_path:
+            raise ValueError("角色包不是有效的 Live2D 运行时模型")
+        self._stop_live2d_players()
+        clear_cached_avatar(AVATAR_CACHE_DIR)
+        self.avatar_decoded = None
+        self.active_pet_package = package
+        self.pet_avatar.clear_custom_avatar()
+        if self.pet_overlay is not None:
+            self.pet_overlay.destroy()
+            self.pet_overlay = None
+        self._apply_pet_package_profile(package)
+        self.avatar_url_var.set("")
+        self.pet_avatar_source_label.configure(
+            text=f"形象：Live2D · {package.live2d_motion_count} 个动作 · 独立 GPU 舞台")
+        if persist:
+            save_selected_pet(package)
+        if hasattr(self, "pet_package_status"):
+            self.pet_package_status.configure(
+                text=f"已应用 {package.name} [{package.package_id}] · Live2D · "
+                     f"{package.live2d_motion_count} 个动作")
+        self._set_avatar_status("Live2D 模型已通过路径和依赖校验；运行时仅监听本机。", 100)
+        self._set_pet_state("happy", "LIVE2D READY")
+        self._pet_append("event", f"Live2D 桌宠“{package.name}”已应用；点击模型可触发动作。")
+        if autolaunch:
+            self._launch_live2d_player(package, "stage")
+
+    def _cleanup_live2d_processes(self):
+        self.live2d_processes = [item for item in self.live2d_processes
+                                 if item[1].poll() is None]
+
+    def _launch_live2d_player(self, package: PetPackage, mode: str):
+        self._cleanup_live2d_processes()
+        try:
+            command = player_command(package.live2d_model_path, mode, ROOT, sys.executable)
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            process = subprocess.Popen(command, creationflags=flags)
+            self.live2d_processes.append((mode, process))
+            self._append_log(f"> Live2D {mode} 已启动：{package.name}")
+        except Exception as error:
+            messagebox.showerror("Live2D 播放器启动失败", str(error))
+
+    def _stop_live2d_players(self, mode: str | None = None):
+        kept: list[tuple[str, subprocess.Popen]] = []
+        for player_mode, process in self.live2d_processes:
+            if process.poll() is not None:
+                continue
+            if mode is None or player_mode == mode:
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+            else:
+                kept.append((player_mode, process))
+        self.live2d_processes = kept
+
+    def _restore_selected_pet_or_avatar(self):
+        package = selected_pet_package()
+        if package is None:
+            self._restore_cached_avatar()
+            return
+
+        if package.visual_kind == "live2d":
+            if has_live2d_consent():
+                self._activate_live2d_package(package, persist=False)
+            else:
+                self._append_log("! 已保存 Live2D 桌宠等待用户确认 Cubism 条款")
+                self._restore_cached_avatar()
+            return
+
+        def worker():
+            try:
+                asset = avatar_asset_for_package(package)
+                self.events.put(("pet_package_restore_done", (package, decode_avatar(asset, 240))))
+            except Exception as error:
+                self.events.put(("pet_package_restore_error", str(error)))
+
+        threading.Thread(target=worker, daemon=True, name="pet-package-restore").start()
 
     def apply_dicebear_avatar(self):
         label = self.avatar_preset_var.get()
@@ -724,8 +1057,11 @@ class Studio(tk.Tk):
         self._set_pet_state("happy", "AVATAR READY")
 
     def restore_vector_avatar(self):
+        self._stop_live2d_players()
         clear_cached_avatar(AVATAR_CACHE_DIR)
+        clear_selected_pet()
         self.avatar_decoded = None
+        self.active_pet_package = None
         self.avatar_url_var.set("")
         self.pet_settings.avatar_url = ""
         self.pet_settings.avatar_source_name = "内置矢量形象"
@@ -737,6 +1073,12 @@ class Studio(tk.Tk):
         self._set_pet_state("idle", "VECTOR AVATAR")
 
     def send_avatar_to_screen_studio(self):
+        if self.active_pet_package is not None and self.active_pet_package.visual_kind == "live2d":
+            messagebox.showinfo(
+                "Live2D 与设备屏幕",
+                "ESP32-S3 屏幕不能直接运行 moc3。请从 Live2D 编辑器导出或录制已授权的 GIF / "
+                "序列帧，再由屏幕工作室裁剪、压缩并写入设备。")
+            return
         if self.avatar_decoded is None:
             messagebox.showinfo("当前是内置形象",
                                 "内置矢量形象不是媒体文件。请先下载网络 PNG / GIF 形象。")
@@ -806,6 +1148,10 @@ class Studio(tk.Tk):
             self.pet_overlay.set_state(emotion, caption)
 
     def show_pet_overlay(self):
+        if self.active_pet_package is not None and self.active_pet_package.visual_kind == "live2d":
+            self._launch_live2d_player(self.active_pet_package, "overlay")
+            self.pet_overlay_button.configure(text="关闭 Live2D 悬浮舞台")
+            return
         if self.pet_overlay is None:
             self.pet_overlay = PetOverlay(self, self.focus_pet_tab)
             if self.avatar_decoded is not None:
@@ -816,11 +1162,22 @@ class Studio(tk.Tk):
         self.pet_overlay_button.configure(text="隐藏桌面悬浮宠物")
 
     def hide_pet_overlay(self):
+        if self.active_pet_package is not None and self.active_pet_package.visual_kind == "live2d":
+            self._stop_live2d_players("overlay")
+            self.pet_overlay_button.configure(text="显示 Live2D 悬浮舞台")
+            return
         if self.pet_overlay is not None:
             self.pet_overlay.hide()
         self.pet_overlay_button.configure(text="显示桌面悬浮宠物")
 
     def toggle_pet_overlay(self):
+        if self.active_pet_package is not None and self.active_pet_package.visual_kind == "live2d":
+            self._cleanup_live2d_processes()
+            if any(mode == "overlay" for mode, _process in self.live2d_processes):
+                self.hide_pet_overlay()
+            else:
+                self.show_pet_overlay()
+            return
         if self.pet_overlay is None or self.pet_overlay.window.state() == "withdrawn":
             self.show_pet_overlay()
         else:
@@ -1132,6 +1489,9 @@ class Studio(tk.Tk):
                 elif kind == "avatar_done":
                     self.avatar_download_active = False
                     decoded, source_name = payload
+                    self._stop_live2d_players()
+                    self.active_pet_package = None
+                    clear_selected_pet()
                     self._apply_avatar_decoded(decoded, str(source_name))
                     self._pet_append("event", "网络形象已通过格式、尺寸和哈希校验，并保存为当前单份缓存。")
                 elif kind == "avatar_error":
@@ -1139,15 +1499,35 @@ class Studio(tk.Tk):
                     self._set_avatar_status(f"导入失败：{payload}（原形象保持不变）", 0)
                     messagebox.showerror("网络形象导入失败", str(payload))
                 elif kind == "avatar_restore_done":
+                    self.active_pet_package = None
                     self._apply_avatar_decoded(payload, "缓存网络形象")
                 elif kind == "avatar_restore_error":
                     self._append_log(f"! 网络形象缓存不可用：{payload}")
+                elif kind == "pet_package_done":
+                    self.avatar_download_active = False
+                    package, decoded = payload
+                    self._apply_pet_package_decoded(package, decoded)
+                elif kind == "pet_package_error":
+                    self.avatar_download_active = False
+                    if hasattr(self, "pet_package_status"):
+                        self.pet_package_status.configure(text=f"角色包载入失败：{payload}")
+                    messagebox.showerror("桌宠角色包载入失败", str(payload))
+                elif kind == "pet_package_restore_done":
+                    package, decoded = payload
+                    self._apply_pet_package_decoded(package, decoded, persist=False)
+                elif kind == "pet_package_restore_error":
+                    clear_selected_pet()
+                    self._append_log(f"! 已保存的桌宠角色包不可用：{payload}")
+                    self._restore_cached_avatar()
         except queue.Empty:
             pass
         self.after(50, self._pump)
 
     def close_app(self):
         self.link.close()
+        self._stop_live2d_players()
+        if self.live2d_license_window is not None and self.live2d_license_window.winfo_exists():
+            self.live2d_license_window.destroy()
         if self.avatar_library_window is not None and self.avatar_library_window.winfo_exists():
             self.avatar_library_window.destroy()
         if self.pet_overlay is not None:
@@ -1156,4 +1536,15 @@ class Studio(tk.Tk):
 
 
 if __name__ == "__main__":
+    if "--live2d-player" in sys.argv:
+        from live2d_player import run_player_guarded
+
+        marker = sys.argv.index("--live2d-player")
+        try:
+            model_argument = sys.argv[marker + 1]
+        except IndexError as error:
+            raise SystemExit("缺少 Live2D model3.json 路径") from error
+        mode_argument = "overlay" if "--mode" in sys.argv and sys.argv[
+            sys.argv.index("--mode") + 1] == "overlay" else "stage"
+        raise SystemExit(run_player_guarded(model_argument, mode_argument))
     Studio().mainloop()

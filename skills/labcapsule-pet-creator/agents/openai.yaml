@@ -1,0 +1,5 @@
+interface:
+  display_name: "LabCapsule 桌宠制作器"
+  short_description: "创建、校验并测试 LabCapsule 图片/GIF/Live2D 统一桌宠角色包"
+  brand_color: "#FACC15"
+  default_prompt: "Use $labcapsule-pet-creator to turn my image, GIF, or Live2D model3 runtime into a validated LabCapsule pet package."

@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/81823650800wzy-sketch/LabCapsule/main/docs/pet_package_v1.schema.json",
+  "title": "LabCapsule Pet Package V1",
+  "description": "Manifest for one portable LabCapsule unified desktop-pet package.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "id", "name"],
+  "oneOf": [
+    {
+      "required": ["avatar"],
+      "not": { "required": ["live2dModel"] }
+    },
+    {
+      "required": ["live2dModel"],
+      "not": { "required": ["avatar"] }
+    }
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "format": "uri"
+    },
+    "schemaVersion": {
+      "const": 1
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 24
+    },
+    "avatar": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255
+    },
+    "live2dModel": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255
+    },
+    "personaFile": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255
+    },
+    "greeting": {
+      "type": "string",
+      "maxLength": 160
+    },
+    "author": {
+      "type": "string",
+      "maxLength": 80
+    },
+    "license": {
+      "type": "string",
+      "maxLength": 120
+    },
+    "homepage": {
+      "type": "string",
+      "maxLength": 500
+    }
+  }
+}
