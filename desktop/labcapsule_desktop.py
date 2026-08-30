@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import csv
 from datetime import datetime
+import math
 from pathlib import Path
 import queue
 import re
@@ -28,9 +29,24 @@ from media_codec import HEIGHT, MAX_FPS, WIDTH, build_media, compose_frame, load
 from pet_agent import CharacterProfile, PetAgentRuntime, PetAvatarCanvas, PetOverlay, PetReply, PetSettings
 
 
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.8.1"
 BAUD_RATE = 460800
 ROOT = Path(__file__).resolve().parent
+
+
+def parse_motion_data_line(line: str):
+    """Validate one firmware DATA record before it reaches charts or CSV."""
+    parts = line.split(",")
+    if len(parts) < 8 or parts[0] != "DATA":
+        return None
+    try:
+        timestamp_us = int(parts[1])
+        values = tuple(float(value) for value in parts[2:8])
+    except ValueError:
+        return None
+    if not 0 <= timestamp_us <= 0xFFFFFFFFFFFFFFFF or not all(map(math.isfinite, values)):
+        return None
+    return parts[1:8], timestamp_us, values
 
 
 class SerialLink:
@@ -726,22 +742,18 @@ class Studio(tk.Tk):
             self.device_status.insert("end", line + "\n")
             self.device_status.see("end")
         if line.startswith("DATA,"):
-            parts = line.split(",")
-            if len(parts) >= 8:
-                self.samples.append(parts[1:8])
-                try:
-                    ax, ay, az = map(float, parts[2:5])
-                    gx, gy, gz = map(float, parts[5:8])
-                    self.last_sample = tuple(parts[1:8])
-                    self.motion_chart.add_sample(int(parts[1]), (ax, ay, az, gx, gy, gz))
-                    self.latest_sample.configure(text="  ".join(
-                        name + "=" + value for name, value in zip(
-                            ("t", "AX", "AY", "AZ", "GX", "GY", "GZ"), parts[1:8]
-                        )
-                    ))
-                    self.sample_label.configure(text=f"样本 {len(self.samples):,}")
-                except ValueError:
-                    pass
+            parsed = parse_motion_data_line(line)
+            if parsed is not None:
+                fields, timestamp_us, values = parsed
+                self.samples.append(fields)
+                self.last_sample = tuple(fields)
+                self.motion_chart.add_sample(timestamp_us, values)
+                self.latest_sample.configure(text="  ".join(
+                    name + "=" + value for name, value in zip(
+                        ("t", "AX", "AY", "AZ", "GX", "GY", "GZ"), fields
+                    )
+                ))
+                self.sample_label.configure(text=f"样本 {len(self.samples):,}")
 
     def _heartbeat(self):
         cpu = round(psutil.cpu_percent())

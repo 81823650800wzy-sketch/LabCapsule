@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "desktop"))
 
 from interactive_chart import InteractiveMotionChart, MotionPoint  # noqa: E402
+from labcapsule_desktop import parse_motion_data_line  # noqa: E402
 from pet_agent import PetAgentRuntime, PetSettings, _redact_secrets  # noqa: E402
 
 
@@ -28,6 +29,19 @@ class InteractiveChartTests(unittest.TestCase):
         self.assertEqual(max(item.ax for item in reduced), 100.0)
         self.assertIs(reduced[0], points[0])
         self.assertIs(reduced[-1], points[-1])
+
+
+class DataParserTests(unittest.TestCase):
+    def test_valid_motion_record(self):
+        fields, timestamp, values = parse_motion_data_line("DATA,1000,1,2,3,4,5,6")
+        self.assertEqual(timestamp, 1000)
+        self.assertEqual(fields, ["1000", "1", "2", "3", "4", "5", "6"])
+        self.assertEqual(values, (1.0, 2.0, 3.0, 4.0, 5.0, 6.0))
+
+    def test_corrupt_or_non_finite_motion_record_is_rejected(self):
+        self.assertIsNone(parse_motion_data_line("DATA,broken,1,2,3,4,5,6"))
+        self.assertIsNone(parse_motion_data_line("DATA,1,nan,2,3,4,5,6"))
+        self.assertIsNone(parse_motion_data_line("DATA,-1,1,2,3,4,5,6"))
 
 
 class PetRuntimeTests(unittest.TestCase):

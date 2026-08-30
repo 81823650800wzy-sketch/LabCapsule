@@ -1,6 +1,6 @@
-# LabCapsule Studio V0.8
+# LabCapsule Studio V0.8.1
 
-Windows 桌面伴侣通过 CH343 / USB Serial 连接设备，不会切换电脑 Wi-Fi，也不会连接设备的无网络热点。V0.8 先把交互式实验图表与 AI 桌宠落在电脑端；固件和 Android V0.7 可继续兼容使用。
+Windows 桌面伴侣通过 CH343 / USB Serial 连接设备，不会切换电脑 Wi-Fi，也不会连接设备的无网络热点。V0.8.1 先把交互式实验图表与 AI 桌宠落在电脑端，并增加损坏实验数据拦截；固件和 Android V0.7 可继续兼容使用。
 
 ## 主要能力
 
