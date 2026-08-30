@@ -2,7 +2,18 @@
 
 > Ask a question. Run an experiment.
 
-LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前版本为 **V0.8.1 Alpha / Interactive Data & AI Pet（Desktop First）**，已经打通“自然语言问题 → 实验协议 → 六轴采集 → 在线直传或离线缓存 → CSV/分析”，并加入可精确检查的实时曲线和理解设备上下文的电脑端 AI 桌宠。V0.8.1 桌面端继续兼容 V0.7 固件与 Android APK。
+LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前版本为 **V0.9.0 Alpha / Network Avatar（Desktop First）**，已经打通“自然语言问题 → 实验协议 → 六轴采集 → 在线直传或离线缓存 → CSV/分析”，并加入可精确检查的实时曲线、理解设备上下文的 AI 桌宠和安全的网络形象导入。V0.9.0 桌面端继续兼容 V0.7 固件与 Android APK。
+
+## V0.9.0 新增
+
+- AI 桌宠支持任意 HTTPS PNG/JPG/WebP/GIF 图片直链，并内置 DiceBear `Pixel Art / Lorelei / Thumbs / Shapes` 四个 CC0 预设和稳定种子生成。
+- 网络文件在电脑端执行 MIME/内容格式、12 MiB、2048²、像素、120 帧、总解码量和 SHA-256 检查；公网强制 HTTPS，失败不会覆盖旧形象。
+- 只缓存当前有效形象，退出软件后仍可自动恢复；GIF 使用文件自己的逐帧时间轴，最快 33 ms/帧，不依赖手机后台传帧。
+- 同一形象同步到 AI 主舞台与可拖动桌面悬浮层，并可一键载入 240×320 屏幕工作室，由用户确认裁剪与 USB 上传。
+- 形象库内提供 DiceBear、VRoid、VRoid Hub、Live2D 官方入口和授权提示；VRoid/Live2D 只接受预先导出的图片，不运行 VRM/moc3。
+- 新增网络、缓存、安全和 GUI 集成测试；继续回归实验数据、交互图表、AI 本地/在线兼容路径。
+
+完整说明和可直接复制的网址见 [V0.9.0 网络形象指南](docs/V0.9.0_NETWORK_AVATAR_GUIDE_ZH.md)。
 
 ## V0.8.1 回归修复
 

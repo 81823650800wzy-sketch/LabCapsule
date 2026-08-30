@@ -17,6 +17,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+import webbrowser
 import zlib
 
 import psutil
@@ -24,12 +25,15 @@ import serial
 from serial.tools import list_ports
 from PIL import Image, ImageTk
 
+from avatar_assets import (AVATAR_CACHE_DIR, DICEBEAR_CC0_PRESETS, DecodedAvatar,
+                           clear_cached_avatar, decode_avatar, dicebear_url,
+                           display_url, download_avatar, load_cached_avatar)
 from interactive_chart import InteractiveMotionChart
 from media_codec import HEIGHT, MAX_FPS, WIDTH, build_media, compose_frame, load_frames
 from pet_agent import CharacterProfile, PetAgentRuntime, PetAvatarCanvas, PetOverlay, PetReply, PetSettings
 
 
-APP_VERSION = "0.8.1"
+APP_VERSION = "0.9.0"
 BAUD_RATE = 460800
 ROOT = Path(__file__).resolve().parent
 
@@ -234,9 +238,16 @@ class Studio(tk.Tk):
         self.pet_runtime = PetAgentRuntime(self.pet_settings)
         self.pet_overlay: PetOverlay | None = None
         self.pet_emotion = "idle"
+        self.avatar_decoded: DecodedAvatar | None = None
+        self.avatar_library_window: tk.Toplevel | None = None
+        self.avatar_download_active = False
+        self.avatar_url_var = tk.StringVar(value=self.pet_settings.avatar_url)
+        self.avatar_seed_var = tk.StringVar(value="LabCapsule")
+        self.avatar_preset_var = tk.StringVar(value=next(iter(DICEBEAR_CC0_PRESETS)))
         self._style()
         self._layout()
         self.refresh_ports()
+        self.after(150, self._restore_cached_avatar)
         self.after(50, self._pump)
         self.after(1000, self._heartbeat)
 
@@ -485,16 +496,23 @@ class Studio(tk.Tk):
         self.pet.columnconfigure(2, weight=2)
         self.pet.rowconfigure(0, weight=1)
         avatar_card = self._card(self.pet, "角色舞台", 0, 0)
-        self.pet_avatar = PetAvatarCanvas(avatar_card, width=240, height=300,
+        self.pet_avatar = PetAvatarCanvas(avatar_card, width=240, height=230,
                                           background=self.PANEL,
                                           on_activate=self.show_pet_overlay)
         self.pet_avatar.pack(padx=4, pady=4)
         self.pet_state_label = ttk.Label(avatar_card, text="IDLE · 等待交互",
                                          style="Muted.TLabel")
         self.pet_state_label.pack(anchor="center", pady=4)
-        ttk.Button(avatar_card, text="显示桌面悬浮宠物", style="Accent.TButton",
-                   command=self.show_pet_overlay).pack(fill="x", pady=3)
-        ttk.Button(avatar_card, text="隐藏悬浮宠物", command=self.hide_pet_overlay).pack(fill="x", pady=3)
+        self.pet_avatar_source_label = ttk.Label(
+            avatar_card, text="形象：内置矢量 · 本机渲染", style="Muted.TLabel", wraplength=230)
+        self.pet_avatar_source_label.pack(anchor="center", pady=(0, 5))
+        ttk.Button(avatar_card, text="网络形象库 / URL", style="Accent.TButton",
+                   command=self.show_avatar_library).pack(fill="x", pady=3)
+        ttk.Button(avatar_card, text="将当前形象送到屏幕工作室",
+                   command=self.send_avatar_to_screen_studio).pack(fill="x", pady=3)
+        self.pet_overlay_button = ttk.Button(avatar_card, text="显示桌面悬浮宠物",
+                                             command=self.toggle_pet_overlay)
+        self.pet_overlay_button.pack(fill="x", pady=3)
         ttk.Label(avatar_card, text="拖动悬浮宠物移动；双击返回本页；右键隐藏。",
                   style="Muted.TLabel", wraplength=230).pack(anchor="w", pady=8)
 
@@ -538,7 +556,7 @@ class Studio(tk.Tk):
             ttk.Label(settings_card, text=title, style="Muted.TLabel").pack(anchor="w", pady=(5, 2))
             ttk.Entry(settings_card, textvariable=variable, show="•" if secret else "").pack(fill="x")
         ttk.Label(settings_card, text="角色设定", style="Muted.TLabel").pack(anchor="w", pady=(8, 2))
-        self.pet_persona = tk.Text(settings_card, height=6, bg="#0f141c", fg=self.INK,
+        self.pet_persona = tk.Text(settings_card, height=4, bg="#0f141c", fg=self.INK,
                                    insertbackground=self.INK, relief="flat", wrap="word",
                                    font=("Microsoft YaHei UI", 9))
         self.pet_persona.insert("1.0", self.pet_settings.profile.persona)
@@ -556,6 +574,179 @@ class Studio(tk.Tk):
                   text="模型没有系统命令权限；启动/中止实验、网络和固件操作始终由用户确认。",
                   style="Muted.TLabel", wraplength=285).pack(anchor="w", pady=8)
         self._pet_append("event", f"{self.pet_settings.profile.name}：{self.pet_settings.profile.greeting}")
+
+    def show_avatar_library(self):
+        if self.avatar_library_window is not None and self.avatar_library_window.winfo_exists():
+            self.avatar_library_window.deiconify()
+            self.avatar_library_window.lift()
+            self.avatar_library_window.focus_force()
+            return
+        window = tk.Toplevel(self)
+        self.avatar_library_window = window
+        window.title("网络形象库 · 安全导入")
+        window.geometry("660x690")
+        window.minsize(590, 620)
+        window.configure(bg=self.BG)
+        window.transient(self)
+        window.protocol("WM_DELETE_WINDOW", self._close_avatar_library)
+
+        header = tk.Frame(window, bg=self.BG, padx=18, pady=14)
+        header.pack(fill="x")
+        tk.Label(header, text="NETWORK AVATAR / LIBRARY", bg=self.BG, fg=self.INK,
+                 font=("Bahnschrift", 17, "bold")).pack(anchor="w")
+        tk.Label(header, text="下载、解码和缩放都在电脑端完成；不会给形象文件代码执行权限。",
+                 bg=self.BG, fg=self.CYAN, font=("Microsoft YaHei UI", 9)).pack(anchor="w", pady=(4, 0))
+
+        preset = ttk.LabelFrame(window, text="通用预设 · DiceBear CC0", style="Card.TLabelframe")
+        preset.pack(fill="x", padx=18, pady=6)
+        ttk.Combobox(preset, textvariable=self.avatar_preset_var,
+                     values=tuple(DICEBEAR_CC0_PRESETS), state="readonly").pack(fill="x")
+        seed_row = tk.Frame(preset, bg=self.PANEL)
+        seed_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(seed_row, text="角色种子", style="Muted.TLabel").pack(side="left")
+        ttk.Entry(seed_row, textvariable=self.avatar_seed_var).pack(side="left", fill="x",
+                                                                    expand=True, padx=8)
+        ttk.Button(seed_row, text="生成并应用", style="Accent.TButton",
+                   command=self.apply_dicebear_avatar).pack(side="left")
+
+        direct = ttk.LabelFrame(window, text="任意网络图片直链", style="Card.TLabelframe")
+        direct.pack(fill="x", padx=18, pady=6)
+        ttk.Entry(direct, textvariable=self.avatar_url_var).pack(fill="x")
+        direct_buttons = tk.Frame(direct, bg=self.PANEL)
+        direct_buttons.pack(fill="x", pady=(8, 0))
+        ttk.Button(direct_buttons, text="下载并应用", style="Accent.TButton",
+                   command=self.download_network_avatar).pack(side="left")
+        ttk.Button(direct_buttons, text="恢复内置矢量形象",
+                   command=self.restore_vector_avatar).pack(side="left", padx=6)
+        ttk.Button(direct_buttons, text="送到屏幕工作室",
+                   command=self.send_avatar_to_screen_studio).pack(side="left")
+        self.avatar_progress = ttk.Progressbar(direct, maximum=100)
+        self.avatar_progress.pack(fill="x", pady=(10, 3))
+        self.avatar_library_status = ttk.Label(
+            direct, text="支持 PNG / JPG / WebP / GIF；HTTPS；最大 12 MiB、2048²、120 帧。",
+            style="Muted.TLabel", wraplength=590)
+        self.avatar_library_status.pack(anchor="w")
+
+        resources = ttk.LabelFrame(window, text="官方形象与授权入口", style="Card.TLabelframe")
+        resources.pack(fill="both", expand=True, padx=18, pady=6)
+        ttk.Label(resources,
+                  text="CC0 预设可直接生成稳定 PNG。VRoid / Live2D 必须逐个检查模型条款；"
+                       "当前版本接受它们导出的 PNG、WebP 或 GIF，不直接运行 VRM / moc3。",
+                  style="Muted.TLabel", wraplength=590).pack(anchor="w", pady=(0, 8))
+        links = (
+            ("DiceBear 风格目录", "https://www.dicebear.com/styles/"),
+            ("DiceBear 许可证", "https://www.dicebear.com/licenses/"),
+            ("VRoid Studio", "https://vroid.com/en/studio"),
+            ("VRoid Hub", "https://hub.vroid.com/en"),
+            ("Live2D 示例与条款", "https://www.live2d.com/en/learn/sample/"),
+            ("LabCapsule 网络形象说明",
+             "https://github.com/81823650800wzy-sketch/LabCapsule/blob/main/docs/"
+             "V0.9.0_NETWORK_AVATAR_GUIDE_ZH.md"),
+        )
+        link_grid = tk.Frame(resources, bg=self.PANEL)
+        link_grid.pack(fill="x")
+        for index, (label, url) in enumerate(links):
+            ttk.Button(link_grid, text=label,
+                       command=lambda target=url: webbrowser.open(target)).grid(
+                           row=index // 3, column=index % 3, sticky="ew", padx=3, pady=3)
+        for index in range(3):
+            link_grid.columnconfigure(index, weight=1)
+        ttk.Label(resources,
+                  text="安全提示：请粘贴图片文件本身的地址，不要粘贴网页、ZIP 或带账户凭据的链接。"
+                       "下载失败时，已缓存的当前形象不会被覆盖。",
+                  style="Muted.TLabel", wraplength=590).pack(anchor="w", pady=(10, 0))
+
+    def _close_avatar_library(self):
+        if self.avatar_library_window is not None:
+            self.avatar_library_window.destroy()
+        self.avatar_library_window = None
+
+    def _set_avatar_status(self, text: str, progress: int | None = None):
+        if (self.avatar_library_window is not None
+                and self.avatar_library_window.winfo_exists()):
+            self.avatar_library_status.configure(text=text)
+            if progress is not None:
+                self.avatar_progress["value"] = progress
+
+    def apply_dicebear_avatar(self):
+        label = self.avatar_preset_var.get()
+        style = DICEBEAR_CC0_PRESETS.get(label)
+        if style is None:
+            messagebox.showwarning("预设无效", "请选择一个 DiceBear CC0 预设。")
+            return
+        self.avatar_url_var.set(dicebear_url(style, self.avatar_seed_var.get()))
+        self.download_network_avatar(label)
+
+    def download_network_avatar(self, source_name: str = "自定义网络形象"):
+        if self.avatar_download_active:
+            self._set_avatar_status("已有形象正在下载，请稍候。")
+            return
+        url = self.avatar_url_var.get().strip()
+        self.avatar_download_active = True
+        self._set_avatar_status("正在安全下载并检查图片…", 0)
+
+        def worker():
+            try:
+                asset = download_avatar(
+                    url, AVATAR_CACHE_DIR,
+                    progress=lambda value: self.events.put(("avatar_progress", value)))
+                decoded = decode_avatar(asset, 240)
+                self.events.put(("avatar_done", (decoded, source_name)))
+            except Exception as error:
+                self.events.put(("avatar_error", str(error)))
+
+        threading.Thread(target=worker, daemon=True, name="avatar-download").start()
+
+    def _restore_cached_avatar(self):
+        def worker():
+            asset = load_cached_avatar(AVATAR_CACHE_DIR)
+            if asset is None:
+                return
+            try:
+                self.events.put(("avatar_restore_done", decode_avatar(asset, 240)))
+            except Exception as error:
+                self.events.put(("avatar_restore_error", str(error)))
+        threading.Thread(target=worker, daemon=True, name="avatar-cache-load").start()
+
+    def _apply_avatar_decoded(self, decoded: DecodedAvatar, source_name: str):
+        self.avatar_decoded = decoded
+        self.pet_avatar.set_custom_avatar(decoded.frames, decoded.durations_ms)
+        if self.pet_overlay is not None:
+            self.pet_overlay.set_custom_avatar(decoded.frames, decoded.durations_ms)
+        self.pet_avatar_source_label.configure(
+            text=f"形象：{source_name} · {decoded.asset.format} / {decoded.asset.frames} 帧")
+        self.avatar_url_var.set(decoded.asset.source_url)
+        self.pet_settings.avatar_url = decoded.asset.source_url
+        self.pet_settings.avatar_source_name = source_name
+        self._set_avatar_status(
+            f"已应用：{decoded.asset.width}×{decoded.asset.height}、{decoded.asset.frames} 帧、"
+            f"{decoded.asset.bytes / 1024:.1f} KiB\n{display_url(decoded.asset.final_url)}", 100)
+        self._set_pet_state("happy", "AVATAR READY")
+
+    def restore_vector_avatar(self):
+        clear_cached_avatar(AVATAR_CACHE_DIR)
+        self.avatar_decoded = None
+        self.avatar_url_var.set("")
+        self.pet_settings.avatar_url = ""
+        self.pet_settings.avatar_source_name = "内置矢量形象"
+        self.pet_avatar.clear_custom_avatar()
+        if self.pet_overlay is not None:
+            self.pet_overlay.clear_custom_avatar()
+        self.pet_avatar_source_label.configure(text="形象：内置矢量 · 本机渲染")
+        self._set_avatar_status("已恢复内置矢量形象；网络缓存已清除。", 0)
+        self._set_pet_state("idle", "VECTOR AVATAR")
+
+    def send_avatar_to_screen_studio(self):
+        if self.avatar_decoded is None:
+            messagebox.showinfo("当前是内置形象",
+                                "内置矢量形象不是媒体文件。请先下载网络 PNG / GIF 形象。")
+            return
+        self.media_path = self.avatar_decoded.asset.path
+        self.pet_path = ""
+        self.media_label.configure(text=f"网络形象 · {Path(self.media_path).name}")
+        self.tabs.select(self.screen)
+        self.preview_media()
+        self.media_state.configure(text="网络形象已载入；确认预览后可通过 USB 上传，不会自动写入设备。")
 
     def refresh_ports(self):
         ports = list(list_ports.comports())
@@ -617,12 +808,23 @@ class Studio(tk.Tk):
     def show_pet_overlay(self):
         if self.pet_overlay is None:
             self.pet_overlay = PetOverlay(self, self.focus_pet_tab)
+            if self.avatar_decoded is not None:
+                self.pet_overlay.set_custom_avatar(self.avatar_decoded.frames,
+                                                   self.avatar_decoded.durations_ms)
         self.pet_overlay.set_state(self.pet_emotion, self.pet_settings.profile.name)
         self.pet_overlay.show()
+        self.pet_overlay_button.configure(text="隐藏桌面悬浮宠物")
 
     def hide_pet_overlay(self):
         if self.pet_overlay is not None:
             self.pet_overlay.hide()
+        self.pet_overlay_button.configure(text="显示桌面悬浮宠物")
+
+    def toggle_pet_overlay(self):
+        if self.pet_overlay is None or self.pet_overlay.window.state() == "withdrawn":
+            self.show_pet_overlay()
+        else:
+            self.hide_pet_overlay()
 
     def focus_pet_tab(self):
         self.deiconify()
@@ -640,6 +842,8 @@ class Studio(tk.Tk):
                 remember=self.pet_memory_var.get(),
                 sync_device=self.pet_sync_var.get(),
                 auto_react=self.pet_auto_var.get(),
+                avatar_url=self.avatar_url_var.get().strip(),
+                avatar_source_name=self.pet_settings.avatar_source_name,
                 profile=CharacterProfile(
                     name=self.pet_name_var.get().strip()[:24] or "胶囊零号",
                     persona=self.pet_persona.get("1.0", "end").strip()[:2400],
@@ -923,12 +1127,29 @@ class Studio(tk.Tk):
                     self._notice_command(title, body)
                 elif kind == "pet_reply":
                     self._handle_pet_reply(payload)
+                elif kind == "avatar_progress":
+                    self._set_avatar_status("正在下载并验证网络形象…", int(payload))
+                elif kind == "avatar_done":
+                    self.avatar_download_active = False
+                    decoded, source_name = payload
+                    self._apply_avatar_decoded(decoded, str(source_name))
+                    self._pet_append("event", "网络形象已通过格式、尺寸和哈希校验，并保存为当前单份缓存。")
+                elif kind == "avatar_error":
+                    self.avatar_download_active = False
+                    self._set_avatar_status(f"导入失败：{payload}（原形象保持不变）", 0)
+                    messagebox.showerror("网络形象导入失败", str(payload))
+                elif kind == "avatar_restore_done":
+                    self._apply_avatar_decoded(payload, "缓存网络形象")
+                elif kind == "avatar_restore_error":
+                    self._append_log(f"! 网络形象缓存不可用：{payload}")
         except queue.Empty:
             pass
         self.after(50, self._pump)
 
     def close_app(self):
         self.link.close()
+        if self.avatar_library_window is not None and self.avatar_library_window.winfo_exists():
+            self.avatar_library_window.destroy()
         if self.pet_overlay is not None:
             self.pet_overlay.destroy()
         self.destroy()

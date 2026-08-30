@@ -19,9 +19,12 @@ from pathlib import Path
 import random
 import re
 import tkinter as tk
+import time
 from typing import Callable
 from urllib import request
 from urllib.parse import urlparse
+
+from PIL import Image, ImageTk
 
 
 APP_DIR = Path(os.environ.get("APPDATA", Path.home())) / "LabCapsule"
@@ -99,6 +102,8 @@ class PetSettings:
     remember: bool = True
     sync_device: bool = True
     auto_react: bool = True
+    avatar_url: str = ""
+    avatar_source_name: str = "内置矢量形象"
     profile: CharacterProfile = field(default_factory=CharacterProfile)
 
     def validate(self) -> None:
@@ -127,7 +132,10 @@ class PetSettings:
                        temperature=float(raw.get("temperature", .65)),
                        remember=bool(raw.get("remember", True)),
                        sync_device=bool(raw.get("sync_device", True)),
-                       auto_react=bool(raw.get("auto_react", True)), profile=profile)
+                       auto_react=bool(raw.get("auto_react", True)),
+                       avatar_url=str(raw.get("avatar_url", ""))[:2048],
+                       avatar_source_name=str(raw.get("avatar_source_name", "内置矢量形象"))[:80],
+                       profile=profile)
         except Exception:
             return cls()
 
@@ -319,7 +327,7 @@ class PetAgentRuntime:
 
 
 class PetAvatarCanvas(tk.Canvas):
-    """Lightweight animated capsule body with blink and pointer gaze."""
+    """Animated capsule fallback plus validated PNG/WebP/GIF avatar playback."""
 
     COLORS = {
         "idle": "#67e8f9", "happy": "#facc15", "curious": "#a78bfa",
@@ -337,8 +345,45 @@ class PetAvatarCanvas(tk.Canvas):
         self.blink_until = 0
         self.tick_count = 0
         self.on_activate = on_activate
+        self._stage_width = width
+        self._stage_height = height
+        self._custom_photos: list[ImageTk.PhotoImage] = []
+        self._custom_sizes: list[tuple[int, int]] = []
+        self._custom_durations: list[int] = []
+        self._custom_index = 0
+        self._custom_deadline = 0.0
         self.bind("<Double-Button-1>", lambda _: on_activate() if on_activate else None)
-        self.after(60, self._tick)
+        self.after(33, self._tick)
+
+    @property
+    def has_custom_avatar(self) -> bool:
+        return bool(self._custom_photos)
+
+    def set_custom_avatar(self, frames: list[Image.Image], durations_ms: list[int]):
+        if not frames or len(frames) != len(durations_ms):
+            raise ValueError("形象帧与时间轴无效")
+        target_width = max(64, round(self._stage_width * .88))
+        target_height = max(64, round(self._stage_height * .70))
+        photos: list[ImageTk.PhotoImage] = []
+        sizes: list[tuple[int, int]] = []
+        for source in frames:
+            frame = source.copy()
+            frame.thumbnail((target_width, target_height), Image.Resampling.LANCZOS)
+            sizes.append(frame.size)
+            photos.append(ImageTk.PhotoImage(frame, master=self))
+        self._custom_photos = photos
+        self._custom_sizes = sizes
+        self._custom_durations = [max(33, min(2000, int(value))) for value in durations_ms]
+        self._custom_index = 0
+        self._custom_deadline = time.monotonic() + self._custom_durations[0] / 1000
+        self.draw_avatar()
+
+    def clear_custom_avatar(self):
+        self._custom_photos.clear()
+        self._custom_sizes.clear()
+        self._custom_durations.clear()
+        self._custom_index = 0
+        self.draw_avatar()
 
     def set_state(self, emotion: str, caption: str = ""):
         self.emotion = emotion if emotion in EMOTIONS else "idle"
@@ -349,18 +394,30 @@ class PetAvatarCanvas(tk.Canvas):
     def _tick(self):
         if not self.winfo_exists():
             return
-        self.phase += .16
+        self.phase += .088
         self.tick_count += 1
         if self.tick_count % random.randint(45, 75) == 0:
             self.blink_until = self.tick_count + 3
+        if len(self._custom_photos) > 1:
+            now = time.monotonic()
+            advances = 0
+            while now >= self._custom_deadline and advances < len(self._custom_photos):
+                self._custom_index = (self._custom_index + 1) % len(self._custom_photos)
+                self._custom_deadline += self._custom_durations[self._custom_index] / 1000
+                advances += 1
+            if now - self._custom_deadline > 2:
+                self._custom_deadline = now + self._custom_durations[self._custom_index] / 1000
         self.draw_avatar()
-        self.after(60, self._tick)
+        self.after(33, self._tick)
 
     def draw_avatar(self):
         self.delete("all")
         width, height = max(120, self.winfo_width()), max(170, self.winfo_height())
         accent = self.COLORS[self.emotion]
         bob = math.sin(self.phase) * (3 if self.emotion != "sleeping" else 1)
+        if self._custom_photos:
+            self._draw_custom_avatar(width, height, accent, bob)
+            return
         cx, cy = width / 2, height / 2 - 8 + bob
         body_w, body_h = min(142, width * .62), min(190, height * .68)
         left, right = cx - body_w / 2, cx + body_w / 2
@@ -408,6 +465,24 @@ class PetAvatarCanvas(tk.Canvas):
         self.create_text(cx, height - 12, text=self.emotion.upper(), fill="#94a3b8",
                          font=("Cascadia Mono", 8))
 
+    def _draw_custom_avatar(self, width: int, height: int, accent: str, bob: float):
+        cx = width / 2
+        photo = self._custom_photos[self._custom_index]
+        image_width, image_height = self._custom_sizes[self._custom_index]
+        cy = max(image_height / 2 + 8, height / 2 - 22 + bob)
+        radius_x = image_width / 2 + 8
+        radius_y = image_height / 2 + 8
+        self.create_oval(cx - radius_x, cy - radius_y, cx + radius_x, cy + radius_y,
+                         fill="#0b1017", outline=accent, width=2)
+        self.create_image(cx, cy, image=photo)
+        caption_y = height - 39
+        self.create_rectangle(12, caption_y - 13, width - 12, caption_y + 13,
+                              fill="#080a0d", outline=accent, width=1)
+        self.create_text(cx, caption_y, text=self.caption, fill=accent,
+                         font=("Cascadia Mono", 8, "bold"))
+        self.create_text(cx, height - 10, text=self.emotion.upper(), fill="#94a3b8",
+                         font=("Cascadia Mono", 8))
+
 
 class PetOverlay:
     """Always-on-top, draggable lightweight desktop stage."""
@@ -442,6 +517,12 @@ class PetOverlay:
 
     def set_state(self, emotion: str, caption: str):
         self.avatar.set_state(emotion, caption)
+
+    def set_custom_avatar(self, frames: list[Image.Image], durations_ms: list[int]):
+        self.avatar.set_custom_avatar(frames, durations_ms)
+
+    def clear_custom_avatar(self):
+        self.avatar.clear_custom_avatar()
 
     def show(self):
         self.window.deiconify()
