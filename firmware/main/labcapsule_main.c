@@ -55,6 +55,9 @@
 #define TFT_HEIGHT                  320
 #define TFT_SPI_HOST                SPI2_HOST
 #define DISPLAY_TRANSFER_ROWS       8
+#define PET_BUBBLE_WIDTH            216U
+#define PET_BUBBLE_HEIGHT           64U
+#define PET_BUBBLE_BYTES            (PET_BUBBLE_WIDTH * PET_BUBBLE_HEIGHT / 8U)
 
 #define MPU6050_ADDRESS_LOW         0x68
 #define MPU6050_ADDRESS_HIGH        0x69
@@ -107,6 +110,7 @@ typedef enum {
     SERIAL_UPLOAD_NONE = 0,
     SERIAL_UPLOAD_WALLPAPER,
     SERIAL_UPLOAD_CLIP,
+    SERIAL_UPLOAD_PET_BUBBLE,
 } serial_upload_kind_t;
 
 typedef enum {
@@ -117,6 +121,7 @@ typedef enum {
     DISPLAY_VIEW_WALLPAPER,
     DISPLAY_VIEW_MEDIA,
     DISPLAY_VIEW_IDLE,
+    DISPLAY_VIEW_PET,
 } display_view_t;
 
 typedef struct {
@@ -149,6 +154,11 @@ static volatile uint8_t s_host_cpu_percent;
 static volatile uint8_t s_host_ram_percent;
 static volatile uint8_t s_host_disk_percent;
 static volatile int16_t s_host_temperature_c = -1;
+static uint8_t s_pet_bubble[PET_BUBBLE_BYTES];
+static volatile bool s_pet_bubble_valid;
+static char s_pet_emotion[12] = "IDLE";
+static char s_pet_action[16] = "IDLE";
+static volatile uint8_t s_pet_phase;
 
 static bool s_usb_serial_ready = false;
 static bool s_mpu_ready = false;
@@ -192,6 +202,7 @@ static size_t s_serial_upload_expected;
 static size_t s_serial_upload_received;
 static uint32_t s_serial_upload_expected_crc;
 static uint32_t s_serial_upload_crc;
+static int64_t s_serial_upload_last_byte_us;
 
 static const uint8_t FONT_ALPHA[26][5] = {
     {0x7e,0x11,0x11,0x11,0x7e}, {0x7f,0x49,0x49,0x49,0x36},
@@ -335,19 +346,14 @@ static esp_err_t mpu_set_sample_rate(uint32_t rate_hz)
     return mpu_write_register(MPU6050_REG_SMPLRT_DIV, (uint8_t)divider);
 }
 
-static esp_err_t mpu_init(void)
+static esp_err_t mpu_probe_and_configure(void)
 {
-    i2c_master_bus_config_t bus_config = {
-        .i2c_port = I2C_NUM_0,
-        .sda_io_num = PIN_MPU_SDA,
-        .scl_io_num = PIN_MPU_SCL,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_config, &s_i2c_bus), TAG,
-                        "I2C bus init failed");
-
+    if (!s_i2c_bus) return ESP_ERR_INVALID_STATE;
+    s_mpu_ready = false;
+    if (s_mpu) {
+        i2c_master_bus_rm_device(s_mpu);
+        s_mpu = NULL;
+    }
     if (i2c_master_probe(s_i2c_bus, MPU6050_ADDRESS_LOW, 100) == ESP_OK) {
         s_mpu_address = MPU6050_ADDRESS_LOW;
     } else if (i2c_master_probe(s_i2c_bus, MPU6050_ADDRESS_HIGH, 100) == ESP_OK) {
@@ -384,6 +390,26 @@ static esp_err_t mpu_init(void)
     }
     s_mpu_ready = true;
     return mpu_set_sample_rate(DEFAULT_SAMPLE_RATE_HZ);
+}
+
+static esp_err_t mpu_init(void)
+{
+    i2c_master_bus_config_t bus_config = {
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = PIN_MPU_SDA,
+        .scl_io_num = PIN_MPU_SCL,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_config, &s_i2c_bus), TAG,
+                        "I2C bus init failed");
+    esp_err_t result = ESP_ERR_NOT_FOUND;
+    for (unsigned attempt = 0; attempt < 5 && result != ESP_OK; ++attempt) {
+        if (attempt > 0) vTaskDelay(pdMS_TO_TICKS(250));
+        result = mpu_probe_and_configure();
+    }
+    return result;
 }
 
 static esp_err_t mpu_read_sample(motion_sample_t *sample)
@@ -826,6 +852,97 @@ static void display_render_idle(void)
     display_text(20, 286, "OK EXPERIMENT", 2, theme.muted);
 }
 
+static bool pet_action_is(const char *value)
+{
+    return strcmp(s_pet_action, value) == 0;
+}
+
+static void display_render_pet_bubble(visual_palette_t theme)
+{
+    const int panel_x = 8;
+    const int panel_y = 236;
+    display_fill_rect_alpha(panel_x, panel_y, 224, 76, theme.text, 96);
+    display_fill_rect_alpha(104, 228, 24, 12, theme.text, 96);
+    if (!s_pet_bubble_valid) {
+        display_text(28, 264, "ASK ME ANYTHING", 2, theme.base);
+        return;
+    }
+    for (unsigned y = 0; y < PET_BUBBLE_HEIGHT; ++y) {
+        unsigned x = 0;
+        while (x < PET_BUBBLE_WIDTH) {
+            unsigned bit = y * PET_BUBBLE_WIDTH + x;
+            if ((s_pet_bubble[bit >> 3] & (0x80U >> (bit & 7U))) == 0) {
+                ++x;
+                continue;
+            }
+            unsigned start = x++;
+            while (x < PET_BUBBLE_WIDTH) {
+                bit = y * PET_BUBBLE_WIDTH + x;
+                if ((s_pet_bubble[bit >> 3] & (0x80U >> (bit & 7U))) == 0) break;
+                ++x;
+            }
+            display_fill_rect(panel_x + 4 + (int)start, panel_y + 6 + (int)y,
+                              (int)(x - start), 1, theme.base);
+        }
+    }
+}
+
+static void display_render_pet(void)
+{
+    if (!s_display_ready) return;
+    visual_palette_t theme = visual_palette();
+    uint16_t accent = theme.accent;
+    if (strcmp(s_pet_emotion, "WARNING") == 0 || pet_action_is("ALERT"))
+        accent = rgb565(255, 76, 90);
+    else if (strcmp(s_pet_emotion, "SUCCESS") == 0 || pet_action_is("CELEBRATE"))
+        accent = rgb565(74, 232, 128);
+    else if (strcmp(s_pet_emotion, "THINKING") == 0 || pet_action_is("THINK"))
+        accent = rgb565(96, 165, 250);
+
+    int bob = (pet_action_is("BOUNCE") || pet_action_is("CELEBRATE"))
+            ? (int)(s_pet_phase % 4U) - 2 : (int)(s_pet_phase & 1U);
+    int body_x = pet_action_is("TILT") ? 58 + (int)(s_pet_phase % 3U) : 60;
+    int body_y = 64 + bob;
+    display_prepare_background(theme.base);
+    display_fill_rect_alpha(0, 0, TFT_WIDTH, 42, theme.panel, 94);
+    display_fill_rect_alpha(0, 0, TFT_WIDTH, 6, accent, 100);
+    display_text(12, 16, "PET LINK", 2, theme.text);
+    display_text(136, 18, s_pet_emotion, 1, accent);
+
+    display_fill_rect_alpha(body_x - 8, body_y + 28, 136, 116, accent, 100);
+    display_fill_rect_alpha(body_x, body_y + 20, 120, 132, accent, 100);
+    display_fill_rect_alpha(body_x + 6, body_y + 26, 108, 120, theme.panel, 100);
+    display_fill_rect_alpha(body_x + 14, body_y + 44, 92, 70, theme.base, 92);
+    display_fill_rect_alpha(body_x - 22, body_y + 82, 20, 8, accent, 100);
+    display_fill_rect_alpha(body_x + 122, body_y + 82, 20, 8, accent, 100);
+
+    int eye_y = body_y + 67;
+    if (pet_action_is("SLEEP")) {
+        display_fill_rect(body_x + 30, eye_y + 5, 18, 3, accent);
+        display_fill_rect(body_x + 72, eye_y + 5, 18, 3, accent);
+    } else {
+        int eye_shift = pet_action_is("THINK") ? (int)(s_pet_phase % 4U) - 2 : 0;
+        display_fill_rect(body_x + 34 + eye_shift, eye_y, 10, 14, theme.text);
+        display_fill_rect(body_x + 76 + eye_shift, eye_y, 10, 14, theme.text);
+    }
+    if (pet_action_is("TALK") && (s_pet_phase & 1U))
+        display_fill_rect(body_x + 50, body_y + 96, 20, 14, accent);
+    else
+        display_fill_rect(body_x + 50, body_y + 100, 20, 4, accent);
+
+    if (pet_action_is("SCAN")) {
+        int scan_y = body_y + 34 + (int)(s_pet_phase % 74U);
+        display_fill_rect_alpha(body_x + 12, scan_y, 96, 2, theme.secondary, 90);
+    }
+    if (pet_action_is("CELEBRATE")) {
+        display_fill_rect(24, 74 + (s_pet_phase % 18U), 8, 8, theme.secondary);
+        display_fill_rect(206, 98 - (s_pet_phase % 18U), 8, 8, accent);
+        display_fill_rect(34, 174 - (s_pet_phase % 12U), 5, 5, accent);
+        display_fill_rect(198, 166 + (s_pet_phase % 12U), 5, 5, theme.secondary);
+    }
+    display_render_pet_bubble(theme);
+}
+
 static void display_render_settings(void)
 {
     visual_palette_t theme = visual_palette();
@@ -940,6 +1057,9 @@ static void display_render_current(void)
             break;
         case DISPLAY_VIEW_IDLE:
             display_render_idle();
+            break;
+        case DISPLAY_VIEW_PET:
+            display_render_pet();
             break;
         case DISPLAY_VIEW_STATUS:
         default:
@@ -1088,6 +1208,15 @@ static void handle_display_command(char **save_pointer)
         s_display_view = DISPLAY_VIEW_SETTINGS;
         display_request_refresh();
         serial_emit("OK,DISPLAY,SETTINGS");
+    } else if (strcmp(action, "PET") == 0) {
+        if (get_state() == STATE_RECORDING) {
+            serial_emit("ERR,DISPLAY,PET,RECORDING_ACTIVE");
+            return;
+        }
+        s_idle_mode = true;
+        s_display_view = DISPLAY_VIEW_PET;
+        display_request_refresh();
+        serial_emit("OK,DISPLAY,PET");
     } else if (strcmp(action, "HOME") == 0 || strcmp(action, "STATUS") == 0) {
         s_idle_mode = false;
         s_display_view = DISPLAY_VIEW_STATUS;
@@ -1135,6 +1264,7 @@ static void serial_upload_abort(void)
     s_serial_upload_kind = SERIAL_UPLOAD_NONE;
     s_serial_upload_expected = 0;
     s_serial_upload_received = 0;
+    s_serial_upload_last_byte_us = 0;
 }
 
 static esp_err_t serial_upload_begin(serial_source_t source, const char *kind_text,
@@ -1147,19 +1277,25 @@ static esp_err_t serial_upload_begin(serial_source_t source, const char *kind_te
     else if (strcmp(kind_text, "CLIP") == 0 && expected >= 29 &&
              expected <= MEDIA_STORE_MAX_CLIP_BYTES)
         kind = SERIAL_UPLOAD_CLIP;
+    else if (strcmp(kind_text, "PETBUBBLE") == 0 && expected == PET_BUBBLE_BYTES)
+        kind = SERIAL_UPLOAD_PET_BUBBLE;
     else return ESP_ERR_INVALID_SIZE;
 
-    labcapsule_media_clip_stop();
-    /* Let the playback task close the old current.lcg before atomic replacement. */
-    vTaskDelay(pdMS_TO_TICKS(60));
-    esp_err_t result = kind == SERIAL_UPLOAD_WALLPAPER
-            ? wallpaper_upload_begin(expected) : media_store_upload_begin(expected);
+    esp_err_t result = ESP_OK;
+    if (kind != SERIAL_UPLOAD_PET_BUBBLE) {
+        labcapsule_media_clip_stop();
+        /* Let the playback task close the old current.lcg before atomic replacement. */
+        vTaskDelay(pdMS_TO_TICKS(60));
+        result = kind == SERIAL_UPLOAD_WALLPAPER
+                ? wallpaper_upload_begin(expected) : media_store_upload_begin(expected);
+    }
     if (result != ESP_OK) return result;
     s_serial_upload_source = source;
     s_serial_upload_expected = expected;
     s_serial_upload_received = 0;
     s_serial_upload_expected_crc = expected_crc;
     s_serial_upload_crc = 0xFFFFFFFFU;
+    s_serial_upload_last_byte_us = esp_timer_get_time();
     s_serial_upload_kind = kind;
     serial_emit("READY,UPLOAD,%s,BYTES=%u", kind_text, (unsigned)expected);
     return ESP_OK;
@@ -1169,6 +1305,7 @@ static void serial_upload_finish(void)
 {
     serial_upload_kind_t kind = s_serial_upload_kind;
     uint32_t actual_crc = s_serial_upload_crc ^ 0xFFFFFFFFU;
+    uint32_t expected_crc = s_serial_upload_expected_crc;
     esp_err_t result = ESP_OK;
     if (actual_crc != s_serial_upload_expected_crc) {
         result = ESP_ERR_INVALID_CRC;
@@ -1176,12 +1313,17 @@ static void serial_upload_finish(void)
         result = wallpaper_upload_finish();
     } else if (kind == SERIAL_UPLOAD_CLIP) {
         result = media_store_upload_finish();
+    } else if (kind == SERIAL_UPLOAD_PET_BUBBLE) {
+        memcpy(s_pet_bubble, s_media_receive_buffer, PET_BUBBLE_BYTES);
+        s_pet_bubble_valid = true;
     }
     if (result != ESP_OK) {
         serial_upload_abort();
-        serial_emit("ERR,UPLOAD,%s,CRC=%08lX,REASON=%s",
-                    kind == SERIAL_UPLOAD_CLIP ? "CLIP" : "WALLPAPER",
-                    (unsigned long)actual_crc, esp_err_to_name(result));
+        serial_emit("ERR,UPLOAD,%s,ACTUAL=%08lX,EXPECTED=%08lX,REASON=%s",
+                    kind == SERIAL_UPLOAD_CLIP ? "CLIP" :
+                            (kind == SERIAL_UPLOAD_PET_BUBBLE ? "PETBUBBLE" : "WALLPAPER"),
+                    (unsigned long)actual_crc, (unsigned long)expected_crc,
+                    esp_err_to_name(result));
         return;
     }
     s_serial_upload_kind = SERIAL_UPLOAD_NONE;
@@ -1192,10 +1334,15 @@ static void serial_upload_finish(void)
         s_display_view = DISPLAY_VIEW_WALLPAPER;
         display_request_refresh();
         serial_emit("OK,UPLOAD,WALLPAPER,CRC=%08lX", (unsigned long)actual_crc);
-    } else {
+    } else if (kind == SERIAL_UPLOAD_CLIP) {
         wallpaper_clear();
         serial_emit("OK,UPLOAD,CLIP,CRC=%08lX", (unsigned long)actual_crc);
         labcapsule_media_clip_start();
+    } else {
+        s_idle_mode = true;
+        s_display_view = DISPLAY_VIEW_PET;
+        display_request_refresh();
+        serial_emit("OK,UPLOAD,PETBUBBLE,CRC=%08lX", (unsigned long)actual_crc);
     }
 }
 
@@ -1205,9 +1352,15 @@ static size_t serial_upload_write(serial_source_t source, const uint8_t *data, s
         return 0;
     size_t remaining = s_serial_upload_expected - s_serial_upload_received;
     size_t consumed = length < remaining ? length : remaining;
-    esp_err_t result = s_serial_upload_kind == SERIAL_UPLOAD_WALLPAPER
-            ? wallpaper_upload_write(data, consumed)
-            : media_store_upload_write(data, consumed);
+    esp_err_t result;
+    if (s_serial_upload_kind == SERIAL_UPLOAD_WALLPAPER)
+        result = wallpaper_upload_write(data, consumed);
+    else if (s_serial_upload_kind == SERIAL_UPLOAD_CLIP)
+        result = media_store_upload_write(data, consumed);
+    else {
+        memcpy(s_media_receive_buffer + s_serial_upload_received, data, consumed);
+        result = ESP_OK;
+    }
     if (result != ESP_OK) {
         serial_emit("ERR,UPLOAD,WRITE,%s", esp_err_to_name(result));
         serial_upload_abort();
@@ -1215,6 +1368,7 @@ static size_t serial_upload_write(serial_source_t source, const uint8_t *data, s
     }
     s_serial_upload_crc = crc32_update(s_serial_upload_crc, data, consumed);
     s_serial_upload_received += consumed;
+    s_serial_upload_last_byte_us = esp_timer_get_time();
     if (s_serial_upload_received == s_serial_upload_expected) serial_upload_finish();
     return consumed;
 }
@@ -1241,6 +1395,19 @@ static void handle_command(char *line, serial_source_t source)
     if (strcmp(command, "PING") == 0) {
         serial_emit("PONG,LABCAPSULE,%s", LABCAPSULE_VERSION);
     } else if (strcmp(command, "STATUS") == 0) {
+        /* Some MPU6050 breakout boards need longer than the main boot retry
+         * window before their I2C identity/configuration reads stabilize.
+         * STATUS is part of every desktop/mobile handshake, so use it as a
+         * transparent recovery point instead of requiring the user to open
+         * the diagnostic page and issue SENSORS manually. */
+        if (!s_mpu_ready) {
+            esp_err_t recovery_result = mpu_probe_and_configure();
+            sensor_hub_set_primary_ready("mpu6050", s_mpu_ready);
+            if (recovery_result == ESP_OK) {
+                ESP_LOGI(TAG, "MPU6050 recovered during STATUS handshake");
+                display_request_refresh();
+            }
+        }
         emit_status();
     } else if (strcmp(command, "DISPLAY") == 0 || strcmp(command, "TFT") == 0) {
         handle_display_command(&save_pointer);
@@ -1301,13 +1468,59 @@ static void handle_command(char *line, serial_source_t source)
             s_host_temperature_c = (int16_t)temperature;
             s_host_last_heartbeat_us = esp_timer_get_time();
             s_host_link_active = true;
-            if (get_state() != STATE_RECORDING) {
+            if (get_state() != STATE_RECORDING && s_display_view != DISPLAY_VIEW_PET) {
                 s_idle_mode = true;
                 s_display_view = DISPLAY_VIEW_IDLE;
             }
             display_request_refresh();
             serial_emit("OK,HOST,CPU=%u,RAM=%u,DISK=%u,TEMP=%ld",
                         cpu, ram, disk, temperature);
+        }
+    } else if (strcmp(command, "PET") == 0) {
+        char *action = strtok_r(NULL, ", ", &save_pointer);
+        if (action) for (char *p = action; *p; ++p)
+            *p = (char)toupper((unsigned char)*p);
+        if (!action || strcmp(action, "STATUS") == 0) {
+            serial_emit("PET,VIEW=%s,EMOTION=%s,ACTION=%s,BUBBLE=%s",
+                        s_display_view == DISPLAY_VIEW_PET ? "ON" : "OFF",
+                        s_pet_emotion, s_pet_action, s_pet_bubble_valid ? "YES" : "NO");
+        } else if (strcmp(action, "SHOW") == 0) {
+            if (get_state() == STATE_RECORDING) serial_emit("ERR,PET,RECORDING_ACTIVE");
+            else {
+                s_idle_mode = true;
+                s_display_view = DISPLAY_VIEW_PET;
+                display_request_refresh();
+                serial_emit("OK,PET,SHOW");
+            }
+        } else if (strcmp(action, "HIDE") == 0) {
+            s_idle_mode = false;
+            s_display_view = DISPLAY_VIEW_STATUS;
+            display_request_refresh();
+            serial_emit("OK,PET,HIDE");
+        } else if (strcmp(action, "CLEAR") == 0) {
+            memset(s_pet_bubble, 0, sizeof(s_pet_bubble));
+            s_pet_bubble_valid = false;
+            display_request_refresh();
+            serial_emit("OK,PET,CLEAR");
+        } else if (strcmp(action, "STATE") == 0) {
+            char *emotion = strtok_r(NULL, ", ", &save_pointer);
+            char *motion = strtok_r(NULL, ", ", &save_pointer);
+            if (!emotion || !motion || strlen(emotion) >= sizeof(s_pet_emotion) ||
+                strlen(motion) >= sizeof(s_pet_action) || get_state() == STATE_RECORDING) {
+                serial_emit("ERR,PET,EXPECTED=PET,STATE,EMOTION,ACTION");
+            } else {
+                for (char *p = emotion; *p; ++p) *p = (char)toupper((unsigned char)*p);
+                for (char *p = motion; *p; ++p) *p = (char)toupper((unsigned char)*p);
+                snprintf(s_pet_emotion, sizeof(s_pet_emotion), "%s", emotion);
+                snprintf(s_pet_action, sizeof(s_pet_action), "%s", motion);
+                s_pet_phase = 0;
+                s_idle_mode = true;
+                s_display_view = DISPLAY_VIEW_PET;
+                display_request_refresh();
+                serial_emit("OK,PET,STATE,%s,%s", s_pet_emotion, s_pet_action);
+            }
+        } else {
+            serial_emit("ERR,PET,EXPECTED=SHOW|HIDE|CLEAR|STATE|STATUS");
         }
     } else if (strcmp(command, "GIF") == 0) {
         char *action = strtok_r(NULL, ", ", &save_pointer);
@@ -1345,6 +1558,14 @@ static void handle_command(char *line, serial_source_t source)
         if (result != ESP_OK)
             serial_emit("ERR,UPLOAD,EXPECTED=UPLOAD,CLIP|WALLPAPER,SIZE,CRC32,%s",
                         esp_err_to_name(result));
+    } else if (strcmp(command, "SENSORS") == 0 || strcmp(command, "SCAN") == 0) {
+        esp_err_t result = s_mpu_ready ? ESP_OK : mpu_probe_and_configure();
+        size_t found = sensor_hub_discover();
+        sensor_hub_set_primary_ready("mpu6050", s_mpu_ready);
+        display_request_refresh();
+        serial_emit("SENSORS,COUNT=%u,MPU=%s,ADDRESS=0x%02X,RESULT=%s",
+                    (unsigned)found, s_mpu_ready ? "OK" : "MISSING", s_mpu_address,
+                    esp_err_to_name(result));
     } else if (strcmp(command, "START") == 0) {
         char *rate_text = strtok_r(NULL, ", ", &save_pointer);
         char *duration_text = strtok_r(NULL, ", ", &save_pointer);
@@ -1376,12 +1597,14 @@ static void handle_command(char *line, serial_source_t source)
         }
     } else if (strcmp(command, "HELP") == 0) {
         serial_emit("COMMANDS,PING|STATUS|START[,RATE,DURATION]|STOP|ABORT|MOCK,ON|OFF");
-        serial_emit("COMMANDS,DISPLAY[,DEV|TEST|WALLPAPER|SETTINGS|HOME|INVERT|BL,ON|OFF]");
+        serial_emit("COMMANDS,DISPLAY[,PET|DEV|TEST|WALLPAPER|SETTINGS|HOME|INVERT|BL,ON|OFF]");
         serial_emit("COMMANDS,STYLE,PRESET,WALL,PANEL,HUD");
         serial_emit("COMMANDS,MODE,IDLE|EXPERIMENT");
         serial_emit("COMMANDS,NOTICE,TITLE,MESSAGE");
         serial_emit("COMMANDS,HOST,CPU,RAM,DISK,TEMP|GIF,PLAY|STOP|DELETE|FPS,N");
-        serial_emit("COMMANDS,UPLOAD,CLIP|WALLPAPER,SIZE,CRC32_THEN_BINARY");
+        serial_emit("COMMANDS,PET,SHOW|HIDE|CLEAR|STATE,EMOTION,ACTION|STATUS");
+        serial_emit("COMMANDS,SENSORS|SCAN");
+        serial_emit("COMMANDS,UPLOAD,CLIP|WALLPAPER|PETBUBBLE,SIZE,CRC32_THEN_BINARY");
     } else {
         serial_emit("ERR,UNKNOWN_COMMAND,%s", command);
     }
@@ -1425,6 +1648,18 @@ static void serial_task(void *argument)
     (void)argument;
     uint8_t buffer[512];
     while (true) {
+        if (s_serial_upload_kind != SERIAL_UPLOAD_NONE &&
+            esp_timer_get_time() - s_serial_upload_last_byte_us > 3000000LL) {
+            serial_upload_kind_t timed_out_kind = s_serial_upload_kind;
+            size_t timed_out_received = s_serial_upload_received;
+            size_t timed_out_expected = s_serial_upload_expected;
+            serial_upload_abort();
+            serial_emit("ERR,UPLOAD,%s,RECEIVED=%u,EXPECTED=%u,REASON=TIMEOUT",
+                        timed_out_kind == SERIAL_UPLOAD_CLIP ? "CLIP" :
+                                (timed_out_kind == SERIAL_UPLOAD_PET_BUBBLE
+                                 ? "PETBUBBLE" : "WALLPAPER"),
+                        (unsigned)timed_out_received, (unsigned)timed_out_expected);
+        }
         int uart_bytes = uart_read_bytes(UART_NUM_0, buffer, sizeof(buffer), pdMS_TO_TICKS(5));
         size_t offset = 0;
         while (offset < (size_t)uart_bytes) {
@@ -1518,16 +1753,20 @@ static void display_task(void *argument)
     display_view_t last_view = (display_view_t)-1;
     uint8_t last_page = 0xFF;
     TickType_t last_idle_refresh = 0;
+    TickType_t last_pet_refresh = 0;
 
     while (true) {
         device_state_t state = get_state();
         TickType_t now = xTaskGetTickCount();
         bool idle_refresh_due = s_display_view == DISPLAY_VIEW_IDLE &&
                 now - last_idle_refresh >= pdMS_TO_TICKS(1000);
+        bool pet_refresh_due = s_display_view == DISPLAY_VIEW_PET &&
+                now - last_pet_refresh >= pdMS_TO_TICKS(120);
         if (state != last_state || s_mpu_ready != last_mpu || s_mock_enabled != last_mock ||
             s_sample_rate_hz != last_rate || s_duration_seconds != last_duration ||
             s_display_revision != last_revision || s_display_view != last_view ||
-            s_developer_page != last_page || idle_refresh_due) {
+            s_developer_page != last_page || idle_refresh_due || pet_refresh_due) {
+            if (pet_refresh_due) ++s_pet_phase;
             display_render_current();
             last_state = state;
             last_mpu = s_mpu_ready;
@@ -1538,6 +1777,7 @@ static void display_task(void *argument)
             last_view = s_display_view;
             last_page = s_developer_page;
             if (s_display_view == DISPLAY_VIEW_IDLE) last_idle_refresh = now;
+            if (s_display_view == DISPLAY_VIEW_PET) last_pet_refresh = now;
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -1571,6 +1811,19 @@ static void handle_input_action(input_action_t action, const char *source, void 
             s_idle_mode = false;
             s_display_view = DISPLAY_VIEW_SETTINGS;
             serial_emit("UI,SETTINGS");
+        }
+        return;
+    }
+
+    if (s_display_view == DISPLAY_VIEW_PET) {
+        if (action == INPUT_ACTION_BACK) {
+            s_idle_mode = false;
+            s_display_view = DISPLAY_VIEW_STATUS;
+            serial_emit("UI,HOME");
+        } else if (action == INPUT_ACTION_OK) {
+            serial_emit("PET,INPUT,TALK");
+        } else if (action == INPUT_ACTION_LEFT || action == INPUT_ACTION_RIGHT) {
+            serial_emit("PET,INPUT,NEXT_ACTION");
         }
         return;
     }
@@ -1651,6 +1904,7 @@ static const char *display_view_name(display_view_t view)
         case DISPLAY_VIEW_WALLPAPER: return "wallpaper";
         case DISPLAY_VIEW_MEDIA: return "media";
         case DISPLAY_VIEW_IDLE: return "idle";
+        case DISPLAY_VIEW_PET: return "pet";
         case DISPLAY_VIEW_STATUS:
         default: return "home";
     }
@@ -1677,6 +1931,7 @@ void labcapsule_build_status_json(char *buffer, size_t buffer_size)
              "\"offlineSamples\":%lu,\"offlineRecording\":%s,"
              "\"currentMedia\":\"%s\",\"mediaBytes\":%u,"
              "\"gifPlaying\":%s,\"gifFps\":%u,"
+             "\"pet\":{\"emotion\":\"%s\",\"action\":\"%s\",\"bubble\":%s},"
              "\"hardware\":{\"uptimeSeconds\":%llu,"
              "\"internalFree\":%lu,\"internalTotal\":%lu,"
              "\"psramFree\":%lu,\"psramTotal\":%lu,"
@@ -1696,6 +1951,7 @@ void labcapsule_build_status_json(char *buffer, size_t buffer_size)
                      (wallpaper_available() ? "image" : "none"),
              (unsigned)media_store_clip_size(),
              s_media_clip_playing ? "true" : "false", (unsigned)s_media_clip_fps,
+             s_pet_emotion, s_pet_action, s_pet_bubble_valid ? "true" : "false",
              (unsigned long long)(esp_timer_get_time() / 1000000ULL),
              (unsigned long)internal_free, (unsigned long)internal_total,
              (unsigned long)psram_free, (unsigned long)psram_total,
@@ -1715,7 +1971,8 @@ void labcapsule_build_ble_device_json(char *buffer, size_t buffer_size)
              "{\"version\":\"%s\",\"state\":\"%s\",\"view\":\"%s\","
              "\"operationMode\":\"%s\",\"mpu\":\"%s\",\"backlight\":%s,"
              "\"brightness\":%u,\"wallpaper\":%s,\"gifPlaying\":%s,"
-             "\"gifFps\":%u,\"style\":{"
+             "\"gifFps\":%u,\"petEmotion\":\"%s\",\"petAction\":\"%s\","
+             "\"style\":{"
              "\"preset\":%u,\"wallpaperOpacity\":%u,\"panelOpacity\":%u,"
              "\"hudOpacity\":%u}}",
              LABCAPSULE_VERSION, state_name(get_state()), display_view_name(s_display_view),
@@ -1724,6 +1981,7 @@ void labcapsule_build_ble_device_json(char *buffer, size_t buffer_size)
              (unsigned)s_backlight_brightness,
              wallpaper_available() ? "true" : "false",
              s_media_clip_playing ? "true" : "false", (unsigned)s_media_clip_fps,
+             s_pet_emotion, s_pet_action,
              (unsigned)s_visual_preset, (unsigned)s_wallpaper_opacity,
              (unsigned)s_panel_opacity, (unsigned)s_hud_opacity);
 }
@@ -2134,7 +2392,7 @@ esp_err_t labcapsule_remote_action(const char *action, char *response, size_t re
         s_host_temperature_c = (int16_t)temperature;
         s_host_last_heartbeat_us = esp_timer_get_time();
         s_host_link_active = true;
-        if (get_state() != STATE_RECORDING) {
+        if (get_state() != STATE_RECORDING && s_display_view != DISPLAY_VIEW_PET) {
             s_idle_mode = true;
             s_display_view = DISPLAY_VIEW_IDLE;
         }
@@ -2194,6 +2452,13 @@ esp_err_t labcapsule_remote_action(const char *action, char *response, size_t re
         s_display_view = DISPLAY_VIEW_STATUS;
     } else if (strcmp(normalized, "SETTINGS") == 0) {
         s_display_view = DISPLAY_VIEW_SETTINGS;
+    } else if (strcmp(normalized, "PET") == 0) {
+        if (get_state() == STATE_RECORDING) {
+            snprintf(response, response_size, "cannot show pet while recording");
+            return ESP_ERR_INVALID_STATE;
+        }
+        s_idle_mode = true;
+        s_display_view = DISPLAY_VIEW_PET;
     } else if (strcmp(normalized, "DEVELOPER") == 0 || strcmp(normalized, "DEV") == 0) {
         s_display_view = DISPLAY_VIEW_DEVELOPER;
         s_developer_page = 0;

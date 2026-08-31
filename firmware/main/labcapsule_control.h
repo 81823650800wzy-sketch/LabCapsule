@@ -6,7 +6,7 @@
 
 #include "esp_err.h"
 
-#define LABCAPSULE_VERSION "0.7.0-alpha"
+#define LABCAPSULE_VERSION "0.11.0-alpha"
 #define LABCAPSULE_MEDIA_MAX_FPS 8U
 
 typedef enum {

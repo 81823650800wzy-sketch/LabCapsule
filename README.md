@@ -2,7 +2,19 @@
 
 > Ask a question. Run an experiment.
 
-LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前版本为 **V0.10.0 Alpha / Unified Pet Package（Desktop First）**，已经打通“自然语言问题 → 实验协议 → 六轴采集 → 在线直传或离线缓存 → CSV/分析”，并加入可精确检查的实时曲线、理解设备上下文的 AI 桌宠和可移植统一桌宠角色包。V0.10.0 桌面端继续兼容 V0.7 固件与 Android APK。
+LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前版本为 **V0.11.0 Alpha / Device Pet + AI + Claude（Desktop First）**，已经打通“自然语言问题 → 实验协议 → 六轴采集 → 在线直传或离线缓存 → CSV/分析”，并把统一桌宠扩展到 COM8 实体屏、电脑状态/实验上下文问答、受限 Claude 复杂任务转交和 Live2D 动作联动。Android V0.7 继续兼容 V0.11 固件；完整 V0.11 桌宠交互当前先在 Windows 端提供。
+
+## V0.11.0 新增
+
+- ST7789 新增独立实体桌宠页：角色由 ESP32 本地持续绘制，AI 中文回答显示在底部 `216 × 64` 气泡，不依赖电脑逐帧传屏。
+- 桌面端新增电脑状态、设备/实验状态、实验设计和数据质量快捷问答；在线默认使用 DeepSeek `deepseek-v4-flash`，无网络或无 Key 时安全回退。
+- 复杂任务可转交本机 Claude Code，但固定为单轮只读模式：禁用工具、MCP、浏览器、会话持久化和设备控制，并设置调用预算上限。
+- 实体屏动作使用 9 项白名单；回答气泡先在电脑排版、脱敏并转成 1728 字节位图，再以 CRC32、64 字节节流分片传输。
+- 固件为中断的二进制上传加入 3 秒恢复超时；COM8 并发发送电脑心跳时完成 50/50 气泡上传，0 CRC、0 协议错误。
+- 自动握手中的 `STATUS` 会在 MPU6050 上电尚未稳定时透明重试探测，现场最终直接返回 `MPU=OK`，不再要求普通用户手工扫描。
+- Hiyori Pro Live2D 已完成依赖识别、WebGL 动态渲染、点击动作和 `HAPPY + BOUNCE → FlickUp` 联动；第三方模型仍只保留在用户目录。
+
+完整安装、AI、Claude、Live2D 与排障步骤见 [V0.11.0 使用手册](docs/V0.11.0_DEVICE_PET_AI_CLAUDE_ZH.md)，验证证据见 [V0.11.0 测试记录](docs/V0.11.0_TEST_REPORT_ZH.md)。
 
 ## V0.10.0 新增
 
@@ -113,7 +125,7 @@ V0.4.0 的界面与媒体能力继续保留：
    idf.py -p COM8 flash monitor
    ```
 
-2. 安装 GitHub Release 中的 `LabCapsule-0.7.0.apk`。首次进入“设置 → 设备与连接”，推荐选择：
+2. Windows 端运行 GitHub Release 中的 `LabCapsule-Studio-0.11.0.exe`；Android 端仍可安装兼容的 `LabCapsule-0.7.0.apk`。手机首次进入“设置 → 设备与连接”时，推荐选择：
 
    - BLE：点击扫描并允许“附近设备”权限；连接成功后直接点“蓝牙一键配网”；
    - 恢复热点：只在排障时连接 `LabCapsule-XXXX`，密码 `labcapsule`，地址 `http://192.168.4.1`。
@@ -122,7 +134,7 @@ V0.4.0 的界面与媒体能力继续保留：
 
 4. 在“AI”页填写 API Endpoint、模型和 Key，生成协议后点击“发送并开始实验”。Key 由 Android Keystore 加密，仅在手机端使用。
 
-完整操作见 [V0.7.0 本地媒体与桌面工作室指南](docs/V0.7.0_LOCAL_MEDIA_DESKTOP_GUIDE_ZH.md)、[V0.6.0 工作模式与通知指南](docs/V0.6.0_IDLE_GIF_MODE_GUIDE_ZH.md)、[V0.5.0 离线实验与硬件扩展指南](docs/V0.5.0_OFFLINE_HARDWARE_GUIDE_ZH.md) 和 [V0.3.3 蓝牙配网与连接排障](docs/V0.3.3_BLE_WIFI_QUICKSTART_ZH.md)。
+完整操作见 [V0.11.0 实体桌宠、AI 与 Claude 指南](docs/V0.11.0_DEVICE_PET_AI_CLAUDE_ZH.md)、[V0.7.0 本地媒体与桌面工作室指南](docs/V0.7.0_LOCAL_MEDIA_DESKTOP_GUIDE_ZH.md)、[V0.6.0 工作模式与通知指南](docs/V0.6.0_IDLE_GIF_MODE_GUIDE_ZH.md)、[V0.5.0 离线实验与硬件扩展指南](docs/V0.5.0_OFFLINE_HARDWARE_GUIDE_ZH.md) 和 [V0.3.3 蓝牙配网与连接排障](docs/V0.3.3_BLE_WIFI_QUICKSTART_ZH.md)。
 
 ## 冻结引脚
 
@@ -162,7 +174,7 @@ SPEC_V0.1.md             初始产品规格（历史基线）
 
 ## 当前实机状态
 
-2026-08-28 已在 COM8 的 ESP32-S3 rev 0.2 / 16 MiB Flash / 8 MiB Octal PSRAM 上完成 V0.7.0 完整烧录和实机验证，串口标识为 `PONG,LABCAPSULE,0.7.0-alpha`。默认反色关闭；原壁纸先完整备份，测试动画通过 USB 上传、CRC 校验、本地播放、4→8 FPS 即时变速和断电重启自启动后已删除，原壁纸随后逐字节分区恢复并确认可用。桌面 UI、静态图/GIF/MP4/桌宠处理、APK v2/v3 签名和固件构建均已通过。纯 5 GHz 网络仍无法被 ESP32-S3 Station 使用，BLE 和 USB 不受影响。
+2026-08-31 已在 COM8 的 ESP32-S3 rev 0.2 / 16 MiB Flash / 8 MiB Octal PSRAM 上完成 V0.11.0 完整烧录和实机验证，串口标识为 `PONG,LABCAPSULE,0.11.0-alpha`，自动握手最终返回 `STATUS,READY,MPU=OK`。实体桌宠独立界面、中文 AI 气泡、电脑/实验上下文、DeepSeek、受限 Claude 和 Hiyori Live2D 动作链均通过；并发电脑心跳下气泡上传压力测试为 50/50、0 错误。本轮未连接设备无网络热点、未启动实验、未擦除媒体或离线实验。纯 5 GHz 网络仍无法被 ESP32-S3 Station 使用，BLE、USB 和离线实验不受影响。
 
 ## 安全边界
 

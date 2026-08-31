@@ -79,6 +79,40 @@ async function boot() {
     document.body.classList.add("overlay");
   }
   setStatus(`${config.name} · ${config.motionCount} 个动作 · WebGL 就绪`);
+
+  let controlRevision = 0;
+  const pickMotionGroup = (action) => {
+    const preferences = {
+      BOUNCE: ["FlickUp", "Tap@Body", "Tap"],
+      TILT: ["Flick", "Tap@Head", "Tap"],
+      THINK: ["Tap@Head", "Idle"],
+      TALK: ["Tap@Body", "Tap", "Flick"],
+      SCAN: ["FlickUp", "Tap@Body", "Tap"],
+      CELEBRATE: ["FlickUp", "Tap@Body", "Tap"],
+      ALERT: ["FlickDown", "Flick", "Tap"],
+      SLEEP: ["Idle"],
+      IDLE: ["Idle"],
+    };
+    return (preferences[action] || preferences.TALK)
+      .find((group) => config.motionGroups.includes(group))
+      || config.motionGroups.find((group) => group !== "Idle")
+      || config.motionGroups[0];
+  };
+  const pollControl = async () => {
+    if (!config.controlUrl) return;
+    try {
+      const current = await fetch(config.controlUrl, { cache: "no-store" }).then((item) => item.json());
+      if (Number.isFinite(current.revision) && current.revision > controlRevision) {
+        controlRevision = current.revision;
+        const group = pickMotionGroup(String(current.action || "TALK").toUpperCase());
+        if (group) model.motion(group);
+        setStatus(`${config.name} · ${current.emotion || "SPEAKING"} · ${group || "IDLE"}`);
+      }
+    } catch (_error) {
+      // The main app may be exiting or atomically replacing the tiny control file.
+    }
+  };
+  if (config.controlUrl) window.setInterval(pollControl, 300);
 }
 
 boot().catch((error) => {

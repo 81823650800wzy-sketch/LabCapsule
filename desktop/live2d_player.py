@@ -70,12 +70,14 @@ def player_html() -> bytes:
 class PlayerServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, handler, model_path: Path, mode: str):
+    def __init__(self, address, handler, model_path: Path, mode: str,
+                 control_path: Path | None = None):
         super().__init__(address, handler)
         self.model_path = model_path
         self.model_root = model_path.parent.resolve()
         self.asset_root = resource_path("live2d_web", "dist").resolve()
         self.mode = mode
+        self.control_path = control_path
         self.asset = inspect_live2d_model(model_path)
 
 
@@ -121,10 +123,28 @@ class PlayerHandler(BaseHTTPRequestHandler):
                 "motionGroups": list(asset.motion_groups),
                 "motionCount": asset.motion_count,
                 "mode": self.server.mode,
+                "controlUrl": "/control.json" if self.server.control_path else "",
                 "officialFileGuide": OFFICIAL_FILE_GUIDE,
                 "officialLicense": OFFICIAL_LICENSE,
             }, ensure_ascii=False).encode("utf-8")
             self._send(200, "application/json; charset=utf-8", payload)
+            return
+        if path == "/control.json" and self.server.control_path:
+            payload = {"schemaVersion": 1, "revision": 0,
+                       "emotion": "IDLE", "action": "IDLE"}
+            try:
+                control = self.server.control_path
+                if control.is_file() and control.stat().st_size <= 4096:
+                    raw = json.loads(control.read_text(encoding="utf-8"))
+                    action = str(raw.get("action", "IDLE"))
+                    emotion = str(raw.get("emotion", "IDLE"))
+                    if action.replace("_", "").isalnum() and emotion.replace("_", "").isalnum():
+                        payload = {"schemaVersion": 1, "revision": int(raw.get("revision", 0)),
+                                   "emotion": emotion[:16], "action": action[:16]}
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+                pass
+            self._send(200, "application/json; charset=utf-8",
+                       json.dumps(payload, separators=(",", ":")).encode("utf-8"))
             return
         if path.startswith("/assets/"):
             target = self._safe_file(self.server.asset_root, path[len("/assets/"):])
@@ -139,7 +159,8 @@ class PlayerHandler(BaseHTTPRequestHandler):
         self._send(200, content_type, target.read_bytes())
 
 
-def run_player(model_path: str | Path, mode: str = "stage") -> int:
+def run_player(model_path: str | Path, mode: str = "stage",
+               control_path: str | Path | None = None) -> int:
     model = Path(model_path).expanduser().resolve()
     asset = inspect_live2d_model(model)
     bundle = resource_path("live2d_web", "dist", "player.bundle.js")
@@ -149,7 +170,8 @@ def run_player(model_path: str | Path, mode: str = "stage") -> int:
         import webview
     except ImportError as error:
         raise RuntimeError("缺少 pywebview；请安装桌面端 requirements.txt") from error
-    server = PlayerServer(("127.0.0.1", 0), PlayerHandler, model, mode)
+    control = Path(control_path).expanduser().resolve() if control_path else None
+    server = PlayerServer(("127.0.0.1", 0), PlayerHandler, model, mode, control)
     thread = threading.Thread(target=server.serve_forever, daemon=True, name="live2d-http")
     thread.start()
     url = f"http://127.0.0.1:{server.server_port}/"
@@ -184,9 +206,10 @@ def run_player(model_path: str | Path, mode: str = "stage") -> int:
         server.server_close()
 
 
-def run_player_guarded(model_path: str | Path, mode: str = "stage") -> int:
+def run_player_guarded(model_path: str | Path, mode: str = "stage",
+                       control_path: str | Path | None = None) -> int:
     try:
-        return run_player(model_path, mode)
+        return run_player(model_path, mode, control_path)
     except Exception as error:
         try:
             import tkinter as tk
@@ -205,8 +228,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="LabCapsule local Live2D stage")
     parser.add_argument("model")
     parser.add_argument("--mode", choices=("stage", "overlay"), default="stage")
+    parser.add_argument("--control", default="")
     args = parser.parse_args()
-    return run_player_guarded(args.model, args.mode)
+    return run_player_guarded(args.model, args.mode, args.control or None)
 
 
 if __name__ == "__main__":

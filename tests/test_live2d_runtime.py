@@ -12,7 +12,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "desktop"))
 
-from live2d_runtime import CORE_URL, has_live2d_consent, player_command, save_live2d_consent  # noqa: E402
+from live2d_runtime import (CORE_URL, has_live2d_consent, player_command,
+                            save_live2d_consent, write_live2d_action)  # noqa: E402
 
 
 class Live2DRuntimeTests(unittest.TestCase):
@@ -42,6 +43,27 @@ class Live2DRuntimeTests(unittest.TestCase):
                                       str(model.resolve()), "--mode", "overlay"])
             with self.assertRaises(ValueError):
                 player_command(model, "invalid", root, frozen=False)
+
+    def test_control_action_is_atomic_and_allowlisted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "control.json"
+            revision = write_live2d_action("happy", "bounce", path)
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(raw["revision"], revision)
+            self.assertEqual(raw["emotion"], "HAPPY")
+            self.assertEqual(raw["action"], "BOUNCE")
+            write_live2d_action("bad/value", "delete files", path)
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["action"], "TALK")
+
+    def test_player_command_accepts_explicit_control_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = root / "pet.model3.json"
+            control = root / "control.json"
+            model.write_text("{}", encoding="utf-8")
+            command = player_command(model, "stage", root, "python.exe", frozen=False,
+                                     control_path=control)
+            self.assertEqual(command[-2:], ["--control", str(control.resolve())])
 
 
 if __name__ == "__main__":

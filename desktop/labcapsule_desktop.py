@@ -10,6 +10,7 @@ import asyncio
 import csv
 from datetime import datetime
 import math
+import platform
 from pathlib import Path
 import queue
 import re
@@ -31,14 +32,17 @@ from avatar_assets import (AVATAR_CACHE_DIR, DICEBEAR_CC0_PRESETS, DecodedAvatar
                            clear_cached_avatar, decode_avatar, dicebear_url,
                            display_url, download_avatar, load_cached_avatar)
 from interactive_chart import InteractiveMotionChart
+from claude_bridge import ClaudeBridge
 from media_codec import HEIGHT, MAX_FPS, WIDTH, build_media, compose_frame, load_frames
 from pet_agent import CharacterProfile, PetAgentRuntime, PetAvatarCanvas, PetOverlay, PetReply, PetSettings
+from pet_device import pet_state_command, render_pet_bubble
 from pet_packages import (PET_SELECTION_PATH, PetPackage, avatar_asset_for_package, clear_selected_pet,
                           discover_pet_packages, save_selected_pet, selected_pet_package)
-from live2d_runtime import has_live2d_consent, player_command, save_live2d_consent
+from live2d_runtime import (CONTROL_PATH, has_live2d_consent, player_command,
+                            save_live2d_consent, write_live2d_action)
 
 
-APP_VERSION = "0.10.0"
+APP_VERSION = "0.11.0"
 BAUD_RATE = 460800
 ROOT = Path(__file__).resolve().parent
 
@@ -99,31 +103,60 @@ class SerialLink:
         safe = command.replace("\r", " ").replace("\n", " ")
         with self.write_lock:
             assert self.port
-            self.port.write((safe + "\n").encode("utf-8"))
+            self._write_all(self.port, (safe + "\n").encode("utf-8"))
+
+    @staticmethod
+    def _write_all(active, payload: bytes) -> None:
+        """Honor short serial writes instead of silently truncating a frame."""
+        view = memoryview(payload)
+        offset = 0
+        while offset < len(view):
+            written = active.write(view[offset:])
+            if not written:
+                raise OSError("串口写入未取得进展")
+            offset += int(written)
 
     def upload(self, kind: str, payload: bytes, progress) -> None:
         if not self.connected:
             raise RuntimeError("设备未连接")
         crc = zlib.crc32(payload) & 0xFFFFFFFF
-        self.ready_event.clear()
-        self.done_event.clear()
-        self.upload_error = ""
+        attempts = 3 if kind.upper() == "PETBUBBLE" else 1
+        # RAM-only bubbles are accepted much faster than flash-backed media.
+        # Explicit pacing prevents small CH343/CP210x receive FIFOs from
+        # overrunning while the display task is active.
+        chunk_size = 64 if kind.upper() == "PETBUBBLE" else 1024
         with self.write_lock:
             assert self.port
-            header = f"UPLOAD,{kind},{len(payload)},{crc:08X}\n".encode("ascii")
-            self.port.write(header)
-            if not self.ready_event.wait(8):
-                raise TimeoutError("设备未进入 USB 上传模式")
-            for offset in range(0, len(payload), 1024):
-                if self.stop_event.is_set():
-                    raise RuntimeError("连接已断开")
-                self.port.write(payload[offset : offset + 1024])
-                progress(min(99, round((offset + 1024) * 100 / len(payload))))
-            self.port.flush()
-        if not self.done_event.wait(25):
-            raise TimeoutError("设备未确认媒体校验结果")
-        if self.upload_error:
-            raise RuntimeError(self.upload_error)
+            for attempt in range(1, attempts + 1):
+                self.ready_event.clear()
+                self.done_event.clear()
+                self.upload_error = ""
+                header = f"UPLOAD,{kind},{len(payload)},{crc:08X}\n".encode("ascii")
+                self._write_all(self.port, header)
+                self.port.flush()
+                if not self.ready_event.wait(8):
+                    raise TimeoutError("设备未进入 USB 上传模式")
+                if self.upload_error:
+                    raise RuntimeError(self.upload_error)
+                for offset in range(0, len(payload), chunk_size):
+                    if self.stop_event.is_set():
+                        raise RuntimeError("连接已断开")
+                    self._write_all(self.port, payload[offset : offset + chunk_size])
+                    if kind.upper() == "PETBUBBLE":
+                        self.port.flush()
+                        time.sleep(0.010)
+                    progress(min(99, round((offset + chunk_size) * 100 / len(payload))))
+                self.port.flush()
+                if not self.done_event.wait(25):
+                    raise TimeoutError("设备未确认媒体校验结果")
+                if not self.upload_error:
+                    break
+                retryable = ("INVALID_CRC" in self.upload_error or
+                             "TIMEOUT" in self.upload_error)
+                if not retryable or attempt == attempts:
+                    raise RuntimeError(self.upload_error)
+                progress(0)
+                time.sleep(0.12 * attempt)
         progress(100)
 
     def _reader(self) -> None:
@@ -234,6 +267,11 @@ class Studio(tk.Tk):
         self.samples: list[list[str]] = []
         self.device_state = "READY"
         self.device_recording = False
+        self.device_rate = 0
+        self.device_duration = 0
+        self.device_firmware_version = ""
+        self.last_handshake_at = 0.0
+        self.host_snapshot: dict[str, object] = {}
         self.last_sample: tuple[str, ...] | None = None
         self.last_pet_error_at = 0.0
         self.media_path = ""
@@ -241,6 +279,12 @@ class Studio(tk.Tk):
         self.preview_photo = None
         self.pet_settings = PetSettings.load()
         self.pet_runtime = PetAgentRuntime(self.pet_settings)
+        self.claude_bridge = ClaudeBridge(self.pet_settings.claude_model)
+        self.device_pet_enabled = False
+        self.pet_device_sync_active = False
+        self.pending_pet_device_reply: PetReply | None = None
+        self.last_pet_reply = PetReply(self.pet_settings.profile.greeting, "idle", True,
+                                       source="event", action="IDLE")
         self.pet_overlay: PetOverlay | None = None
         self.active_pet_package: PetPackage | None = None
         self.live2d_processes: list[tuple[str, subprocess.Popen]] = []
@@ -501,11 +545,29 @@ class Studio(tk.Tk):
         self.log.pack(fill="both", expand=True)
 
     def _pet_ui(self):
-        self.pet.columnconfigure(0, weight=0)
-        self.pet.columnconfigure(1, weight=3)
-        self.pet.columnconfigure(2, weight=2)
-        self.pet.rowconfigure(0, weight=1)
-        avatar_card = self._card(self.pet, "角色舞台", 0, 0)
+        shell = tk.Frame(self.pet, bg=self.BG)
+        shell.pack(fill="both", expand=True)
+        canvas = tk.Canvas(shell, bg=self.BG, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(shell, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        body = tk.Frame(canvas, bg=self.BG)
+        body_window = canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>", lambda _: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(
+            body_window, width=event.width))
+
+        def scroll_pet(event):
+            if self.tabs.select() == str(self.pet):
+                canvas.yview_scroll(-1 * int(event.delta / 120), "units")
+
+        self.bind_all("<MouseWheel>", scroll_pet, add="+")
+        body.columnconfigure(0, weight=0)
+        body.columnconfigure(1, weight=3)
+        body.columnconfigure(2, weight=2)
+        body.rowconfigure(0, weight=1)
+        avatar_card = self._card(body, "角色舞台", 0, 0)
         self.pet_avatar = PetAvatarCanvas(avatar_card, width=240, height=230,
                                           background=self.PANEL,
                                           on_activate=self.show_pet_overlay)
@@ -523,16 +585,24 @@ class Studio(tk.Tk):
         self.pet_overlay_button = ttk.Button(avatar_card, text="显示桌面悬浮宠物",
                                              command=self.toggle_pet_overlay)
         self.pet_overlay_button.pack(fill="x", pady=3)
+        ttk.Button(avatar_card, text="在 COM8 打开桌宠界面", style="Accent.TButton",
+                   command=self.show_device_pet).pack(fill="x", pady=3)
+        ttk.Button(avatar_card, text="退出设备桌宠界面",
+                   command=self.hide_device_pet).pack(fill="x", pady=3)
+        self.pet_device_status = ttk.Label(
+            avatar_card, text="设备桌宠：等待连接", style="Muted.TLabel", wraplength=230)
+        self.pet_device_status.pack(anchor="w", pady=(5, 0))
         ttk.Label(avatar_card, text="拖动悬浮宠物移动；双击返回本页；右键隐藏。",
                   style="Muted.TLabel", wraplength=230).pack(anchor="w", pady=8)
 
-        chat_card = self._card(self.pet, "对话与实验陪伴", 0, 1)
+        chat_card = self._card(body, "对话与实验陪伴", 0, 1)
         self.pet_chat = tk.Text(chat_card, bg="#0f141c", fg=self.INK,
                                 insertbackground=self.INK, relief="flat", wrap="word",
                                 font=("Microsoft YaHei UI", 10), padx=10, pady=10)
         self.pet_chat.pack(fill="both", expand=True)
         self.pet_chat.tag_configure("user", foreground=self.CYAN, spacing1=7)
         self.pet_chat.tag_configure("pet", foreground=self.INK, spacing1=7)
+        self.pet_chat.tag_configure("claude", foreground=self.YELLOW, spacing1=7)
         self.pet_chat.tag_configure("event", foreground=self.MUTED, spacing1=7)
         self.pet_chat.configure(state="disabled")
         input_row = tk.Frame(chat_card, bg=self.PANEL)
@@ -545,13 +615,17 @@ class Studio(tk.Tk):
                    command=self.send_pet_message).pack(side="left", padx=(6, 0))
         quick = tk.Frame(chat_card, bg=self.PANEL)
         quick.pack(fill="x", pady=(7, 0))
-        for label, message in (("解释当前状态", "请解释当前设备和实验状态"),
-                               ("设计一个实验", "请帮我把想法整理成可测量的对照实验"),
-                               ("检查数据质量", "根据当前上下文提醒我检查实验数据质量")):
+        quick.columnconfigure((0, 1), weight=1)
+        for index, (label, message) in enumerate((
+                ("电脑状态", "请根据实时信息告诉我电脑目前的运行情况"),
+                ("解释当前状态", "请解释当前设备和实验状态"),
+                ("设计一个实验", "请帮我把想法整理成可测量的对照实验"),
+                ("检查数据质量", "根据当前上下文提醒我检查实验数据质量"))):
             ttk.Button(quick, text=label,
-                       command=lambda value=message: self.send_pet_message(value)).pack(side="left", padx=2)
+                       command=lambda value=message: self.send_pet_message(value)).grid(
+                           row=index // 2, column=index % 2, sticky="ew", padx=2, pady=2)
 
-        settings_card = self._card(self.pet, "角色与 AI 设置", 0, 2)
+        settings_card = self._card(body, "角色与 AI 设置", 0, 2)
         self.pet_name_var = tk.StringVar(value=self.pet_settings.profile.name)
         self.pet_endpoint_var = tk.StringVar(value=self.pet_settings.endpoint)
         self.pet_model_var = tk.StringVar(value=self.pet_settings.model)
@@ -559,6 +633,8 @@ class Studio(tk.Tk):
         self.pet_memory_var = tk.BooleanVar(value=self.pet_settings.remember)
         self.pet_sync_var = tk.BooleanVar(value=self.pet_settings.sync_device)
         self.pet_auto_var = tk.BooleanVar(value=self.pet_settings.auto_react)
+        self.pet_delegate_var = tk.BooleanVar(value=self.pet_settings.delegate_complex)
+        self.pet_claude_model_var = tk.StringVar(value=self.pet_settings.claude_model)
         for title, variable, secret in (("角色名称", self.pet_name_var, False),
                                         ("OpenAI 兼容 Endpoint", self.pet_endpoint_var, False),
                                         ("模型", self.pet_model_var, False),
@@ -577,11 +653,24 @@ class Studio(tk.Tk):
                         variable=self.pet_sync_var).pack(anchor="w")
         ttk.Checkbutton(settings_card, text="自动响应连接/实验完成/错误事件",
                         variable=self.pet_auto_var).pack(anchor="w")
+        ttk.Checkbutton(settings_card, text="复杂任务自动转交本机 Claude（只读安全模式）",
+                        variable=self.pet_delegate_var).pack(anchor="w")
+        claude_row = tk.Frame(settings_card, bg=self.PANEL)
+        claude_row.pack(fill="x", pady=(5, 0))
+        ttk.Label(claude_row, text="Claude 模型", style="Muted.TLabel").pack(side="left")
+        ttk.Entry(claude_row, textvariable=self.pet_claude_model_var, width=12).pack(
+            side="left", padx=6)
+        self.claude_state_label = ttk.Label(
+            settings_card,
+            text=("Claude：已检测，可受限调用" if self.claude_bridge.available else
+                  "Claude：本机未安装，自动使用主 AI"),
+            style="Muted.TLabel", wraplength=285)
+        self.claude_state_label.pack(anchor="w", pady=(4, 0))
         ttk.Button(settings_card, text="保存角色与 AI 设置", style="Accent.TButton",
                    command=self.save_pet_settings).pack(fill="x", pady=(10, 3))
         ttk.Button(settings_card, text="清除桌宠记忆", command=self.clear_pet_memory).pack(fill="x", pady=3)
         ttk.Label(settings_card,
-                  text="模型没有系统命令权限；启动/中止实验、网络和固件操作始终由用户确认。",
+                  text="Claude 桥禁用全部工具且不保存会话；启动/中止实验、网络和固件操作始终由用户确认。",
                   style="Muted.TLabel", wraplength=285).pack(anchor="w", pady=8)
         self._pet_append("event", f"{self.pet_settings.profile.name}：{self.pet_settings.profile.greeting}")
 
@@ -687,7 +776,7 @@ class Studio(tk.Tk):
             ("可扩展应用许可", "https://www.live2d.com/en/sdk/license/expandable/"),
             ("LabCapsule 统一桌宠手册",
              "https://github.com/81823650800wzy-sketch/LabCapsule/blob/main/docs/"
-             "V0.10.0_UNIFIED_PET_PACKAGE_TEST_ZH.md"),
+             "V0.11.0_DEVICE_PET_AI_CLAUDE_ZH.md"),
         )
         link_grid = tk.Frame(resources, bg=self.PANEL)
         link_grid.pack(fill="x")
@@ -956,7 +1045,8 @@ class Studio(tk.Tk):
     def _launch_live2d_player(self, package: PetPackage, mode: str):
         self._cleanup_live2d_processes()
         try:
-            command = player_command(package.live2d_model_path, mode, ROOT, sys.executable)
+            command = player_command(package.live2d_model_path, mode, ROOT, sys.executable,
+                                     control_path=CONTROL_PATH)
             flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             process = subprocess.Popen(command, creationflags=flags)
             self.live2d_processes.append((mode, process))
@@ -1133,19 +1223,71 @@ class Studio(tk.Tk):
         if not hasattr(self, "pet_chat"):
             return
         prefix = {"user": "你", "pet": self.pet_settings.profile.name,
-                  "event": "系统"}.get(kind, "系统")
+                  "claude": "Claude", "event": "系统"}.get(kind, "系统")
         self.pet_chat.configure(state="normal")
-        self.pet_chat.insert("end", f"{prefix}  {text}\n", kind if kind in {"user", "pet", "event"} else "event")
+        self.pet_chat.insert("end", f"{prefix}  {text}\n",
+                             kind if kind in {"user", "pet", "claude", "event"} else "event")
         self.pet_chat.configure(state="disabled")
         self.pet_chat.see("end")
 
-    def _set_pet_state(self, emotion: str, caption: str):
+    def _set_pet_state(self, emotion: str, caption: str, action: str = ""):
         self.pet_emotion = emotion
+        motion = pet_state_command(emotion, action).rsplit(",", 1)[-1]
         if hasattr(self, "pet_avatar"):
             self.pet_avatar.set_state(emotion, caption)
             self.pet_state_label.configure(text=f"{emotion.upper()} · {caption[:36]}")
         if self.pet_overlay is not None:
             self.pet_overlay.set_state(emotion, caption)
+        if self.active_pet_package is not None and self.active_pet_package.visual_kind == "live2d":
+            try:
+                write_live2d_action(emotion, motion, CONTROL_PATH)
+            except OSError as error:
+                self._append_log(f"! Live2D 动作同步失败：{error}")
+
+    def show_device_pet(self):
+        if not self.link.connected:
+            self.pet_device_status.configure(text="设备桌宠：请先连接 COM8")
+            return
+        self.device_pet_enabled = True
+        self._sync_pet_reply_to_device(self.last_pet_reply)
+
+    def hide_device_pet(self):
+        self.device_pet_enabled = False
+        self.pending_pet_device_reply = None
+        if self.link.connected:
+            self.send("PET,HIDE")
+        self.pet_device_status.configure(text="设备桌宠：已退出")
+
+    def _sync_pet_reply_to_device(self, reply: PetReply):
+        if not self.device_pet_enabled or not self.link.connected or self.device_recording:
+            return
+        if not self.device_firmware_version:
+            self.pending_pet_device_reply = reply
+            self.pet_device_status.configure(text="设备桌宠：等待固件握手…")
+            return
+        if not self.device_firmware_version.startswith("0.11."):
+            self.pet_device_status.configure(
+                text=f"设备桌宠：固件 {self.device_firmware_version} 不支持，请更新 0.11")
+            return
+        if self.pet_device_sync_active:
+            self.pending_pet_device_reply = reply
+            return
+        self.pet_device_sync_active = True
+        self.pending_pet_device_reply = None
+        self.pet_device_status.configure(text="设备桌宠：正在同步中文气泡…")
+
+        def worker():
+            try:
+                payload = render_pet_bubble(reply.text)
+                self.link.send("DISPLAY,PET")
+                self.link.send(pet_state_command(reply.emotion, reply.action))
+                self.link.upload("PETBUBBLE", payload,
+                                 lambda value: self.events.put(("pet_device_progress", value)))
+                self.events.put(("pet_device_done", reply))
+            except Exception as error:
+                self.events.put(("pet_device_error", str(error)))
+
+        threading.Thread(target=worker, daemon=True, name="pet-device-sync").start()
 
     def show_pet_overlay(self):
         if self.active_pet_package is not None and self.active_pet_package.visual_kind == "live2d":
@@ -1199,6 +1341,8 @@ class Studio(tk.Tk):
                 remember=self.pet_memory_var.get(),
                 sync_device=self.pet_sync_var.get(),
                 auto_react=self.pet_auto_var.get(),
+                delegate_complex=self.pet_delegate_var.get(),
+                claude_model=self.pet_claude_model_var.get().strip()[:80] or "sonnet",
                 avatar_url=self.avatar_url_var.get().strip(),
                 avatar_source_name=self.pet_settings.avatar_source_name,
                 profile=CharacterProfile(
@@ -1209,6 +1353,10 @@ class Studio(tk.Tk):
             )
             self.pet_settings.save()
             self.pet_runtime.update_settings(self.pet_settings)
+            self.claude_bridge = ClaudeBridge(self.pet_settings.claude_model)
+            self.claude_state_label.configure(
+                text=("Claude：已检测，可受限调用" if self.claude_bridge.available else
+                      "Claude：本机未安装，自动使用主 AI"))
             self._pet_append("event", "角色与 AI 设置已保存；API Key 由当前 Windows 用户 DPAPI 加密。")
             self._set_pet_state("success", "SETTINGS SAVED")
         except Exception as error:
@@ -1225,12 +1373,22 @@ class Studio(tk.Tk):
             "port": self.link.port.port if self.link.connected and self.link.port else "",
             "state": self.device_state,
             "recording": self.device_recording,
+            "configured_rate_hz": self.device_rate,
+            "configured_duration_s": self.device_duration,
+            "firmware_version": self.device_firmware_version,
             "samples": len(self.samples),
             "latest_sample": self.last_sample,
             "motion_summary": self.motion_chart.summary(),
             "chart_channels": [name for name, variable in self.motion_chart.channel_vars.items()
                                if variable.get()],
             "chart_window": self.motion_chart.window_var.get(),
+            "computer": dict(self.host_snapshot),
+            "experiment": {
+                "status": self.device_state,
+                "recording": self.device_recording,
+                "received_samples": len(self.samples),
+                "summary": self.motion_chart.summary(),
+            },
         }
 
     def send_pet_message(self, preset: str | None = None):
@@ -1243,6 +1401,21 @@ class Studio(tk.Tk):
         context = self._device_context()
         def worker():
             reply = self.pet_runtime.chat(text, context)
+            should_delegate = (self.pet_settings.delegate_complex and
+                               self.claude_bridge.should_delegate(
+                                   text, reply.delegate_to_claude))
+            if should_delegate:
+                self.events.put(("claude_started", None))
+                task = reply.delegate_prompt or text
+                result = self.claude_bridge.process(task, context, reply.text)
+                if result.ok:
+                    reply = PetReply(result.text, "speaking", True, source="claude",
+                                     action="TALK")
+                    self.pet_runtime.memory.append("assistant", result.text)
+                    self.events.put(("claude_finished", result.elapsed_s))
+                else:
+                    reply.text += f"\n（Claude 转交未完成：{result.error}）"
+                    self.events.put(("claude_error", result.error))
             self.events.put(("pet_reply", reply))
         threading.Thread(target=worker, daemon=True, name="pet-agent").start()
 
@@ -1259,11 +1432,12 @@ class Studio(tk.Tk):
         }.get(reply.emotion, "PET ONLINE")
 
     def _handle_pet_reply(self, reply: PetReply):
-        self._pet_append("pet", reply.text)
-        self._set_pet_state(reply.emotion, reply.text)
-        if (reply.device_notice and self.pet_settings.sync_device and self.link.connected
+        self.last_pet_reply = reply
+        self._pet_append("claude" if reply.source == "claude" else "pet", reply.text)
+        self._set_pet_state(reply.emotion, reply.text, reply.action)
+        if (self.pet_settings.sync_device and self.device_pet_enabled and self.link.connected
                 and not self.device_recording):
-            self.send(f"NOTICE,AI PET,{self._ascii_device_notice(reply)}")
+            self._sync_pet_reply_to_device(reply)
         self.after(4500, lambda: self._set_pet_state("idle", "LINK READY")
                    if self.pet_emotion == reply.emotion else None)
 
@@ -1272,18 +1446,38 @@ class Studio(tk.Tk):
             return
         reply = self.pet_runtime.react_event(event, detail)
         if reply:
+            self.last_pet_reply = reply
             self._pet_append("event", reply.text)
-            self._set_pet_state(reply.emotion, event.replace("_", " ").upper())
-            if (reply.device_notice and self.pet_settings.sync_device and self.link.connected
+            self._set_pet_state(reply.emotion, event.replace("_", " ").upper(), reply.action)
+            if (reply.device_notice and self.pet_settings.sync_device and self.device_pet_enabled
+                    and self.link.connected
                     and not self.device_recording):
-                self.send(f"NOTICE,AI PET,{self._ascii_device_notice(reply)}")
+                self._sync_pet_reply_to_device(reply)
 
     def _handle_line(self, line: str):
         self._append_log(line)
-        if line.startswith("STATUS,"):
+        if line.startswith("PONG,LABCAPSULE,"):
+            self.device_firmware_version = line.split(",", 2)[-1].strip()
+            if self.device_firmware_version.startswith("0.11."):
+                self.pet_device_status.configure(text="设备桌宠：COM8 协议就绪")
+                pending = self.pending_pet_device_reply or self.last_pet_reply
+                self.pending_pet_device_reply = None
+                if self.device_pet_enabled and self.pet_settings.sync_device:
+                    self._sync_pet_reply_to_device(pending)
+            else:
+                self.pet_device_status.configure(
+                    text=f"设备桌宠：需更新固件（当前 {self.device_firmware_version}）")
+        elif line.startswith("STATUS,"):
             fields = line.split(",")
             if len(fields) > 1:
                 self.device_state = fields[1]
+            values = {item.split("=", 1)[0]: item.split("=", 1)[1]
+                      for item in fields[2:] if "=" in item}
+            try:
+                self.device_rate = int(values.get("RATE", self.device_rate))
+                self.device_duration = int(values.get("DURATION", self.device_duration))
+            except ValueError:
+                pass
         elif line.startswith("OK,START"):
             self.device_state = "RECORDING"
             self.device_recording = True
@@ -1296,10 +1490,17 @@ class Studio(tk.Tk):
             self.device_state = "ABORTED"
             self.device_recording = False
             self._pet_event("experiment_abort")
-        elif line.startswith("ERR,") and time.monotonic() - self.last_pet_error_at > 8:
+        elif (line.startswith("ERR,") and not line.startswith("ERR,UPLOAD,PETBUBBLE")
+              and time.monotonic() - self.last_pet_error_at > 8):
             self.last_pet_error_at = time.monotonic()
             self._pet_event("device_error", line[:100])
-        if line.startswith("STATUS,") or line.startswith("PONG,") or line.startswith("GIF,"):
+        if line == "PET,INPUT,TALK":
+            self.focus_pet_tab()
+            self.send_pet_message("请简要介绍当前电脑、设备和实验状态")
+        elif line == "PET,INPUT,NEXT_ACTION":
+            self._set_pet_state("happy", "HELLO", "BOUNCE")
+        if (line.startswith("STATUS,") or line.startswith("PONG,") or
+                line.startswith("GIF,") or line.startswith("PET,")):
             self.device_status.insert("end", line + "\n")
             self.device_status.see("end")
         if line.startswith("DATA,"):
@@ -1318,8 +1519,10 @@ class Studio(tk.Tk):
 
     def _heartbeat(self):
         cpu = round(psutil.cpu_percent())
-        ram = round(psutil.virtual_memory().percent)
-        disk = round(psutil.disk_usage(Path.home().anchor or "C:\\").percent)
+        memory = psutil.virtual_memory()
+        disk_usage = psutil.disk_usage(Path.home().anchor or "C:\\")
+        ram = round(memory.percent)
+        disk = round(disk_usage.percent)
         temperature = -1
         try:
             readings = psutil.sensors_temperatures()
@@ -1328,11 +1531,36 @@ class Studio(tk.Tk):
                 temperature = round(values[0])
         except Exception:
             pass
+        battery = None
+        try:
+            battery = psutil.sensors_battery()
+        except Exception:
+            pass
+        self.host_snapshot = {
+            "os": f"{platform.system()} {platform.release()}",
+            "cpu_percent": cpu,
+            "logical_cpus": psutil.cpu_count(logical=True) or 0,
+            "memory_percent": ram,
+            "memory_used_gb": round(memory.used / (1024 ** 3), 2),
+            "memory_total_gb": round(memory.total / (1024 ** 3), 2),
+            "disk_percent": disk,
+            "disk_free_gb": round(disk_usage.free / (1024 ** 3), 2),
+            "temperature_c": temperature if temperature >= 0 else None,
+            "battery_percent": round(battery.percent) if battery else None,
+            "power_plugged": bool(battery.power_plugged) if battery else None,
+            "uptime_seconds": max(0, round(time.time() - psutil.boot_time())),
+            "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
         for key, value in (("cpu", cpu), ("ram", ram), ("disk", disk)):
             self.metric_labels[key].configure(text=f"{value}%")
         if self.link.connected:
-            self.send(f"HOST,{cpu},{ram},{disk},{temperature}")
             now = time.monotonic()
+            if (not self.device_firmware_version and
+                    now - self.last_handshake_at >= 2.0):
+                self.last_handshake_at = now
+                self.send("PING")
+                self.send("STATUS")
+            self.send(f"HOST,{cpu},{ram},{disk},{temperature}")
             if self.notification_enabled and now - self.last_notification_poll >= 5:
                 self.last_notification_poll = now
                 threading.Thread(target=self._poll_notifications, daemon=True).start()
@@ -1463,6 +1691,16 @@ class Studio(tk.Tk):
                     self.connection_label.configure(text=f"● {port if state else '未连接'}",
                                                     fg=self.CYAN if state else self.RED)
                     self.connect_button.configure(text="断开" if state else "连接")
+                    if state:
+                        self.device_firmware_version = ""
+                        self.last_handshake_at = 0.0
+                        self.pet_device_status.configure(text="设备桌宠：正在握手…")
+                    else:
+                        self.device_firmware_version = ""
+                        self.device_pet_enabled = False
+                        self.pet_device_sync_active = False
+                        self.pending_pet_device_reply = None
+                        self.pet_device_status.configure(text="设备桌宠：等待连接")
                     self._pet_event("connected" if state else "disconnected")
                 elif kind == "progress":
                     self.media_progress["value"] = int(payload)
@@ -1484,6 +1722,36 @@ class Studio(tk.Tk):
                     self._notice_command(title, body)
                 elif kind == "pet_reply":
                     self._handle_pet_reply(payload)
+                elif kind == "claude_started":
+                    self.claude_state_label.configure(text="Claude：正在受限处理复杂任务…")
+                    self._set_pet_state("thinking", "CLAUDE WORKING", "THINK")
+                elif kind == "claude_finished":
+                    self.claude_state_label.configure(
+                        text=f"Claude：处理完成 · {float(payload):.1f} 秒 · 无工具权限")
+                elif kind == "claude_error":
+                    self.claude_state_label.configure(text=f"Claude：转交失败 · {str(payload)[:70]}")
+                elif kind == "pet_device_progress":
+                    self.pet_device_status.configure(text=f"设备桌宠：同步 {int(payload)}%")
+                elif kind == "pet_device_done":
+                    self.pet_device_sync_active = False
+                    self.pet_device_status.configure(
+                        text=f"设备桌宠：已显示 · {payload.emotion.upper()} / 中文气泡")
+                    if not self.device_pet_enabled and self.link.connected:
+                        self.send("PET,HIDE")
+                        continue
+                    pending = self.pending_pet_device_reply
+                    self.pending_pet_device_reply = None
+                    if pending is not None:
+                        self._sync_pet_reply_to_device(pending)
+                elif kind == "pet_device_error":
+                    self.pet_device_sync_active = False
+                    self.pet_device_status.configure(text=f"设备桌宠：同步失败 · {str(payload)[:80]}")
+                    if not self.device_pet_enabled:
+                        continue
+                    pending = self.pending_pet_device_reply
+                    self.pending_pet_device_reply = None
+                    if pending is not None:
+                        self._sync_pet_reply_to_device(pending)
                 elif kind == "avatar_progress":
                     self._set_avatar_status("正在下载并验证网络形象…", int(payload))
                 elif kind == "avatar_done":
@@ -1546,5 +1814,11 @@ if __name__ == "__main__":
             raise SystemExit("缺少 Live2D model3.json 路径") from error
         mode_argument = "overlay" if "--mode" in sys.argv and sys.argv[
             sys.argv.index("--mode") + 1] == "overlay" else "stage"
-        raise SystemExit(run_player_guarded(model_argument, mode_argument))
+        control_argument = None
+        if "--control" in sys.argv:
+            try:
+                control_argument = sys.argv[sys.argv.index("--control") + 1]
+            except IndexError as error:
+                raise SystemExit("缺少 Live2D control.json 路径") from error
+        raise SystemExit(run_player_guarded(model_argument, mode_argument, control_argument))
     Studio().mainloop()
