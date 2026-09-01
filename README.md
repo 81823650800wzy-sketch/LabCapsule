@@ -2,7 +2,17 @@
 
 > Ask a question. Run an experiment.
 
-LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前 Android 版本为 **V1.1.0 Alpha / AI Measurement Workspace**：首页自然语言直接驱动 MPU6050 测量、实时曲线、标定与分析；同一个稳定硬件身份和 Hiyori 角色继续贯通 240×320 实体屏、Windows EXE 与 Android APK。
+LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前双端版本为 **V1.2.0 Alpha / Role Card Collaboration**：在 V1.1 自然语言测量闭环上，新增可搜索多会话、带进度更新、私有完整角色卡同步，以及经一次性配对授权的手机—电脑—Claude 协同。
+
+## V1.2.0 双端新增
+
+- APK 更新显示真实字节与百分比，退出再进入可继续追踪系统下载任务。
+- 对话按用户内容命名并折叠，支持新对话、模糊搜索和自动定位；用户与 AI 气泡方向和配色不同。
+- Live2D、人设、静态预览和可选语音包组成完整角色卡，通过用户私有仓库的小索引与 Release 资产在 PC/手机同步；按 SHA-256 本地缓存。
+- Android 与 Windows 都能横向预览角色卡，并可单独勾选替换形象、人设或语音包。
+- Studio 手机桥默认关闭；用户在电脑开启后，手机必须输入 10 分钟有效的一次性码，才可读取电脑/设备状态并把复杂问题交给电脑端 Claude。
+
+完整操作见 [V1.2 角色卡与手机电脑协同指南](docs/V1.2.0_ROLECARD_COLLAB_GUIDE_ZH.md)。
 
 ## V1.1.0 Android 新增
 
@@ -150,7 +160,7 @@ V0.4.0 的界面与媒体能力继续保留：
    idf.py -p COM8 flash monitor
    ```
 
-2. Windows 端运行 GitHub Release 中的 `LabCapsule-Studio-1.0.0.exe`；Android 端安装 `LabCapsule-1.1.0.apk`。手机首次进入“设置 → 设备与连接”时，推荐选择：
+2. Windows 端运行 GitHub Release 中的 `LabCapsule-Studio-1.2.0.exe`；Android 端安装 `LabCapsule-1.2.0.apk`。手机首次进入“设置 → 设备与连接”时，推荐选择：
 
    - BLE：点击扫描并允许“附近设备”权限；连接成功后直接点“蓝牙一键配网”；
    - 恢复热点：只在排障时连接 `LabCapsule-XXXX`，密码 `labcapsule`，地址 `http://192.168.4.1`。

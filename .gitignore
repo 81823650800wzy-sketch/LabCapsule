@@ -22,6 +22,7 @@ venv/
 dist/
 build/
 *.spec
+!LabCapsule-Studio-1.2.0.spec
 desktop/live2d_web/node_modules/
 !desktop/live2d_web/dist/
 !desktop/live2d_web/dist/player.bundle.js

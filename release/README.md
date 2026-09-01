@@ -1,60 +1,25 @@
-# LabCapsule 1.1.0 Alpha（Android AI 测量工作台）
-
-本次只更新 Android APK、文档和测试；Windows Studio 与 ESP32 固件继续使用 1.0.0，协议保持兼容，无需重新烧录 COM8。
+# LabCapsule 1.2.0 Alpha（角色卡与手机电脑协同）
 
 ## 发布文件
 
-- `LabCapsule-Studio-1.0.0.exe` — Windows 10/11 单文件 Studio，85,841,923 字节。
-- `LabCapsule-1.1.0.apk` — Android 8.0+ 简体中文 AI 测量工作台，373,302 字节。
-- `LabCapsule-1.0.0-ota.bin` — ESP32-S3 V1.0.0 应用 OTA 镜像，1,398,704 字节。
+- `LabCapsule-1.2.0.apk` — Android 8.0+ 简体中文客户端，393,781 字节。
+- `LabCapsule-Studio-1.2.0.exe` — Windows 10/11 x64 单文件 Studio，85,875,274 字节。
+- ESP32-S3 固件协议没有改变，继续使用 V1.0.0-alpha / 0.11 系列兼容固件；本版不要求重新烧录。
 
 ## SHA-256
 
 ```text
-6CBEC60592639EF7463B7133DAD47CF4FF5EB661FBE25AAF37D7E4918F990C35  LabCapsule-Studio-1.0.0.exe
-C08CDA213F94FAC12DE1CD776687A1B564E73F91644E3FFEEE0F08C4AAC1DC73  LabCapsule-1.1.0.apk
-675DA5103E6B53C496F9E6206883D56ED906375E0196C23EB7FB44FF710DF685  LabCapsule-1.0.0-ota.bin
+7E603AF0CB5FF871461567AC697D29288A85B1605C07C0EFE5FDB6890715F1C7  LabCapsule-1.2.0.apk
+30BB5F104A8BBF2F5A5175009CF685882C786F646C413CAA7C1857C6B973B653  LabCapsule-Studio-1.2.0.exe
 ```
-
-EXE 当前没有 Authenticode 签名，APK 为开发签名。请只从本仓库 GitHub Release 下载并核对 SHA-256；商业发行前需替换正式证书。
 
 ## 安装顺序
 
-1. 首次使用 V1 或分区表变化时，在 `firmware` 目录执行 `idf.py -p COM8 flash`；不要执行 `erase-flash`。
-2. Windows 运行 `LabCapsule-Studio-1.0.0.exe`；Android 安装 `LabCapsule-1.1.0.apk`。
-3. 保持手机/电脑在正常有网络连接上，优先用 USB 或 BLE 找到设备；不要长期连接恢复热点。
-4. 核对稳定设备 ID。COM8 本次实机为 `lc-000000000000`。
-5. Windows 已可从用户目录恢复 Hiyori Free。Android 需把完整 Hiyori 文件夹复制到手机并在“设置 → Live2D 角色”选择；模型不包含在发布包中。
-6. 如需跨端记忆，在双端配置用户自己的私有 GitHub 仓库和最小权限 Token。
+1. 保持电脑和手机连接原有正常联网 Wi-Fi，不连接 LabCapsule 无网络恢复热点。
+2. Windows 运行 `LabCapsule-Studio-1.2.0.exe`；Android 安装 `LabCapsule-1.2.0.apk`。
+3. 设备仍优先使用 USB COM8；只有 5 GHz 路由器时，ESP32 使用 USB/BLE，手机和电脑保持自身网络。
+4. 需要手机访问电脑时，由用户在 Studio 设置中手动开启手机桥，再在 APK 输入一次性配对码。
+5. 需要双端角色卡时，在两端填写同一个私有 GitHub 仓库、分支和具有 Contents/Releases 权限的细粒度 Token。
 
-## 重点变化
-
-- Android 导航改为“首页 / 数据 / 桌面 / 设置”，首页只保留统一角色与 AI 对话。
-- 自然语言可直接触发 MPU6050 测量、实时曲线、本地分析和结果回复。
-- 数据页新增缩放、平移、逐点六轴查看、日期折叠搜索、PNG/CSV 导出。
-- 支持自然语言单轴标定；回正统一应用于 CSV、图表和分析。
-- 对话、记忆和实验 CSV 本地优先，联网后周期同步用户私有仓库。
-
-- Windows、Android、实体屏统一 Hiyori 内容 ID `live2d-000000000000`；旧 `local-*` 自动迁移。
-- Windows 增加 USB/LAN/BLE 三链路、语音转写、私有记忆、持久实验会话和简化导航。
-- Android 增加统一 Hiyori 对话、系统语音、Live2D 文件夹导入、私有记忆和真实 240:320 舞台。
-- 设备暴露稳定硬件身份、角色代理、STA 状态、传感器与 `MIC_PORT` 扩展能力。
-- GIF/Hiyori 代理一次写入设备本地并持续播放；AI 回答只同步安全动作和底部气泡。
-- 新增按需组件/设备上下文 Skill，防止 AI 为每次问题加载整个仓库。
-- 修复扩展 I²C 扫描对已启动 MPU 的争用；USB 和 BLE 均返回 MPU6050 0x68。
-
-## 验证摘要
-
-- 63/63 Python 自动化测试通过。
-- Android versionCode 110 / versionName 1.1.0，APK v2/v3 签名通过，包内 Live2D 播放器资产完整。
-- ESP-IDF 5.5.4 构建通过，3 MiB app 分区剩余 56%；最终 OTA 镜像已写入 COM8 并通过哈希校验。
-- COM8 返回 V1 身份、MPU OK、传感器 count 1、Hiyori proxy ON。
-- Windows BLE 实机读取同一身份、角色、网络字段和传感器。
-- 源码与最终 EXE 均用用户现有 Hiyori Free 完成 24 帧、8 FPS 捕获；EXE 隐藏启动 20 秒保持运行。
-- 当前无 ADB 手机，故 Android 真机 Live2D WebView 仍需用户安装后执行指南中的首次导入验收。
-
-完整指南：`docs/V1.1.0_AI_MEASUREMENT_GUIDE_ZH.md`
-
-测试证据：`docs/V1.1.0_TEST_REPORT_ZH.md`
-
-按需上下文 Skill：`skills/labcapsule-context-access/SKILL.md`
+完整步骤：[V1.2 使用指南](../docs/V1.2.0_ROLECARD_COLLAB_GUIDE_ZH.md)
+验证证据：[V1.2 测试报告](../docs/V1.2.0_TEST_REPORT_ZH.md)

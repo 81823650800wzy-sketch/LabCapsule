@@ -40,7 +40,9 @@ class AndroidV11NavigationTests(unittest.TestCase):
     def test_home_contains_only_avatar_and_conversation(self):
         home = method_body("View buildHomePage", "View buildDevicePage")
         self.assertIn("addMobileLive2dStage", home)
-        self.assertIn("assistantConversationView", home)
+        self.assertIn("conversationSessionsView", home)
+        self.assertIn("createNewConversation", home)
+        self.assertIn("renderConversationSessions", home)
         self.assertNotIn("aiEndpoint =", home)
         self.assertNotIn("confirmLive2dImport", home)
         self.assertNotIn("快速实验", home)
@@ -103,9 +105,9 @@ class AndroidV11MeasurementTests(unittest.TestCase):
         self.assertIn("15L * 60L * 1000L", SOURCE)
 
     def test_build_metadata_is_v11(self):
-        self.assertRegex(BUILD, r"--version-code\s+110")
-        self.assertIn("--version-name '1.1.0'", BUILD)
-        self.assertIn("LabCapsule-1.1.0.apk", BUILD)
+        self.assertRegex(BUILD, r"--version-code\s+120")
+        self.assertIn("--version-name '1.2.0'", BUILD)
+        self.assertIn("LabCapsule-1.2.0.apk", BUILD)
 
 
 if __name__ == "__main__":

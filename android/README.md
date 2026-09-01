@@ -1,10 +1,18 @@
-# LabCapsule Android Remote 1.1.0
+# LabCapsule Android Remote 1.2.0
 
 原生 Java Android 8.0+ 控制器，不依赖 Gradle 或第三方 Android 运行库。默认简体中文，采用“首页 / 数据 / 桌面 / 设置”四分区液态导航。首页只显示统一 Live2D 形象和 AI 对话；Live2D、AI、实验参数、连接、屏幕、网络、记忆和固件全部位于可模糊搜索且默认折叠的设置区。
 
-完整用户步骤见 [V1.1 AI 测量工作台使用指南](../docs/V1.1.0_AI_MEASUREMENT_GUIDE_ZH.md)。
+完整用户步骤见 [V1.2 角色卡与手机电脑协同指南](../docs/V1.2.0_ROLECARD_COLLAB_GUIDE_ZH.md)。
 
-## V1.1 能力
+## V1.2 新增
+
+- APK 更新使用系统下载器并显示等待、下载字节、百分比、暂停、失败和完成状态；应用重启后会恢复同一下载任务的进度显示。
+- 首页按用户第一条提问自动命名会话；历史会话默认折叠，支持新对话、模糊搜索和自动滚到命中位置；用户与 Hiyori 使用不同方向和颜色的气泡。
+- 完整角色卡包含 Live2D、人设、静态预览和可选语音包。私有仓库只保存小索引和 GitHub Release 二进制资产；横向预览中可分别勾选形象、人设、语音包。
+- 完整角色卡仅首次选择或哈希变化时下载；APK 校验 SHA-256 后保存到私有目录，离线切换不重复访问仓库。
+- 手机可通过一次性 6 位配对码申请 Studio 权限，读取电脑与 LabCapsule 状态，并把复杂问题交给电脑端 Claude 后接收回答。手机桥默认关闭且不开放 Shell、任意文件或未经确认的写操作。
+
+## V1.1 基础能力
 
 - 对首页直接说“马上帮我测试 10 秒的桌面震动情况”，本地意图执行器会选择 MPU6050、扫描设备、下发协议、实时画图、保存 CSV 并自动分析，不要求 AI 模型控制硬件。
 - 数据页实时绘制 AX/AY/AZ，支持双指缩放、横向拖动、点选查看六轴值，并可导出 PNG 与原始 CSV；历史按日期折叠并支持模糊搜索。
@@ -32,7 +40,7 @@ cd <仓库目录>\android
 .\build-apk.ps1
 ```
 
-输出 `dist\LabCapsule-1.1.0.apk`。脚本执行 aapt2、javac、D8、zipalign 和 apksigner。仓库里的 keystore 仅用于开发测试；商业发布必须更换正式私钥。
+输出 `dist\LabCapsule-1.2.0.apk`。脚本执行 aapt2、javac、D8、zipalign 和 apksigner。仓库里的 keystore 仅用于开发测试；商业发布必须更换正式私钥。
 
 ## 推荐连接流程
 

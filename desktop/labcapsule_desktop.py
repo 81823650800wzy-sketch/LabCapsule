@@ -7,9 +7,12 @@ USB, an already-reachable LAN address, or BLE for device control and transfer.
 from __future__ import annotations
 
 import asyncio
+import base64
 import csv
 from datetime import datetime
 import json
+import hashlib
+import io
 import math
 import platform
 from pathlib import Path
@@ -39,17 +42,21 @@ from media_codec import (HEIGHT, MAX_FPS, WIDTH, build_clip_from_frames, build_m
 from pet_agent import CharacterProfile, PetAgentRuntime, PetAvatarCanvas, PetOverlay, PetReply, PetSettings
 from pet_device import pet_state_command, render_pet_bubble
 from pet_packages import (APP_DIR, PET_SELECTION_PATH, PetPackage, avatar_asset_for_package, clear_selected_pet,
-                          discover_pet_packages, save_selected_pet, selected_pet_package)
+                          discover_pet_packages, load_pet_package, save_selected_pet,
+                          selected_pet_package)
 from live2d_runtime import (CONTROL_PATH, has_live2d_consent, player_command,
                             save_live2d_consent, write_live2d_action)
 from memory_repo import (GitHubMemoryClient, MemoryRemote, empty_snapshot,
                          merge_snapshots)
+from mobile_bridge import MobileBridgeServer
+from role_card_repo import (GitHubRoleCardClient, RoleCardRemote, apply_role_card,
+                            build_role_card)
 from device_transport import BleLink, LanLink
 from speech_input import record_wav, transcribe_wav
 from experiment_store import ExperimentStore
 
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.2.0"
 BAUD_RATE = 460800
 ROOT = Path(__file__).resolve().parent
 
@@ -322,6 +329,13 @@ class Studio(tk.Tk):
         self.pet_settings = PetSettings.load()
         self.pet_runtime = PetAgentRuntime(self.pet_settings)
         self.claude_bridge = ClaudeBridge(self.pet_settings.claude_model)
+        self.mobile_bridge: MobileBridgeServer | None = None
+        self.role_preview_path = ""
+        self.role_voice_path = ""
+        self.role_card_catalog: dict = {"schemaVersion": 1, "cards": []}
+        self.role_card_window: tk.Toplevel | None = None
+        self.role_card_photos: list[ImageTk.PhotoImage] = []
+        self.role_profile_override: CharacterProfile | None = None
         self.device_pet_enabled = False
         self.pet_device_sync_active = False
         self.pending_pet_device_reply: PetReply | None = None
@@ -819,8 +833,37 @@ class Studio(tk.Tk):
         ttk.Button(settings_card, text="立即同步当前设备记忆",
                    command=self.sync_memory_now).pack(fill="x", pady=3)
         ttk.Button(settings_card, text="清除桌宠记忆", command=self.clear_pet_memory).pack(fill="x", pady=3)
+        ttk.Separator(settings_card).pack(fill="x", pady=9)
+        ttk.Label(settings_card, text="完整角色卡（PC / 手机）",
+                  style="Muted.TLabel").pack(anchor="w")
+        self.role_card_status = ttk.Label(
+            settings_card, text="角色卡：选择静态预览后可上传当前 Live2D；完整包按需缓存。",
+            style="Muted.TLabel", wraplength=285)
+        self.role_card_status.pack(anchor="w", pady=(5, 3))
+        role_files = tk.Frame(settings_card, bg=self.PANEL)
+        role_files.pack(fill="x")
+        ttk.Button(role_files, text="选择预览", command=self.choose_role_preview).pack(
+            side="left", fill="x", expand=True, padx=(0, 2))
+        ttk.Button(role_files, text="选择语音包", command=self.choose_role_voice).pack(
+            side="left", fill="x", expand=True, padx=(2, 0))
+        ttk.Button(settings_card, text="上传当前完整角色卡", style="Accent.TButton",
+                   command=self.upload_current_role_card).pack(fill="x", pady=3)
+        ttk.Button(settings_card, text="同步并选择私有仓库角色卡",
+                   command=self.show_role_card_library).pack(fill="x", pady=3)
+        ttk.Separator(settings_card).pack(fill="x", pady=9)
+        ttk.Label(settings_card, text="手机访问电脑（需明确授权）",
+                  style="Muted.TLabel").pack(anchor="w")
+        self.mobile_bridge_status = ttk.Label(
+            settings_card,
+            text="手机桥：关闭。开启后在手机输入这里显示的一次性配对码。",
+            style="Muted.TLabel", wraplength=285)
+        self.mobile_bridge_status.pack(anchor="w", pady=(5, 3))
+        self.mobile_bridge_button = ttk.Button(
+            settings_card, text="开启手机桥并生成配对码", command=self.toggle_mobile_bridge)
+        self.mobile_bridge_button.pack(fill="x", pady=3)
         ttk.Label(settings_card,
                   text="个人记忆只允许写入私有仓库；Token 不写入仓库。Claude 桥禁用全部工具且不保存会话；"
+                       "手机桥仅开放电脑/实验状态和受限 Claude 分析，不开放 Shell、文件或任意设备操作；"
                        "启动/中止实验、网络和固件操作始终由用户确认。",
                   style="Muted.TLabel", wraplength=285).pack(anchor="w", pady=8)
         self._pet_append("event", f"{self.pet_settings.profile.name}：{self.pet_settings.profile.greeting}")
@@ -1064,6 +1107,14 @@ class Studio(tk.Tk):
         self._apply_avatar_decoded(decoded, f"{package.name} · 统一角色包")
         self.active_pet_package = package
         self._apply_pet_package_profile(package)
+        if self.role_profile_override is not None:
+            profile = self.role_profile_override
+            self.role_profile_override = None
+            self.pet_settings.profile = profile
+            self.pet_runtime.update_settings(self.pet_settings)
+            self.pet_name_var.set(profile.name)
+            self.pet_persona.delete("1.0", "end")
+            self.pet_persona.insert("1.0", profile.persona)
         if persist:
             save_selected_pet(package)
         license_text = f" · {package.license}" if package.license else ""
@@ -1174,6 +1225,14 @@ class Studio(tk.Tk):
             self.pet_overlay.destroy()
             self.pet_overlay = None
         self._apply_pet_package_profile(package)
+        if self.role_profile_override is not None:
+            profile = self.role_profile_override
+            self.role_profile_override = None
+            self.pet_settings.profile = profile
+            self.pet_runtime.update_settings(self.pet_settings)
+            self.pet_name_var.set(profile.name)
+            self.pet_persona.delete("1.0", "end")
+            self.pet_persona.insert("1.0", profile.persona)
         self.avatar_url_var.set("")
         self.pet_avatar_source_label.configure(
             text=f"形象：Live2D · {package.live2d_motion_count} 个动作 · 独立 GPU 舞台")
@@ -1653,6 +1712,270 @@ class Studio(tk.Tk):
                 self.events.put(("memory_sync_error", str(error)))
 
         threading.Thread(target=worker, daemon=True, name="memory-sync").start()
+
+    def _role_card_remote(self) -> RoleCardRemote:
+        return RoleCardRemote(self.memory_repository_var.get().strip(),
+                              self.memory_token_var.get().strip(),
+                              self.memory_branch_var.get().strip() or "main")
+
+    def choose_role_preview(self):
+        value = filedialog.askopenfilename(
+            title="选择角色卡静态预览",
+            filetypes=(("图片", "*.png;*.jpg;*.jpeg;*.webp"), ("全部文件", "*.*")))
+        if value:
+            self.role_preview_path = value
+            self.role_card_status.configure(text=f"角色卡预览：{Path(value).name}")
+
+    def choose_role_voice(self):
+        value = filedialog.askopenfilename(
+            title="选择可选语音包",
+            filetypes=(("语音/压缩包", "*.wav;*.mp3;*.ogg;*.zip;*.json"),
+                       ("全部文件", "*.*")))
+        if value:
+            self.role_voice_path = value
+            self.role_card_status.configure(text=f"语音包：{Path(value).name}")
+
+    def upload_current_role_card(self):
+        package = self.active_pet_package
+        if package is None or package.visual_kind != "live2d":
+            messagebox.showwarning("无法创建角色卡", "请先在桌宠管理中选择并应用 Live2D 角色。")
+            return
+        if not self.role_preview_path:
+            messagebox.showwarning("缺少静态预览", "请先选择角色卡静态预览图。")
+            return
+        self.role_card_status.configure(text="角色卡：正在打包并校验 Live2D 依赖…")
+        persona = self.pet_persona.get("1.0", "end").strip()
+        remote = self._role_card_remote()
+
+        def worker():
+            try:
+                cache = APP_DIR / "rolecards" / "cache"
+                cache.mkdir(parents=True, exist_ok=True)
+                bundle = cache / f"{package.package_id}.upload.zip"
+                item = build_role_card(package, persona, self.role_preview_path,
+                                       self.role_voice_path or None, bundle)
+                client = GitHubRoleCardClient(remote)
+                catalog = client.publish(
+                    bundle, item,
+                    lambda value: self.events.put(("role_card_upload_progress", value)))
+                final = cache / f"{item['id']}-{item['sha256']}.zip"
+                bundle.replace(final)
+                self.events.put(("role_card_upload_done", (catalog, final)))
+            except Exception as error:
+                self.events.put(("role_card_error", str(error)))
+
+        threading.Thread(target=worker, daemon=True, name="role-card-upload").start()
+
+    def sync_role_card_catalog(self):
+        self.role_card_status.configure(text="角色卡：正在读取私有仓库索引…")
+        remote = self._role_card_remote()
+
+        def worker():
+            try:
+                client = GitHubRoleCardClient(remote)
+                client.require_private_repository()
+                catalog, _sha = client.pull_catalog()
+                self.events.put(("role_card_catalog_done", catalog))
+            except Exception as error:
+                self.events.put(("role_card_error", str(error)))
+
+        threading.Thread(target=worker, daemon=True, name="role-card-catalog").start()
+
+    def show_role_card_library(self):
+        if self.role_card_window is not None and self.role_card_window.winfo_exists():
+            self.role_card_window.deiconify()
+            self.role_card_window.lift()
+            self.sync_role_card_catalog()
+            return
+        window = tk.Toplevel(self)
+        self.role_card_window = window
+        window.title("私有角色卡 · PC / 手机同步")
+        window.geometry("920x430")
+        window.minsize(720, 380)
+        window.configure(bg=self.BG)
+        window.transient(self)
+        window.protocol("WM_DELETE_WINDOW", lambda: (window.destroy(),
+                                                       setattr(self, "role_card_window", None)))
+        header = tk.Frame(window, bg=self.BG, padx=18, pady=12)
+        header.pack(fill="x")
+        tk.Label(header, text="ROLE CARDS / PRIVATE CACHE", bg=self.BG, fg=self.INK,
+                 font=("Bahnschrift", 17, "bold")).pack(side="left")
+        self.role_replace_visual_var = tk.BooleanVar(value=True)
+        self.role_replace_persona_var = tk.BooleanVar(value=True)
+        self.role_replace_voice_var = tk.BooleanVar(value=True)
+        for text, variable in (("形象", self.role_replace_visual_var),
+                               ("人设", self.role_replace_persona_var),
+                               ("语音包", self.role_replace_voice_var)):
+            ttk.Checkbutton(header, text=text, variable=variable).pack(side="right", padx=5)
+        ttk.Button(header, text="刷新", command=self.sync_role_card_catalog).pack(side="right", padx=8)
+        shell = tk.Frame(window, bg=self.BG)
+        shell.pack(fill="both", expand=True, padx=18, pady=(0, 16))
+        self.role_card_canvas = tk.Canvas(shell, bg=self.BG, height=300,
+                                          highlightthickness=0)
+        scrollbar = ttk.Scrollbar(shell, orient="horizontal",
+                                  command=self.role_card_canvas.xview)
+        self.role_card_canvas.configure(xscrollcommand=scrollbar.set)
+        self.role_card_canvas.pack(fill="both", expand=True)
+        scrollbar.pack(fill="x")
+        self.role_card_strip = tk.Frame(self.role_card_canvas, bg=self.BG)
+        self.role_card_canvas.create_window((0, 0), window=self.role_card_strip, anchor="nw")
+        self.role_card_strip.bind("<Configure>", lambda _event:
+                                  self.role_card_canvas.configure(
+                                      scrollregion=self.role_card_canvas.bbox("all")))
+        self._render_role_card_library()
+        self.sync_role_card_catalog()
+
+    def _render_role_card_library(self):
+        if self.role_card_window is None or not self.role_card_window.winfo_exists():
+            return
+        for child in self.role_card_strip.winfo_children():
+            child.destroy()
+        self.role_card_photos.clear()
+        cards = self.role_card_catalog.get("cards", [])
+        if not cards:
+            tk.Label(self.role_card_strip, text="私有仓库中暂无角色卡，或索引尚未刷新。",
+                     bg=self.BG, fg=self.MUTED, padx=30, pady=100).pack(side="left")
+            return
+        for item in cards[:30]:
+            frame = tk.Frame(self.role_card_strip, bg=self.PANEL, width=190, height=285,
+                             padx=10, pady=10, highlightthickness=1,
+                             highlightbackground=self.PANEL_2)
+            frame.pack(side="left", padx=(0, 10), fill="y")
+            frame.pack_propagate(False)
+            try:
+                raw = base64.b64decode(item.get("previewBase64", ""), validate=True)
+                with Image.open(io.BytesIO(raw)) as source:
+                    image = source.convert("RGB")
+                    image.thumbnail((170, 190), Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(image)
+                self.role_card_photos.append(photo)
+                tk.Label(frame, image=photo, bg=self.PANEL).pack()
+            except Exception:
+                tk.Label(frame, text="NO PREVIEW", bg=self.PANEL_2, fg=self.MUTED,
+                         width=20, height=10).pack()
+            tk.Label(frame, text=str(item.get("name", "未命名角色"))[:28], bg=self.PANEL,
+                     fg=self.INK, font=("Microsoft YaHei UI", 10, "bold")).pack(pady=(7, 2))
+            cached = APP_DIR / "rolecards" / "cache" / \
+                     f"{item.get('id')}-{item.get('sha256')}.zip"
+            state = "已缓存，可离线切换" if cached.is_file() else \
+                    f"按需下载 · {int(item.get('size', 0)) // 1024} KiB"
+            tk.Label(frame, text=state, bg=self.PANEL, fg=self.MUTED,
+                     font=("Microsoft YaHei UI", 8)).pack()
+            ttk.Button(frame, text="按勾选项应用",
+                       command=lambda value=dict(item): self.download_role_card(value)).pack(
+                           fill="x", side="bottom")
+
+    def download_role_card(self, item: dict):
+        visual = self.role_replace_visual_var.get()
+        persona = self.role_replace_persona_var.get()
+        voice = self.role_replace_voice_var.get()
+        if not any((visual, persona, voice)):
+            messagebox.showwarning("没有替换项", "请至少勾选形象、人设或语音包之一。")
+            return
+        self.role_card_status.configure(text=f"角色卡：正在准备 {item.get('name', '')}…")
+        remote = self._role_card_remote()
+
+        def worker():
+            try:
+                cache = APP_DIR / "rolecards" / "cache"
+                digest = str(item["sha256"])
+                bundle = cache / f"{item['id']}-{digest}.zip"
+                valid_cache = False
+                if bundle.is_file():
+                    digest_state = hashlib.sha256()
+                    with bundle.open("rb") as stream:
+                        for chunk in iter(lambda: stream.read(64 * 1024), b""):
+                            digest_state.update(chunk)
+                    current = digest_state.hexdigest()
+                    valid_cache = current == digest
+                if not valid_cache:
+                    client = GitHubRoleCardClient(remote)
+                    client.download(item, bundle,
+                                    lambda value: self.events.put(("role_card_download_progress", value)))
+                destination = APP_DIR / "pets" / "synced" / str(item["id"])
+                manifest = apply_role_card(bundle, destination, True, True, True)
+                package = load_pet_package(destination)
+                self.events.put(("role_card_apply_done",
+                                 (package, manifest, visual, persona, voice)))
+            except Exception as error:
+                self.events.put(("role_card_error", str(error)))
+
+        threading.Thread(target=worker, daemon=True, name="role-card-download").start()
+
+    def _apply_synced_role_card(self, package: PetPackage, manifest: dict,
+                                visual: bool, persona: bool, voice: bool):
+        previous_profile = self.pet_settings.profile
+        if visual:
+            if not persona:
+                self.role_profile_override = previous_profile
+            self._apply_live2d_package(package)
+        elif persona:
+            self._apply_pet_package_profile(package)
+        if voice:
+            voice_entry = str(manifest.get("voiceFile", ""))
+            selection = {"roleId": manifest.get("id", ""), "voiceFile": voice_entry,
+                         "voicePath": str((Path(package.folder) /
+                                           voice_entry.replace("voice/", "", 1)).resolve())
+                         if voice_entry.startswith("voice/") else "",
+                         "updatedAt": datetime.now().astimezone().isoformat()}
+            target = APP_DIR / "role_voice_selection.json"
+            target.write_text(json.dumps(selection, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.pet_settings.save()
+        self.role_card_status.configure(
+            text=f"角色卡：已应用 {manifest.get('name', package.name)} · 本地缓存可离线使用")
+        self._render_role_card_library()
+
+    def _mobile_bridge_context(self) -> dict:
+        """Snapshot only plain fields; safe to call from the HTTP worker thread."""
+        return {
+            "studioVersion": APP_VERSION,
+            "computer": dict(self.host_snapshot),
+            "labcapsule": {
+                "connected": bool(self.link.connected),
+                "transport": str(getattr(self.link, "kind", "usb")),
+                "state": self.device_state,
+                "recording": self.device_recording,
+                "configuredRateHz": self.device_rate,
+                "configuredDurationSeconds": self.device_duration,
+                "firmwareVersion": self.device_firmware_version,
+                "deviceId": self.device_id,
+                "deviceAlias": self.device_alias,
+                "characterId": self.device_character_id,
+                "staConnected": self.device_sta_connected,
+                "staIp": self.device_sta_ip,
+                "sampleCount": len(self.samples),
+                "latestSample": self.last_sample,
+            },
+            "permissions": ["computer.status", "labcapsule.context", "claude.delegate"],
+        }
+
+    def _mobile_bridge_ask(self, question: str) -> dict:
+        result = self.claude_bridge.process(question, self._mobile_bridge_context())
+        if not result.ok:
+            raise RuntimeError(result.error or "电脑端 Claude 没有返回回答")
+        return {"reply": result.text, "elapsedSeconds": round(result.elapsed_s, 2),
+                "model": self.claude_bridge.model}
+
+    def toggle_mobile_bridge(self):
+        if self.mobile_bridge is not None:
+            self.mobile_bridge.stop()
+            self.mobile_bridge = None
+            self.mobile_bridge_status.configure(
+                text="手机桥：已关闭；现有授权不会被网络端使用。")
+            self.mobile_bridge_button.configure(text="开启手机桥并生成配对码")
+            return
+        try:
+            server = MobileBridgeServer(APP_DIR / "mobile_bridge_authorized.json",
+                                        self._mobile_bridge_context, self._mobile_bridge_ask)
+            info = server.start()
+            self.mobile_bridge = server
+            self.mobile_bridge_status.configure(
+                text=f"手机桥：已开启\n地址 {info.url}\n一次性配对码 {info.pairing_code}"
+                     "（10 分钟有效）\n首次开启可能出现 Windows 防火墙局域网提示。")
+            self.mobile_bridge_button.configure(text="关闭手机桥")
+            self._pet_append("event", "手机桥已开启；只有输入当前配对码的手机可读取允许列表中的状态。")
+        except Exception as error:
+            messagebox.showerror("手机桥开启失败", str(error))
 
     def _device_context(self) -> dict:
         return {
@@ -2247,6 +2570,27 @@ class Studio(tk.Tk):
                     self.memory_sync_status.configure(
                         text=f"记忆同步：失败 · {str(payload)[:110]}")
                     self._append_log(f"! 私有记忆同步失败：{payload}")
+                elif kind == "role_card_upload_progress":
+                    self.role_card_status.configure(text=f"角色卡：正在上传 {int(payload)}%")
+                elif kind == "role_card_download_progress":
+                    self.role_card_status.configure(text=f"角色卡：正在下载 {int(payload)}%")
+                elif kind == "role_card_upload_done":
+                    catalog, cached = payload
+                    self.role_card_catalog = catalog
+                    self.role_card_status.configure(
+                        text=f"角色卡：已上传并缓存 · {Path(cached).stat().st_size // 1024} KiB")
+                    self._render_role_card_library()
+                elif kind == "role_card_catalog_done":
+                    self.role_card_catalog = payload
+                    self.role_card_status.configure(
+                        text=f"角色卡：已同步 {len(payload.get('cards', []))} 个 · 完整包按需下载")
+                    self._render_role_card_library()
+                elif kind == "role_card_apply_done":
+                    package, manifest, visual, persona, voice = payload
+                    self._apply_synced_role_card(package, manifest, visual, persona, voice)
+                elif kind == "role_card_error":
+                    self.role_card_status.configure(text=f"角色卡失败：{str(payload)[:120]}")
+                    messagebox.showerror("角色卡操作失败", str(payload))
                 elif kind == "pet_device_progress":
                     self.pet_device_status.configure(text=f"设备桌宠：同步 {int(payload)}%")
                 elif kind == "pet_device_done":
@@ -2309,12 +2653,17 @@ class Studio(tk.Tk):
         self.after(50, self._pump)
 
     def close_app(self):
+        if self.mobile_bridge is not None:
+            self.mobile_bridge.stop()
+            self.mobile_bridge = None
         self.link.close()
         self._stop_live2d_players()
         if self.live2d_license_window is not None and self.live2d_license_window.winfo_exists():
             self.live2d_license_window.destroy()
         if self.avatar_library_window is not None and self.avatar_library_window.winfo_exists():
             self.avatar_library_window.destroy()
+        if self.role_card_window is not None and self.role_card_window.winfo_exists():
+            self.role_card_window.destroy()
         if self.pet_overlay is not None:
             self.pet_overlay.destroy()
         self.destroy()

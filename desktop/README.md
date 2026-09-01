@@ -1,10 +1,13 @@
-# LabCapsule Studio 1.0.0
+# LabCapsule Studio 1.2.0
 
 Windows 可视化实验与 Hiyori 助手，支持 USB、局域网 HTTP 和 Bluetooth LE。应用不会切换电脑 Wi-Fi，也不会主动加入设备的无网络恢复热点。
 
 完整操作见 [V1.0 统一随身实验助手指南](../docs/V1.0.0_UNIFIED_ASSISTANT_GUIDE_ZH.md)，验收证据见 [V1.0 测试报告](../docs/V1.0.0_TEST_REPORT_ZH.md)。
 
 ## 主要能力
+
+- 与 Android 共用私有角色卡协议：Live2D、人设、静态预览和语音包打成校验 ZIP；横向角色库可按形象/人设/语音包局部替换并离线缓存。
+- 可手动开启手机桥，显示 10 分钟有效的一次性配对码。已授权手机只能读取白名单电脑/设备上下文并调用受限 Claude；服务默认关闭。
 
 - 顶部选择 USB / 局域网 WiFi / BLE；三条链路统一显示稳定 `deviceId`、角色、STA 和传感器状态。
 - 默认页面为“实验助手 / 实验数据 / 设置”；设备、屏幕工作室和诊断在设置中默认折叠。
@@ -27,10 +30,10 @@ python -m pip install -r requirements.txt
 
 ```powershell
 cd <仓库目录>
-pyinstaller --noconfirm --clean LabCapsule-Studio-1.0.0.spec
+pyinstaller --noconfirm --clean LabCapsule-Studio-1.2.0.spec
 ```
 
-输出为 `dist\LabCapsule-Studio-1.0.0.exe`。商业发行前应增加 Windows 代码签名。
+输出为 `dist\LabCapsule-Studio-1.2.0.exe`。商业发行前应增加 Windows 代码签名。
 
 ## 使用现有 Hiyori
 

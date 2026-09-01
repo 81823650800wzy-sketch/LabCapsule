@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/81823650800wzy-sketch/LabCapsule/main/docs/role_card_v1.schema.json",
+  "title": "LabCapsule Role Card V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "id", "name", "characterId", "persona", "live2dModel", "previewFile", "createdAt"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,80}$"},
+    "name": {"type": "string", "minLength": 1, "maxLength": 80},
+    "characterId": {"type": "string", "minLength": 1, "maxLength": 80},
+    "persona": {"type": "string", "minLength": 1, "maxLength": 4000},
+    "live2dModel": {"type": "string", "pattern": "^live2d/.+\\.model3\\.json$"},
+    "previewFile": {"const": "preview.jpg"},
+    "voiceFile": {"type": "string", "pattern": "^voice/[A-Za-z0-9._-]{1,100}$"},
+    "createdAt": {"type": "string", "maxLength": 40}
+  }
+}
