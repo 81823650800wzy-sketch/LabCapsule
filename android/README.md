@@ -1,10 +1,16 @@
-# LabCapsule Android Remote 1.0.0
+# LabCapsule Android Remote 1.1.0
 
-原生 Java Android 8.0+ 控制器，不依赖 Gradle 或第三方 Android 运行库。默认简体中文，采用“首页 / 实验 / 数据 / AI / 设置”五分区液态导航；设备、屏幕、网络、记忆和固件位于默认折叠的设置区。
+原生 Java Android 8.0+ 控制器，不依赖 Gradle 或第三方 Android 运行库。默认简体中文，采用“首页 / 数据 / 桌面 / 设置”四分区液态导航。首页只显示统一 Live2D 形象和 AI 对话；Live2D、AI、实验参数、连接、屏幕、网络、记忆和固件全部位于可模糊搜索且默认折叠的设置区。
 
-完整用户步骤见 [V1.0 统一随身实验助手指南](../docs/V1.0.0_UNIFIED_ASSISTANT_GUIDE_ZH.md)。
+完整用户步骤见 [V1.1 AI 测量工作台使用指南](../docs/V1.1.0_AI_MEASUREMENT_GUIDE_ZH.md)。
 
-## V1 能力
+## V1.1 能力
+
+- 对首页直接说“马上帮我测试 10 秒的桌面震动情况”，本地意图执行器会选择 MPU6050、扫描设备、下发协议、实时画图、保存 CSV 并自动分析，不要求 AI 模型控制硬件。
+- 数据页实时绘制 AX/AY/AZ，支持双指缩放、横向拖动、点选查看六轴值，并可导出 PNG 与原始 CSV；历史按日期折叠并支持模糊搜索。
+- 可通过自然语言标定单轴，例如“将 AX 当前真实值标定为 0”；回正参数持久化在 APK 中，后续 CSV、图表与分析统一使用修正值。
+- 记忆、对话和实验 CSV 本地优先保存；网络可用时每 15 分钟同步到用户配置的私有 GitHub 仓库，密钥不进入仓库。
+- 所有四个页面都显示连接状态；断线时连接方式和连接按钮优先展开。
 
 - BLE 与局域网 HTTP 双通道；BLE 不切换手机 Wi-Fi，可完成配网、I²C 扫描、控制、实验、离线同步、媒体和 OTA。
 - 状态卡明确显示稳定 `deviceId`、`characterId`、`staConnected` 和 `staIp`。ESP32-S3 仅支持 2.4 GHz，纯 5 GHz 下可继续使用 BLE。
@@ -26,7 +32,7 @@ cd <仓库目录>\android
 .\build-apk.ps1
 ```
 
-输出 `dist\LabCapsule-1.0.0.apk`。脚本执行 aapt2、javac、D8、zipalign 和 apksigner。仓库里的 keystore 仅用于开发测试；商业发布必须更换正式私钥。
+输出 `dist\LabCapsule-1.1.0.apk`。脚本执行 aapt2、javac、D8、zipalign 和 apksigner。仓库里的 keystore 仅用于开发测试；商业发布必须更换正式私钥。
 
 ## 推荐连接流程
 
@@ -41,16 +47,16 @@ cd <仓库目录>\android
 ## 导入 Hiyori
 
 1. 把完整 `hiyori_free` 文件夹复制到手机。
-2. 进入“AI → 选择现有 Live2D 文件夹”。
+2. 进入“设置”，搜索 `Live2D`，展开“Live2D 角色”并选择现有文件夹。
 3. 阅读并确认模型与 Cubism SDK 条款，然后选择整个文件夹。
-4. 等待“已保存到 APK 私有目录”；重新进入 AI 页应显示 Live2D 舞台。
+4. 等待“已保存到 APK 私有目录”；重新进入首页应显示 Live2D 舞台。
 5. 连接设备后发送对话，动作会同步到手机和实体屏。
 
 限制为 800 文件、128 MiB 和 12 层目录。导入使用 `current.tmp → current` 原子切换；失败不会覆盖旧角色。
 
 ## 私有记忆
 
-在“设置 → AI 与私有记忆”填写私有仓库 `owner/repo`、分支和只授予该仓库 Contents 读写的细粒度 Token，再启用同步。路径固定为 `memory/devices/<deviceId>/snapshot.json`。API Key、Token、密码、Wi-Fi 凭据和原始音频不会写入记忆。
+在“设置 → 本地记忆与数据同步”填写私有仓库 `owner/repo`、分支和只授予该仓库 Contents 读写的细粒度 Token，再启用同步。记忆路径为 `memory/devices/<deviceId>/snapshot.json`，实验索引与 CSV 位于 `data/devices/<deviceId>/`。API Key、Token、密码、Wi-Fi 凭据和原始音频不会进入仓库。
 
 ## 媒体策略
 

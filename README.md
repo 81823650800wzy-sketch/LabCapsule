@@ -2,7 +2,18 @@
 
 > Ask a question. Run an experiment.
 
-LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前版本为 **V1.0.0 Alpha / Unified Portable Experiment Assistant**：同一个稳定硬件身份和 Hiyori 角色贯通 240×320 实体屏、Windows EXE 与 Android APK；USB、局域网和 BLE 共用实验、媒体、AI、私有记忆和传感器扩展协议。
+LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前 Android 版本为 **V1.1.0 Alpha / AI Measurement Workspace**：首页自然语言直接驱动 MPU6050 测量、实时曲线、标定与分析；同一个稳定硬件身份和 Hiyori 角色继续贯通 240×320 实体屏、Windows EXE 与 Android APK。
+
+## V1.1.0 Android 新增
+
+- 导航收敛为“首页 / 数据 / 桌面 / 设置”；首页只显示 Hiyori Live2D 与 AI 对话，所有配置默认折叠并支持模糊搜索。
+- “马上帮我测试 10 秒的桌面震动情况”会由本地意图执行器选择 MPU6050、启动采集、绘制曲线、保存 CSV、执行 RMS/Peak/FFT 并回复结果。
+- 数据曲线支持双指缩放、拖动、逐点六轴读数、PNG/CSV 导出；历史按日期折叠并可搜索。
+- 支持用自然语言对 AX/AY/AZ/GX/GY/GZ 执行软件标定，后续 CSV、曲线和分析统一使用回正数据。
+- 对话、记忆和实验数据本地优先；联网后可每 15 分钟同步到用户配置的私有 GitHub 仓库。
+- 四个页面均显示连接状态，断开时优先给出 BLE 和局域网连接入口。
+
+完整操作见 [V1.1 AI 测量工作台使用指南](docs/V1.1.0_AI_MEASUREMENT_GUIDE_ZH.md)。
 
 ## V1.0.0 新增
 
@@ -139,16 +150,16 @@ V0.4.0 的界面与媒体能力继续保留：
    idf.py -p COM8 flash monitor
    ```
 
-2. Windows 端运行 GitHub Release 中的 `LabCapsule-Studio-1.0.0.exe`；Android 端安装 `LabCapsule-1.0.0.apk`。手机首次进入“设置 → 设备与连接”时，推荐选择：
+2. Windows 端运行 GitHub Release 中的 `LabCapsule-Studio-1.0.0.exe`；Android 端安装 `LabCapsule-1.1.0.apk`。手机首次进入“设置 → 设备与连接”时，推荐选择：
 
    - BLE：点击扫描并允许“附近设备”权限；连接成功后直接点“蓝牙一键配网”；
    - 恢复热点：只在排障时连接 `LabCapsule-XXXX`，密码 `labcapsule`，地址 `http://192.168.4.1`。
 
 3. 输入路由器 2.4 GHz SSID/密码并保存。手机始终留在正常联网 Wi-Fi；设备状态卡直接显示 `staConnected`、`staIp` 与失败原因。成功后点击“使用此局域网 IP”。
 
-4. 在“AI”页填写 API Endpoint、模型和 Key，生成协议后点击“发送并开始实验”。Key 由 Android Keystore 加密，仅在手机端使用。
+4. 在“设置”搜索“AI”，填写 Endpoint、模型和 Key；回到首页直接说出测量、标定或分析要求。Key 由 Android Keystore 加密，仅在手机端使用。
 
-完整操作见 [V1.0 统一随身实验助手指南](docs/V1.0.0_UNIFIED_ASSISTANT_GUIDE_ZH.md)、[V0.7.0 本地媒体与桌面工作室指南](docs/V0.7.0_LOCAL_MEDIA_DESKTOP_GUIDE_ZH.md) 和 [V0.3.3 蓝牙配网与连接排障](docs/V0.3.3_BLE_WIFI_QUICKSTART_ZH.md)。
+完整操作见 [V1.1 AI 测量工作台使用指南](docs/V1.1.0_AI_MEASUREMENT_GUIDE_ZH.md)、[V1.0 统一随身实验助手指南](docs/V1.0.0_UNIFIED_ASSISTANT_GUIDE_ZH.md) 和 [V0.3.3 蓝牙配网与连接排障](docs/V0.3.3_BLE_WIFI_QUICKSTART_ZH.md)。
 
 ## 冻结引脚
 

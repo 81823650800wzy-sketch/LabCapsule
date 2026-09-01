@@ -51,8 +51,8 @@ if (Test-Path -LiteralPath (Join-Path $ProjectRoot 'assets')) {
     --manifest (Join-Path $ProjectRoot 'AndroidManifest.xml') `
     --min-sdk-version 26 `
     --target-sdk-version 35 `
-    --version-code 100 `
-    --version-name '1.0.0' `
+    --version-code 110 `
+    --version-name '1.1.0' `
     $AssetArgs `
     $ResourceFiles
 if ($LASTEXITCODE -ne 0) { throw 'aapt2 link failed' }
@@ -101,7 +101,7 @@ if (-not (Test-Path -LiteralPath $KeyStore)) {
     if ($LASTEXITCODE -ne 0) { throw 'keytool failed' }
 }
 
-$OutputApk = Join-Path $DistRoot 'LabCapsule-1.0.0.apk'
+$OutputApk = Join-Path $DistRoot 'LabCapsule-1.1.0.apk'
 & (Join-Path $BuildTools 'apksigner.bat') sign `
     --ks $KeyStore `
     --ks-pass 'pass:labcapsule' `
