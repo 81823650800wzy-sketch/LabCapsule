@@ -65,6 +65,14 @@ size_t sensor_hub_discover(void)
     for (size_t i = 0; i < s_slot_count; ++i) {
         sensor_slot_t *slot = &s_slots[i];
         if (slot->driver.bus != SENSOR_BUS_I2C || !s_i2c_bus) continue;
+        /* The primary MPU is already registered with the IDF I2C driver.  On
+         * ESP32-S3, probing that address again while its device handle is
+         * active may report busy/not-found even though live sampling works.
+         * Its owning driver explicitly maintains this readiness bit. */
+        if (strcmp(slot->driver.id, "mpu6050") == 0 && slot->detected) {
+            ++found;
+            continue;
+        }
         esp_err_t result = slot->driver.probe
             ? slot->driver.probe(s_i2c_bus, slot->driver.address)
             : i2c_master_probe(s_i2c_bus, slot->driver.address, 60);

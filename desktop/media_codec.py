@@ -302,3 +302,38 @@ def build_media(
     if progress:
         progress(95)
     return MediaResult(payload, len(rendered), fps, source_kind)
+
+
+def build_clip_from_frames(
+    frames: Iterable[Image.Image],
+    fps: int = 8,
+    background: str = "黑色",
+    progress: Callable[[int], None] | None = None,
+) -> MediaResult:
+    """Build one persistent LCG clip from host-rendered Live2D canvas frames."""
+    fps = max(1, min(MAX_FPS, int(fps)))
+    source_frames = list(frames)[:MAX_FRAMES]
+    if len(source_frames) < 2:
+        raise ValueError("Live2D 设备代理至少需要 2 帧")
+    rendered = [compose_frame(frame, "适应", background) for frame in source_frames]
+    quantized = [rgb332(frame) for frame in rendered]
+    bootstrap = encode_frame(quantized[0], None)
+    packets: list[FramePacket] = []
+    previous = quantized[0]
+    for index in range(1, len(quantized)):
+        packets.append(encode_frame(quantized[index], previous))
+        previous = quantized[index]
+        if progress:
+            progress(round(index * 90 / len(quantized)))
+    packets.append(encode_frame(quantized[0], previous))
+    output = BytesIO()
+    output.write(struct.pack(">IIII", CLIP_MAGIC, CLIP_VERSION, 1000 // fps, len(packets)))
+    _write_packet(output, bootstrap)
+    for packet in packets:
+        _write_packet(output, packet)
+    payload = output.getvalue()
+    if len(payload) > MAX_CLIP_BYTES:
+        raise ValueError(f"Live2D 设备代理 {len(payload) / 1024 / 1024:.2f} MiB 超过 6 MiB")
+    if progress:
+        progress(100)
+    return MediaResult(payload, len(rendered), float(fps), "Live2D 设备代理")

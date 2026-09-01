@@ -118,6 +118,22 @@ class PetPackageTests(unittest.TestCase):
         clear_selected_pet(selection)
         self.assertIsNone(selected_pet_package(selection))
 
+    def test_legacy_local_selection_migrates_to_content_id(self):
+        folder = self.root / "legacy"
+        folder.mkdir()
+        Image.new("RGBA", (32, 32), "#ffffff").save(folder / "pet.png")
+        package = load_pet_package(folder)
+        selection = self.root / "selected-legacy.json"
+        selection.write_text(json.dumps({"id": "local-old-host-path", "folder": str(folder)}),
+                             encoding="utf-8")
+
+        restored = selected_pet_package(selection)
+
+        self.assertIsNotNone(restored)
+        self.assertEqual(restored.package_id, package.package_id)
+        self.assertEqual(json.loads(selection.read_text(encoding="utf-8"))["id"],
+                         package.package_id)
+
 
 if __name__ == "__main__":
     unittest.main()

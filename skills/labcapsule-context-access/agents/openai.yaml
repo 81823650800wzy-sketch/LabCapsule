@@ -1,0 +1,4 @@
+interface:
+  display_name: "LabCapsule Context Access"
+  short_description: "按需读取设备、元件、实验和同步记忆上下文"
+  default_prompt: "Use $labcapsule-context-access to retrieve only the LabCapsule context relevant to this question."

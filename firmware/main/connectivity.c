@@ -76,6 +76,7 @@ typedef enum {
     FILE_TRANSFER_FRAME,
     FILE_TRANSFER_WALLPAPER,
     FILE_TRANSFER_CLIP,
+    FILE_TRANSFER_PET_BUBBLE,
 } file_transfer_kind_t;
 
 static file_transfer_kind_t s_file_kind;
@@ -84,6 +85,7 @@ static size_t s_file_received;
 static uint32_t s_file_crc_expected;
 static uint32_t s_file_crc;
 static uint32_t s_file_duration_ms;
+static uint8_t s_file_pet_bubble[LABCAPSULE_PET_BUBBLE_BYTES];
 
 /* 6c430001-4c61-6243-6170-73756c650001 */
 static const ble_uuid128_t s_service_uuid = BLE_UUID128_INIT(
@@ -146,14 +148,17 @@ static esp_err_t file_transfer_begin(file_transfer_kind_t kind, size_t size,
                                      uint16_t height)
 {
     size_t maximum = kind == FILE_TRANSFER_CLIP ? MEDIA_STORE_MAX_CLIP_BYTES :
+            kind == FILE_TRANSFER_PET_BUBBLE ? LABCAPSULE_PET_BUBBLE_BYTES :
             WALLPAPER_PAYLOAD_BYTES;
     if (s_file_kind != FILE_TRANSFER_NONE || size == 0 || size > maximum ||
-        (kind == FILE_TRANSFER_WALLPAPER && size != WALLPAPER_PAYLOAD_BYTES)) {
+        (kind == FILE_TRANSFER_WALLPAPER && size != WALLPAPER_PAYLOAD_BYTES) ||
+        (kind == FILE_TRANSFER_PET_BUBBLE && size != LABCAPSULE_PET_BUBBLE_BYTES)) {
         return ESP_ERR_INVALID_STATE;
     }
     if (kind == FILE_TRANSFER_FRAME || kind == FILE_TRANSFER_WALLPAPER ||
         kind == FILE_TRANSFER_CLIP) labcapsule_media_clip_stop();
-    esp_err_t result = kind == FILE_TRANSFER_FRAME
+    esp_err_t result = kind == FILE_TRANSFER_PET_BUBBLE ? ESP_OK :
+            kind == FILE_TRANSFER_FRAME
             ? labcapsule_media_region_begin(size, x, y, width, height, encoding)
             : kind == FILE_TRANSFER_WALLPAPER ? wallpaper_upload_begin(size)
                                               : media_store_upload_begin(size);
@@ -171,7 +176,9 @@ static esp_err_t file_transfer_write(const uint8_t *data, size_t length)
 {
     if (s_file_kind == FILE_TRANSFER_NONE || !data || length == 0 ||
         s_file_received + length > s_file_expected) return ESP_ERR_INVALID_ARG;
-    esp_err_t result = s_file_kind == FILE_TRANSFER_FRAME
+    esp_err_t result = s_file_kind == FILE_TRANSFER_PET_BUBBLE
+            ? (memcpy(s_file_pet_bubble + s_file_received, data, length), ESP_OK)
+            : s_file_kind == FILE_TRANSFER_FRAME
             ? labcapsule_media_frame_write(data, length)
             : s_file_kind == FILE_TRANSFER_WALLPAPER
                     ? wallpaper_upload_write(data, length)
@@ -190,7 +197,9 @@ static esp_err_t file_transfer_finish(void)
         file_transfer_abort();
         return ESP_ERR_INVALID_CRC;
     }
-    esp_err_t result = s_file_kind == FILE_TRANSFER_FRAME
+    esp_err_t result = s_file_kind == FILE_TRANSFER_PET_BUBBLE
+            ? labcapsule_set_pet_bubble(s_file_pet_bubble, s_file_expected)
+            : s_file_kind == FILE_TRANSFER_FRAME
             ? labcapsule_media_frame_finish(s_file_duration_ms)
             : s_file_kind == FILE_TRANSFER_WALLPAPER
                     ? wallpaper_upload_finish() : media_store_upload_finish();
@@ -402,19 +411,14 @@ bool connectivity_remote_connected(void)
 
 static void ble_build_status_response(void)
 {
-    /* Worst-case compact V0.7 JSON is 270 bytes plus its terminator. */
-    char device_status[272];
-    char network_status[188];
+    /* Keep the combined status below the negotiated 512-byte GATT value. */
+    char device_status[280];
+    char network_status[152];
     labcapsule_build_ble_device_json(device_status, sizeof(device_status));
-    wifi_mode_t wifi_mode = WIFI_MODE_NULL;
-    esp_wifi_get_mode(&wifi_mode);
     const labcapsule_config_t *config = device_config_get();
-    bool recovery_ap_active = wifi_mode == WIFI_MODE_AP || wifi_mode == WIFI_MODE_APSTA;
     snprintf(network_status, sizeof(network_status),
-             "{\"recoveryAp\":\"%s\",\"recoveryApActive\":%s,"
-             "\"staConfigured\":%s,\"staConnected\":%s,\"staIp\":\"%s\","
+             "{\"staConfigured\":%s,\"staConnected\":%s,\"staIp\":\"%s\","
              "\"remoteConnected\":%s,\"lastDisconnectReason\":%u}",
-             s_ap_ssid, recovery_ap_active ? "true" : "false",
              config->wifi_ssid[0] ? "true" : "false",
              s_sta_connected ? "true" : "false", s_sta_ip,
              s_remote_connected ? "true" : "false",
@@ -478,9 +482,9 @@ static esp_err_t status_handler(httpd_req_t *request)
 static esp_err_t network_handler(httpd_req_t *request)
 {
     if (request->method == HTTP_GET) {
-        char config[640];
+        char config[800];
         char network[384];
-        char response[1100];
+        char response[1300];
         device_config_redacted_json(config, sizeof(config));
         connectivity_build_status_json(network, sizeof(network));
         snprintf(response, sizeof(response), "{\"ok\":true,\"config\":%s,\"network\":%s}",
@@ -773,6 +777,41 @@ static esp_err_t media_clip_handler(httpd_req_t *request)
     return http_json(request, NULL, response);
 }
 
+static esp_err_t pet_bubble_handler(httpd_req_t *request)
+{
+    uint32_t crc = 0;
+    char query[64];
+    char value[24];
+    if (httpd_req_get_url_query_str(request, query, sizeof(query)) == ESP_OK &&
+        query_value(query, "crc", value, sizeof(value))) crc = strtoul(value, NULL, 16);
+    if ((size_t)request->content_len != LABCAPSULE_PET_BUBBLE_BYTES ||
+        file_transfer_begin(FILE_TRANSFER_PET_BUBBLE, (size_t)request->content_len,
+                            0, crc, LABCAPSULE_MEDIA_RAW565,
+                            0, 0, LABCAPSULE_PET_BUBBLE_WIDTH,
+                            LABCAPSULE_PET_BUBBLE_HEIGHT) != ESP_OK) {
+        return http_json(request, "409 Conflict",
+                         "{\"ok\":false,\"error\":\"pet bubble upload rejected\"}");
+    }
+    uint8_t buffer[512];
+    size_t remaining = (size_t)request->content_len;
+    while (remaining > 0) {
+        size_t wanted = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+        int received = httpd_req_recv(request, (char *)buffer, wanted);
+        if (received == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (received <= 0 || file_transfer_write(buffer, (size_t)received) != ESP_OK) {
+            file_transfer_abort();
+            return ESP_FAIL;
+        }
+        remaining -= (size_t)received;
+    }
+    if (file_transfer_finish() != ESP_OK) {
+        return http_json(request, "400 Bad Request",
+                         "{\"ok\":false,\"error\":\"pet bubble validation failed\"}");
+    }
+    return http_json(request, NULL,
+                     "{\"ok\":true,\"message\":\"pet dialogue applied\"}");
+}
+
 static esp_err_t control_handler(httpd_req_t *request)
 {
     char query[128];
@@ -954,7 +993,7 @@ static esp_err_t http_server_start(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.stack_size = 8192;
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 18;
     httpd_handle_t server = NULL;
     ESP_RETURN_ON_ERROR(httpd_start(&server, &config), TAG, "HTTP server start failed");
 
@@ -994,6 +1033,9 @@ static esp_err_t http_server_start(void)
     const httpd_uri_t media_clip_uri = {
         .uri = "/api/media/clip", .method = HTTP_POST, .handler = media_clip_handler,
     };
+    const httpd_uri_t pet_bubble_uri = {
+        .uri = "/api/pet/bubble", .method = HTTP_POST, .handler = pet_bubble_handler,
+    };
     const httpd_uri_t experiment_uri = {
         .uri = "/api/experiment", .method = HTTP_POST, .handler = experiment_handler,
     };
@@ -1018,6 +1060,7 @@ static esp_err_t http_server_start(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &mode_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &media_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &media_clip_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &pet_bubble_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &experiment_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &offline_get_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &offline_post_uri));
@@ -1453,6 +1496,11 @@ static int ble_access(uint16_t connection_handle, uint16_t attribute_handle,
                     result = file_transfer_begin(FILE_TRANSFER_CLIP, size, 0, crc,
                                                  LABCAPSULE_MEDIA_RGB332,
                                                  0, 0, 240, 320);
+                } else if (strcmp(kind, "PETBUBBLE") == 0) {
+                    result = file_transfer_begin(FILE_TRANSFER_PET_BUBBLE, size, 0, crc,
+                                                 LABCAPSULE_MEDIA_RAW565,
+                                                 0, 0, LABCAPSULE_PET_BUBBLE_WIDTH,
+                                                 LABCAPSULE_PET_BUBBLE_HEIGHT);
                 }
             }
         } else if (strcmp(command, "END") == 0) {

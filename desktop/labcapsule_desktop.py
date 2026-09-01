@@ -1,7 +1,7 @@
-"""LabCapsule Studio V0.8 - interactive data and AI companion for Windows.
+"""LabCapsule Studio V1 - interactive data and AI companion for Windows.
 
 The app intentionally never changes the computer's Wi-Fi connection.  It uses
-the CH343/native USB serial link for telemetry, experiments and media upload.
+USB, an already-reachable LAN address, or BLE for device control and transfer.
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import csv
 from datetime import datetime
+import json
 import math
 import platform
 from pathlib import Path
@@ -33,16 +34,22 @@ from avatar_assets import (AVATAR_CACHE_DIR, DICEBEAR_CC0_PRESETS, DecodedAvatar
                            display_url, download_avatar, load_cached_avatar)
 from interactive_chart import InteractiveMotionChart
 from claude_bridge import ClaudeBridge
-from media_codec import HEIGHT, MAX_FPS, WIDTH, build_media, compose_frame, load_frames
+from media_codec import (HEIGHT, MAX_FPS, WIDTH, build_clip_from_frames, build_media,
+                         compose_frame, load_frames)
 from pet_agent import CharacterProfile, PetAgentRuntime, PetAvatarCanvas, PetOverlay, PetReply, PetSettings
 from pet_device import pet_state_command, render_pet_bubble
-from pet_packages import (PET_SELECTION_PATH, PetPackage, avatar_asset_for_package, clear_selected_pet,
+from pet_packages import (APP_DIR, PET_SELECTION_PATH, PetPackage, avatar_asset_for_package, clear_selected_pet,
                           discover_pet_packages, save_selected_pet, selected_pet_package)
 from live2d_runtime import (CONTROL_PATH, has_live2d_consent, player_command,
                             save_live2d_consent, write_live2d_action)
+from memory_repo import (GitHubMemoryClient, MemoryRemote, empty_snapshot,
+                         merge_snapshots)
+from device_transport import BleLink, LanLink
+from speech_input import record_wav, transcribe_wav
+from experiment_store import ExperimentStore
 
 
-APP_VERSION = "0.11.0"
+APP_VERSION = "1.0.0"
 BAUD_RATE = 460800
 ROOT = Path(__file__).resolve().parent
 
@@ -62,7 +69,22 @@ def parse_motion_data_line(line: str):
     return parts[1:8], timestamp_us, values
 
 
+def parse_key_value_fields(parts: list[str]) -> dict[str, str]:
+    """Parse firmware comma fields while ignoring malformed diagnostics."""
+    values: dict[str, str] = {}
+    for item in parts:
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        key = key.strip().upper()
+        if key:
+            values[key] = value.strip()
+    return values
+
+
 class SerialLink:
+    kind = "usb"
+
     def __init__(self, on_line, on_state):
         self.on_line = on_line
         self.on_state = on_state
@@ -85,6 +107,9 @@ class SerialLink:
         self.on_state(True, name)
         self.send("PING")
         self.send("STATUS")
+        self.send("IDENTITY")
+        self.send("PET,STATUS")
+        self.send("NETWORK")
 
     def close(self) -> None:
         self.stop_event.set()
@@ -120,11 +145,11 @@ class SerialLink:
         if not self.connected:
             raise RuntimeError("设备未连接")
         crc = zlib.crc32(payload) & 0xFFFFFFFF
-        attempts = 3 if kind.upper() == "PETBUBBLE" else 1
+        attempts = 3 if kind.upper() == "PETBUBBLE" else 2
         # RAM-only bubbles are accepted much faster than flash-backed media.
         # Explicit pacing prevents small CH343/CP210x receive FIFOs from
         # overrunning while the display task is active.
-        chunk_size = 64 if kind.upper() == "PETBUBBLE" else 1024
+        chunk_size = 64 if kind.upper() == "PETBUBBLE" else 256
         with self.write_lock:
             assert self.port
             for attempt in range(1, attempts + 1):
@@ -145,9 +170,15 @@ class SerialLink:
                     if kind.upper() == "PETBUBBLE":
                         self.port.flush()
                         time.sleep(0.010)
+                    else:
+                        self.port.flush()
+                        # The FAT writer commits its 16 KiB buffer in bursts.
+                        # Leave headroom in bridge/UART FIFOs across those stalls.
+                        sent = min(chunk_size, len(payload) - offset)
+                        time.sleep(0.250 if (offset + sent) % 4096 == 0 else 0.006)
                     progress(min(99, round((offset + chunk_size) * 100 / len(payload))))
                 self.port.flush()
-                if not self.done_event.wait(25):
+                if not self.done_event.wait(60):
                     raise TimeoutError("设备未确认媒体校验结果")
                 if not self.upload_error:
                     break
@@ -257,19 +288,30 @@ class Studio(tk.Tk):
         self.configure(bg=self.BG)
         self.protocol("WM_DELETE_WINDOW", self.close_app)
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
-        self.link = SerialLink(
-            lambda line: self.events.put(("line", line)),
-            lambda state, port: self.events.put(("state", (state, port))),
-        )
+        self.transport_var = tk.StringVar(value="USB 数据线")
+        self.transport_mode = "USB 数据线"
+        self.link = self._make_link(self.transport_mode)
         self.notification_bridge = WindowsNotificationBridge()
         self.notification_enabled = False
         self.last_notification_poll = 0.0
         self.samples: list[list[str]] = []
+        self.experiment_store = ExperimentStore(APP_DIR)
+        self.experiment_started_at = ""
+        self.experiment_session_saved = False
         self.device_state = "READY"
         self.device_recording = False
         self.device_rate = 0
         self.device_duration = 0
         self.device_firmware_version = ""
+        self.device_id = ""
+        self.device_alias = ""
+        self.device_character_id = ""
+        self.device_pet_proxy = False
+        self.device_sta_connected = False
+        self.device_sta_ip = "0.0.0.0"
+        self.memory_sync_active = False
+        self.memory_revision = 0
+        self.memory_synced_device = ""
         self.last_handshake_at = 0.0
         self.host_snapshot: dict[str, object] = {}
         self.last_sample: tuple[str, ...] | None = None
@@ -330,12 +372,22 @@ class Studio(tk.Tk):
         style.configure("TCombobox", fieldbackground="#0f141c", foreground=self.INK)
         style.configure("Horizontal.TProgressbar", background=self.CYAN, troughcolor=self.PANEL_2)
 
+    def _make_link(self, mode: str):
+        line = lambda value: self.events.put(("line", value))
+        state = lambda connected, target: self.events.put(
+            ("state", (connected, target)))
+        if mode == "局域网 WiFi":
+            return LanLink(line, state)
+        if mode == "蓝牙 BLE":
+            return BleLink(line, state)
+        return SerialLink(line, state)
+
     def _layout(self):
         header = tk.Frame(self, bg=self.BG)
         header.pack(fill="x", padx=20, pady=(16, 8))
         tk.Label(header, text="LABCAPSULE / STUDIO", bg=self.BG, fg=self.INK,
                  font=("Bahnschrift", 19, "bold")).pack(side="left")
-        tk.Label(header, text=" USB FIRST · LOCAL MEDIA · MOTION LAB ", bg=self.YELLOW,
+        tk.Label(header, text=" USB · LAN · BLE / LOCAL MEDIA / MOTION LAB ", bg=self.YELLOW,
                  fg="#111318", font=("Bahnschrift", 9, "bold"), padx=8, pady=3).pack(side="left", padx=14)
         self.connection_label = tk.Label(header, text="● 未连接", bg=self.BG, fg=self.RED,
                                          font=("Microsoft YaHei UI", 10, "bold"))
@@ -343,34 +395,94 @@ class Studio(tk.Tk):
 
         connect = tk.Frame(self, bg=self.PANEL, padx=12, pady=10)
         connect.pack(fill="x", padx=20, pady=(0, 10))
-        tk.Label(connect, text="数据线设备", bg=self.PANEL, fg=self.MUTED).pack(side="left")
+        tk.Label(connect, text="连接方式", bg=self.PANEL, fg=self.MUTED).pack(side="left")
+        self.transport_box = ttk.Combobox(
+            connect, textvariable=self.transport_var,
+            values=("USB 数据线", "局域网 WiFi", "蓝牙 BLE"),
+            width=13, state="readonly")
+        self.transport_box.pack(side="left", padx=(8, 4))
+        self.transport_box.bind("<<ComboboxSelected>>", self.on_transport_changed)
         self.port_var = tk.StringVar()
-        self.port_box = ttk.Combobox(connect, textvariable=self.port_var, width=42, state="readonly")
+        self.port_box = ttk.Combobox(connect, textvariable=self.port_var, width=34, state="readonly")
         self.port_box.pack(side="left", padx=10)
-        ttk.Button(connect, text="重新扫描", command=self.refresh_ports).pack(side="left", padx=4)
+        self.scan_button = ttk.Button(connect, text="重新扫描", command=self.refresh_ports)
+        self.scan_button.pack(side="left", padx=4)
         self.connect_button = ttk.Button(connect, text="连接", style="Accent.TButton",
                                          command=self.toggle_connect)
         self.connect_button.pack(side="left", padx=4)
-        tk.Label(connect, text="不会连接或切换设备热点，不影响电脑联网", bg=self.PANEL,
-                 fg=self.CYAN).pack(side="right")
+        self.network_label = tk.Label(
+            connect, text="不会连接或切换设备热点，不影响电脑联网",
+            bg=self.PANEL, fg=self.CYAN)
+        self.network_label.pack(side="right")
 
         self.tabs = ttk.Notebook(self)
         self.tabs.pack(fill="both", expand=True, padx=20, pady=(0, 20))
-        self.dashboard = tk.Frame(self.tabs, bg=self.BG)
-        self.screen = tk.Frame(self.tabs, bg=self.BG)
         self.experiment = tk.Frame(self.tabs, bg=self.BG)
         self.pet = tk.Frame(self.tabs, bg=self.BG)
-        self.console = tk.Frame(self.tabs, bg=self.BG)
-        self.tabs.add(self.dashboard, text="状态中心")
-        self.tabs.add(self.screen, text="屏幕工作室")
-        self.tabs.add(self.experiment, text="实验与数据")
-        self.tabs.add(self.pet, text="AI 桌宠")
-        self.tabs.add(self.console, text="诊断日志")
+        self.settings = tk.Frame(self.tabs, bg=self.BG)
+        self.tabs.add(self.pet, text="实验助手")
+        self.tabs.add(self.experiment, text="实验数据")
+        self.tabs.add(self.settings, text="设置")
+        self._settings_shell()
         self._dashboard_ui()
         self._screen_ui()
         self._experiment_ui()
         self._pet_ui()
         self._console_ui()
+
+    def _settings_shell(self):
+        shell = tk.Frame(self.settings, bg=self.BG)
+        shell.pack(fill="both", expand=True)
+        canvas = tk.Canvas(shell, bg=self.BG, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(shell, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        content = tk.Frame(canvas, bg=self.BG)
+        window = canvas.create_window((0, 0), window=content, anchor="nw")
+        content.bind("<Configure>", lambda _event: canvas.configure(
+            scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
+        self.settings_canvas = canvas
+        self.settings_sections: dict[str, tuple[ttk.Button, tk.Frame]] = {}
+
+        def section(key: str, title: str) -> tk.Frame:
+            outer = tk.Frame(content, bg=self.BG)
+            outer.pack(fill="x", padx=4, pady=4)
+            body = tk.Frame(outer, bg=self.BG)
+
+            def toggle():
+                self.open_settings_section(key if not body.winfo_ismapped() else "")
+
+            button = ttk.Button(outer, text=f"＋ {title}", command=toggle)
+            button.pack(fill="x")
+            self.settings_sections[key] = (button, body)
+            return body
+
+        self.dashboard = section("device", "设备、连接与通知")
+        self.screen = section("screen", "屏幕、壁纸与媒体")
+        self.console = section("diagnostics", "开发者诊断")
+        ttk.Label(content,
+                  text="设置区默认折叠；日常使用只需实验助手和实验数据。",
+                  style="Muted.TLabel").pack(anchor="w", padx=10, pady=12)
+
+    def open_settings_section(self, key: str):
+        for name, (button, body) in self.settings_sections.items():
+            if name == key:
+                body.pack(fill="both", expand=True, pady=(4, 0))
+                button.configure(text="－ " + {
+                    "device": "设备、连接与通知",
+                    "screen": "屏幕、壁纸与媒体",
+                    "diagnostics": "开发者诊断",
+                }[name])
+            else:
+                body.pack_forget()
+                button.configure(text="＋ " + {
+                    "device": "设备、连接与通知",
+                    "screen": "屏幕、壁纸与媒体",
+                    "diagnostics": "开发者诊断",
+                }[name])
+        self.settings_canvas.yview_moveto(0.0)
 
     def _card(self, parent, title, row, column, **grid):
         box = ttk.LabelFrame(parent, text=title, style="Card.TLabelframe")
@@ -580,12 +692,12 @@ class Studio(tk.Tk):
         self.pet_avatar_source_label.pack(anchor="center", pady=(0, 5))
         ttk.Button(avatar_card, text="统一桌宠管理", style="Accent.TButton",
                    command=self.show_avatar_library).pack(fill="x", pady=3)
-        ttk.Button(avatar_card, text="将当前形象送到屏幕工作室",
+        ttk.Button(avatar_card, text="同步当前角色到设备",
                    command=self.send_avatar_to_screen_studio).pack(fill="x", pady=3)
         self.pet_overlay_button = ttk.Button(avatar_card, text="显示桌面悬浮宠物",
                                              command=self.toggle_pet_overlay)
         self.pet_overlay_button.pack(fill="x", pady=3)
-        ttk.Button(avatar_card, text="在 COM8 打开桌宠界面", style="Accent.TButton",
+        ttk.Button(avatar_card, text="在设备打开桌宠界面", style="Accent.TButton",
                    command=self.show_device_pet).pack(fill="x", pady=3)
         ttk.Button(avatar_card, text="退出设备桌宠界面",
                    command=self.hide_device_pet).pack(fill="x", pady=3)
@@ -613,6 +725,12 @@ class Studio(tk.Tk):
         pet_entry.bind("<Return>", lambda _: self.send_pet_message())
         ttk.Button(input_row, text="发送", style="Accent.TButton",
                    command=self.send_pet_message).pack(side="left", padx=(6, 0))
+        self.mic_button = ttk.Button(input_row, text="🎙 说话 6 秒",
+                                     command=self.record_pet_voice)
+        self.mic_button.pack(side="left", padx=(6, 0))
+        self.speech_status = ttk.Label(chat_card, text="麦克风：点击后由电脑录音并转写",
+                                       style="Muted.TLabel")
+        self.speech_status.pack(anchor="w", pady=(5, 0))
         quick = tk.Frame(chat_card, bg=self.PANEL)
         quick.pack(fill="x", pady=(7, 0))
         quick.columnconfigure((0, 1), weight=1)
@@ -635,12 +753,28 @@ class Studio(tk.Tk):
         self.pet_auto_var = tk.BooleanVar(value=self.pet_settings.auto_react)
         self.pet_delegate_var = tk.BooleanVar(value=self.pet_settings.delegate_complex)
         self.pet_claude_model_var = tk.StringVar(value=self.pet_settings.claude_model)
+        self.memory_sync_var = tk.BooleanVar(value=self.pet_settings.memory_sync_enabled)
+        self.memory_repository_var = tk.StringVar(value=self.pet_settings.memory_repository)
+        self.memory_branch_var = tk.StringVar(value=self.pet_settings.memory_branch)
+        self.memory_token_var = tk.StringVar(value=self.pet_settings.memory_token)
+        self.speech_endpoint_var = tk.StringVar(value=self.pet_settings.speech_endpoint)
+        self.speech_model_var = tk.StringVar(value=self.pet_settings.speech_model)
+        self.speech_key_var = tk.StringVar(value=self.pet_settings.speech_api_key)
         for title, variable, secret in (("角色名称", self.pet_name_var, False),
                                         ("OpenAI 兼容 Endpoint", self.pet_endpoint_var, False),
                                         ("模型", self.pet_model_var, False),
                                         ("API Key（DPAPI 加密）", self.pet_key_var, True)):
             ttk.Label(settings_card, text=title, style="Muted.TLabel").pack(anchor="w", pady=(5, 2))
             ttk.Entry(settings_card, textvariable=variable, show="•" if secret else "").pack(fill="x")
+        ttk.Label(settings_card, text="电脑麦克风转写（可单独配置）",
+                  style="Muted.TLabel").pack(anchor="w", pady=(8, 2))
+        for title, variable, secret in (
+                ("语音 Endpoint", self.speech_endpoint_var, False),
+                ("语音模型", self.speech_model_var, False),
+                ("语音 API Key（DPAPI 加密）", self.speech_key_var, True)):
+            ttk.Label(settings_card, text=title, style="Muted.TLabel").pack(anchor="w", pady=(4, 2))
+            ttk.Entry(settings_card, textvariable=variable,
+                      show="•" if secret else "").pack(fill="x")
         ttk.Label(settings_card, text="角色设定", style="Muted.TLabel").pack(anchor="w", pady=(8, 2))
         self.pet_persona = tk.Text(settings_card, height=4, bg="#0f141c", fg=self.INK,
                                    insertbackground=self.INK, relief="flat", wrap="word",
@@ -668,9 +802,26 @@ class Studio(tk.Tk):
         self.claude_state_label.pack(anchor="w", pady=(4, 0))
         ttk.Button(settings_card, text="保存角色与 AI 设置", style="Accent.TButton",
                    command=self.save_pet_settings).pack(fill="x", pady=(10, 3))
+        ttk.Separator(settings_card).pack(fill="x", pady=9)
+        ttk.Label(settings_card, text="跨设备私有记忆", style="Muted.TLabel").pack(anchor="w")
+        ttk.Checkbutton(settings_card, text="连接设备后同步私有 GitHub 记忆仓库",
+                        variable=self.memory_sync_var).pack(anchor="w", pady=(5, 0))
+        for title, variable, secret in (
+                ("私有仓库 owner/repository", self.memory_repository_var, False),
+                ("分支", self.memory_branch_var, False),
+                ("GitHub Token（仅当前 Windows 用户可解密）", self.memory_token_var, True)):
+            ttk.Label(settings_card, text=title, style="Muted.TLabel").pack(anchor="w", pady=(5, 2))
+            ttk.Entry(settings_card, textvariable=variable,
+                      show="•" if secret else "").pack(fill="x")
+        self.memory_sync_status = ttk.Label(
+            settings_card, text="记忆同步：等待稳定设备 ID", style="Muted.TLabel", wraplength=285)
+        self.memory_sync_status.pack(anchor="w", pady=(6, 2))
+        ttk.Button(settings_card, text="立即同步当前设备记忆",
+                   command=self.sync_memory_now).pack(fill="x", pady=3)
         ttk.Button(settings_card, text="清除桌宠记忆", command=self.clear_pet_memory).pack(fill="x", pady=3)
         ttk.Label(settings_card,
-                  text="Claude 桥禁用全部工具且不保存会话；启动/中止实验、网络和固件操作始终由用户确认。",
+                  text="个人记忆只允许写入私有仓库；Token 不写入仓库。Claude 桥禁用全部工具且不保存会话；"
+                       "启动/中止实验、网络和固件操作始终由用户确认。",
                   style="Muted.TLabel", wraplength=285).pack(anchor="w", pady=8)
         self._pet_append("event", f"{self.pet_settings.profile.name}：{self.pet_settings.profile.greeting}")
 
@@ -749,7 +900,7 @@ class Studio(tk.Tk):
                    command=self.download_network_avatar).pack(side="left")
         ttk.Button(direct_buttons, text="恢复内置矢量形象",
                    command=self.restore_vector_avatar).pack(side="left", padx=6)
-        ttk.Button(direct_buttons, text="送到屏幕工作室",
+        ttk.Button(direct_buttons, text="同步角色 / 送到屏幕工作室",
                    command=self.send_avatar_to_screen_studio).pack(side="left")
         self.avatar_progress = ttk.Progressbar(direct, maximum=100)
         self.avatar_progress.pack(fill="x", pady=(10, 3))
@@ -776,7 +927,7 @@ class Studio(tk.Tk):
             ("可扩展应用许可", "https://www.live2d.com/en/sdk/license/expandable/"),
             ("LabCapsule 统一桌宠手册",
              "https://github.com/81823650800wzy-sketch/LabCapsule/blob/main/docs/"
-             "V0.11.0_DEVICE_PET_AI_CLAUDE_ZH.md"),
+             "V1.0.0_UNIFIED_ASSISTANT_GUIDE_ZH.md"),
         )
         link_grid = tk.Frame(resources, bg=self.PANEL)
         link_grid.pack(fill="x")
@@ -1164,10 +1315,7 @@ class Studio(tk.Tk):
 
     def send_avatar_to_screen_studio(self):
         if self.active_pet_package is not None and self.active_pet_package.visual_kind == "live2d":
-            messagebox.showinfo(
-                "Live2D 与设备屏幕",
-                "ESP32-S3 屏幕不能直接运行 moc3。请从 Live2D 编辑器导出或录制已授权的 GIF / "
-                "序列帧，再由屏幕工作室裁剪、压缩并写入设备。")
+            self.capture_live2d_device_proxy()
             return
         if self.avatar_decoded is None:
             messagebox.showinfo("当前是内置形象",
@@ -1176,11 +1324,92 @@ class Studio(tk.Tk):
         self.media_path = self.avatar_decoded.asset.path
         self.pet_path = ""
         self.media_label.configure(text=f"网络形象 · {Path(self.media_path).name}")
-        self.tabs.select(self.screen)
+        self.tabs.select(self.settings)
+        self.open_settings_section("screen")
         self.preview_media()
-        self.media_state.configure(text="网络形象已载入；确认预览后可通过 USB 上传，不会自动写入设备。")
+        self.media_state.configure(text="网络形象已载入；确认预览后可通过当前链路上传，不会自动写入设备。")
+
+    def capture_live2d_device_proxy(self):
+        package = self.active_pet_package
+        if package is None or package.visual_kind != "live2d":
+            messagebox.showwarning("没有 Live2D", "请先应用一个 Live2D 角色包。")
+            return
+        if not has_live2d_consent():
+            messagebox.showwarning("尚未确认许可", "请先在角色库中完成 Live2D/Cubism 条款确认。")
+            return
+        if not self.link.connected:
+            messagebox.showwarning("设备未连接", "请先通过 USB、局域网或 BLE 连接设备。")
+            return
+        self.avatar_download_active = True
+        self._set_avatar_status("正在由 GPU 渲染同一 Hiyori 的 240×320 设备代理…", 2)
+        cache = APP_DIR / "pet-proxies" / package.package_id
+
+        def worker():
+            process = None
+            try:
+                cache.mkdir(parents=True, exist_ok=True)
+                for stale in list(cache.glob("frame-*.png")) + [cache / "capture.json"]:
+                    if stale.is_file():
+                        stale.unlink()
+                command = player_command(package.live2d_model_path, "capture", ROOT,
+                                         sys.executable, capture_path=cache)
+                flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                process = subprocess.Popen(command, creationflags=flags)
+                self.live2d_processes.append(("capture", process))
+                return_code = process.wait(timeout=90)
+                self._cleanup_live2d_processes()
+                if return_code != 0:
+                    raise RuntimeError(f"Live2D 捕获子进程退出码 {return_code}")
+                metadata = json.loads((cache / "capture.json").read_text(encoding="utf-8"))
+                if metadata.get("complete") is not True:
+                    raise RuntimeError("Live2D 捕获未完成")
+                paths = sorted(cache.glob("frame-*.png"))
+                if len(paths) != int(metadata.get("frames", 0)):
+                    raise RuntimeError("Live2D 捕获帧数量不完整")
+                frames: list[Image.Image] = []
+                for path in paths:
+                    with Image.open(path) as source:
+                        frames.append(source.convert("RGBA").copy())
+                fps = max(1, min(MAX_FPS, round(1000 / int(metadata["durationMs"]))))
+                result = build_clip_from_frames(
+                    frames, fps=fps,
+                    progress=lambda value: self.events.put(("avatar_progress", value)))
+                temporary = cache / "device-proxy.tmp"
+                final = cache / "device-proxy.lcg"
+                temporary.write_bytes(result.payload)
+                temporary.replace(final)
+                self.events.put(("media_state", f"Hiyori 代理 {len(result.payload):,} B，通过当前链路写入设备…"))
+                self.link.upload("CLIP", result.payload,
+                                 lambda value: self.events.put(("avatar_progress", value)))
+                self.link.send(f"PET,IDENTITY,{package.package_id},PROXY")
+                self.link.send("PET,SHOW")
+                self.events.put(("live2d_proxy_done", (package, result, final)))
+            except subprocess.TimeoutExpired as error:
+                if process is not None:
+                    process.terminate()
+                self.events.put(("live2d_proxy_error", f"Live2D 捕获超过 90 秒：{error}"))
+            except Exception as error:
+                self.events.put(("live2d_proxy_error", str(error)))
+
+        threading.Thread(target=worker, daemon=True, name="live2d-device-proxy").start()
 
     def refresh_ports(self):
+        mode = self.transport_var.get()
+        if mode == "局域网 WiFi":
+            self.port_box.configure(state="normal")
+            self.port_box["values"] = ()
+            if not self.port_var.get() or self.port_var.get().upper().startswith("COM"):
+                self.port_var.set("http://")
+            self.scan_button.configure(text="校验地址")
+            return
+        if mode == "蓝牙 BLE":
+            self.port_box.configure(state="normal")
+            self.port_box["values"] = ("LabCapsule",)
+            self.port_var.set("LabCapsule")
+            self.scan_button.configure(text="连接时扫描")
+            return
+        self.port_box.configure(state="readonly")
+        self.scan_button.configure(text="重新扫描")
         ports = list(list_ports.comports())
         values = [f"{item.device} — {item.description}" for item in ports]
         self.port_box["values"] = values
@@ -1188,13 +1417,30 @@ class Studio(tk.Tk):
         if preferred or values:
             self.port_var.set(preferred or values[0])
 
+    def on_transport_changed(self, _event=None):
+        selected = self.transport_var.get()
+        if self.link.connected:
+            self.link.close()
+        self.transport_mode = selected
+        self.link = self._make_link(selected)
+        self.refresh_ports()
+        if selected == "局域网 WiFi":
+            self.network_label.configure(
+                text="输入设备 STA 地址；不会加入 LabCapsule 无网络热点")
+        elif selected == "蓝牙 BLE":
+            self.network_label.configure(text="BLE 不占用 WiFi；大文件建议 USB/局域网")
+        else:
+            self.network_label.configure(text="USB 最稳定；不会更改电脑联网")
+
     def toggle_connect(self):
         if self.link.connected:
             self.link.close()
             return
-        name = self.port_var.get().split(" — ", 1)[0].strip()
+        name = self.port_var.get().strip()
+        if self.transport_var.get() == "USB 数据线":
+            name = name.split(" — ", 1)[0].strip()
         if not name:
-            messagebox.showwarning("未发现设备", "请连接数据 USB-C 后重新扫描。")
+            messagebox.showwarning("缺少连接目标", "请选择串口、输入局域网地址或使用 BLE 扫描。")
             return
         try:
             self.link.connect(name)
@@ -1246,7 +1492,7 @@ class Studio(tk.Tk):
 
     def show_device_pet(self):
         if not self.link.connected:
-            self.pet_device_status.configure(text="设备桌宠：请先连接 COM8")
+            self.pet_device_status.configure(text="设备桌宠：请先连接设备")
             return
         self.device_pet_enabled = True
         self._sync_pet_reply_to_device(self.last_pet_reply)
@@ -1265,9 +1511,9 @@ class Studio(tk.Tk):
             self.pending_pet_device_reply = reply
             self.pet_device_status.configure(text="设备桌宠：等待固件握手…")
             return
-        if not self.device_firmware_version.startswith("0.11."):
+        if not self.device_firmware_version.startswith(("0.11.", "1.0.")):
             self.pet_device_status.configure(
-                text=f"设备桌宠：固件 {self.device_firmware_version} 不支持，请更新 0.11")
+                text=f"设备桌宠：固件 {self.device_firmware_version} 不支持，请更新 V1")
             return
         if self.pet_device_sync_active:
             self.pending_pet_device_reply = reply
@@ -1345,6 +1591,13 @@ class Studio(tk.Tk):
                 claude_model=self.pet_claude_model_var.get().strip()[:80] or "sonnet",
                 avatar_url=self.avatar_url_var.get().strip(),
                 avatar_source_name=self.pet_settings.avatar_source_name,
+                memory_sync_enabled=self.memory_sync_var.get(),
+                memory_repository=self.memory_repository_var.get().strip(),
+                memory_branch=self.memory_branch_var.get().strip() or "main",
+                memory_token=self.memory_token_var.get().strip(),
+                speech_endpoint=self.speech_endpoint_var.get().strip(),
+                speech_model=self.speech_model_var.get().strip(),
+                speech_api_key=self.speech_key_var.get().strip(),
                 profile=CharacterProfile(
                     name=self.pet_name_var.get().strip()[:24] or "胶囊零号",
                     persona=self.pet_persona.get("1.0", "end").strip()[:2400],
@@ -1359,6 +1612,8 @@ class Studio(tk.Tk):
                       "Claude：本机未安装，自动使用主 AI"))
             self._pet_append("event", "角色与 AI 设置已保存；API Key 由当前 Windows 用户 DPAPI 加密。")
             self._set_pet_state("success", "SETTINGS SAVED")
+            if self.pet_settings.memory_sync_enabled and self.device_id:
+                self.sync_memory_now()
         except Exception as error:
             messagebox.showerror("AI 设置保存失败", str(error))
 
@@ -1367,15 +1622,55 @@ class Studio(tk.Tk):
         self._pet_append("event", "本地桌宠对话和长期偏好已清除。")
         self._set_pet_state("idle", "MEMORY CLEARED")
 
+    def sync_memory_now(self):
+        if self.memory_sync_active:
+            return
+        if not self.device_id:
+            self.memory_sync_status.configure(text="记忆同步：请先连接并识别 LabCapsule")
+            return
+        remote = MemoryRemote(self.memory_repository_var.get().strip(),
+                              self.memory_token_var.get().strip(),
+                              self.memory_branch_var.get().strip() or "main")
+        self.memory_sync_active = True
+        self.memory_sync_status.configure(
+            text=f"记忆同步：正在校验私有仓库 · {self.device_id}")
+
+        def worker():
+            try:
+                client = GitHubMemoryClient(remote)
+                client.require_private_repository()
+                remote_snapshot, sha = client.pull(self.device_id)
+                local = empty_snapshot(self.device_id, self.device_character_id)
+                local["revision"] = self.memory_revision
+                local["facts"] = list(self.pet_runtime.memory.facts)
+                local["recentSessions"] = self.experiment_store.recent(self.device_id)
+                merged = merge_snapshots(local, remote_snapshot)
+                if self.device_character_id:
+                    merged["characterId"] = self.device_character_id
+                client.push(merged, sha)
+                self.events.put(("memory_sync_done", merged))
+            except Exception as error:
+                self.events.put(("memory_sync_error", str(error)))
+
+        threading.Thread(target=worker, daemon=True, name="memory-sync").start()
+
     def _device_context(self) -> dict:
         return {
             "connected": self.link.connected,
+            "transport": getattr(self.link, "kind", "usb"),
             "port": self.link.port.port if self.link.connected and self.link.port else "",
             "state": self.device_state,
             "recording": self.device_recording,
             "configured_rate_hz": self.device_rate,
             "configured_duration_s": self.device_duration,
             "firmware_version": self.device_firmware_version,
+            "device_id": self.device_id,
+            "device_alias": self.device_alias,
+            "character_id": self.device_character_id,
+            "character_proxy": self.device_pet_proxy,
+            "memory_revision": self.memory_revision,
+            "network": {"staConnected": self.device_sta_connected,
+                        "staIp": self.device_sta_ip},
             "samples": len(self.samples),
             "latest_sample": self.last_sample,
             "motion_summary": self.motion_chart.summary(),
@@ -1419,6 +1714,32 @@ class Studio(tk.Tk):
             self.events.put(("pet_reply", reply))
         threading.Thread(target=worker, daemon=True, name="pet-agent").start()
 
+    def record_pet_voice(self):
+        if self.mic_button.instate(["disabled"]):
+            return
+        endpoint = self.speech_endpoint_var.get().strip()
+        model = self.speech_model_var.get().strip()
+        api_key = self.speech_key_var.get().strip()
+        if not api_key:
+            messagebox.showwarning(
+                "未配置语音转写",
+                "请在右侧填写语音 Endpoint、模型和 API Key。语音密钥与对话密钥可不同。")
+            return
+        self.mic_button.state(["disabled"])
+        self.speech_status.configure(text="麦克风：正在录音 6 秒…")
+        self._set_pet_state("curious", "LISTENING", "TILT")
+
+        def worker():
+            try:
+                wav = record_wav(6.0)
+                self.events.put(("speech_uploading", len(wav)))
+                text = transcribe_wav(wav, endpoint, model, api_key, "zh")
+                self.events.put(("speech_done", text))
+            except Exception as error:
+                self.events.put(("speech_error", str(error)))
+
+        threading.Thread(target=worker, daemon=True, name="pet-microphone").start()
+
     @staticmethod
     def _ascii_device_notice(reply: PetReply) -> str:
         ascii_text = " ".join(re.findall(r"[A-Za-z0-9][A-Za-z0-9 .:\-]{1,}", reply.text))[:30]
@@ -1454,12 +1775,85 @@ class Studio(tk.Tk):
                     and not self.device_recording):
                 self._sync_pet_reply_to_device(reply)
 
+    def _accept_device_identity(self, device_id: str) -> None:
+        if not re.fullmatch(r"lc-[0-9a-f]{12}", device_id):
+            self._append_log(f"! 忽略无效设备 ID：{device_id[:40]}")
+            return
+        changed = device_id != self.device_id
+        self.device_id = device_id
+        try:
+            self.pet_runtime.memory.bind_device(device_id)
+        except Exception as error:
+            self._append_log(f"! 设备记忆分区失败：{error}")
+        port = self.link.port.port if self.link.connected and self.link.port else "设备"
+        self.connection_label.configure(text=f"● {port} · {device_id}", fg=self.CYAN)
+        if changed:
+            self._pet_append("event", f"已识别硬件 {device_id}；已切换到该设备的独立记忆分区。")
+        if (self.pet_settings.memory_sync_enabled and
+                self.memory_synced_device != device_id and not self.memory_sync_active):
+            self.sync_memory_now()
+
+    def _apply_transport_status(self, payload: dict) -> None:
+        device = payload.get("device", payload)
+        network = payload.get("network", {})
+        if not isinstance(device, dict):
+            return
+        version = str(device.get("version", ""))[:40]
+        if version:
+            self.device_firmware_version = version
+        device_id = str(device.get("deviceId", ""))
+        if device_id:
+            self._accept_device_identity(device_id)
+        self.device_state = str(device.get("state", self.device_state)).upper()
+        self.device_recording = self.device_state == "RECORDING"
+        try:
+            self.device_rate = int(device.get("rate", self.device_rate))
+            self.device_duration = int(device.get("duration", self.device_duration))
+        except (TypeError, ValueError):
+            pass
+        pet = device.get("pet", {})
+        if isinstance(pet, dict):
+            self.device_character_id = str(
+                pet.get("characterId", self.device_character_id))[:64]
+            self.device_pet_proxy = bool(pet.get("proxy", self.device_pet_proxy))
+        else:
+            self.device_character_id = str(
+                device.get("characterId", self.device_character_id))[:64]
+            self.device_pet_proxy = bool(device.get("petProxy", self.device_pet_proxy))
+        if isinstance(network, dict):
+            self.device_sta_connected = bool(network.get("staConnected", False))
+            self.device_sta_ip = str(network.get("staIp", "0.0.0.0"))[:48]
+            self.network_label.configure(
+                text=(f"外部 WiFi：已连接 · {self.device_sta_ip}" if self.device_sta_connected
+                      else "外部 WiFi：未连接 · ESP32-S3 仅支持 2.4 GHz"),
+                fg=self.CYAN if self.device_sta_connected else self.YELLOW)
+        if hasattr(self, "pet_device_status") and self.device_firmware_version:
+            self.pet_device_status.configure(
+                text=f"设备桌宠：{self.device_firmware_version} · "
+                     f"{self.device_character_id or '未设置角色'}")
+
     def _handle_line(self, line: str):
         self._append_log(line)
-        if line.startswith("PONG,LABCAPSULE,"):
-            self.device_firmware_version = line.split(",", 2)[-1].strip()
-            if self.device_firmware_version.startswith("0.11."):
-                self.pet_device_status.configure(text="设备桌宠：COM8 协议就绪")
+        if line.startswith("TRANSPORT_JSON,"):
+            try:
+                self._apply_transport_status(json.loads(line.split(",", 1)[1]))
+            except (json.JSONDecodeError, TypeError, ValueError) as error:
+                self._append_log(f"! 设备状态 JSON 无效：{error}")
+        elif line.startswith("NETWORK,"):
+            try:
+                network = json.loads(line.split(",", 1)[1])
+                self._apply_transport_status({"device": {}, "network": network})
+            except (json.JSONDecodeError, TypeError, ValueError) as error:
+                self._append_log(f"! 网络状态 JSON 无效：{error}")
+        elif line.startswith("PONG,LABCAPSULE,"):
+            fields = line.split(",")
+            self.device_firmware_version = fields[2].strip() if len(fields) > 2 else ""
+            values = parse_key_value_fields(fields[3:])
+            if values.get("DEVICE"):
+                self._accept_device_identity(values["DEVICE"])
+            if self.device_firmware_version.startswith(("0.11.", "1.0.")):
+                self.pet_device_status.configure(
+                    text=f"设备桌宠：{self.device_firmware_version} 协议就绪")
                 pending = self.pending_pet_device_reply or self.last_pet_reply
                 self.pending_pet_device_reply = None
                 if self.device_pet_enabled and self.pet_settings.sync_device:
@@ -1467,28 +1861,54 @@ class Studio(tk.Tk):
             else:
                 self.pet_device_status.configure(
                     text=f"设备桌宠：需更新固件（当前 {self.device_firmware_version}）")
+        elif line.startswith("IDENTITY,"):
+            values = parse_key_value_fields(line.split(",")[1:])
+            if values.get("DEVICE"):
+                self._accept_device_identity(values["DEVICE"])
+            self.device_alias = values.get("ALIAS", self.device_alias)
+            self.device_character_id = values.get("CHARACTER", self.device_character_id)
+            self.device_pet_proxy = values.get("PROXY", "OFF").upper() == "ON"
+            if hasattr(self, "memory_sync_status") and not self.pet_settings.memory_sync_enabled:
+                self.memory_sync_status.configure(
+                    text=f"记忆同步：{self.device_id or '设备已识别'} · 未启用远程同步")
+        elif line.startswith("PET,VIEW="):
+            values = parse_key_value_fields(line.split(",")[1:])
+            self.device_character_id = values.get("CHARACTER", self.device_character_id)
+            self.device_pet_proxy = values.get("PROXY", "OFF").upper() == "ON"
+        elif line.startswith("OK,PET,IDENTITY,"):
+            fields = line.split(",")
+            if len(fields) >= 5:
+                self.device_character_id = fields[3].strip()[:64]
+                self.device_pet_proxy = fields[4].strip().upper() == "PROXY"
         elif line.startswith("STATUS,"):
             fields = line.split(",")
             if len(fields) > 1:
                 self.device_state = fields[1]
-            values = {item.split("=", 1)[0]: item.split("=", 1)[1]
-                      for item in fields[2:] if "=" in item}
+            values = parse_key_value_fields(fields[2:])
             try:
                 self.device_rate = int(values.get("RATE", self.device_rate))
                 self.device_duration = int(values.get("DURATION", self.device_duration))
             except ValueError:
                 pass
         elif line.startswith("OK,START"):
+            if self.device_state != "RECORDING":
+                self.samples.clear()
+                self.motion_chart.clear()
+            self.experiment_started_at = datetime.now().astimezone().isoformat(
+                timespec="seconds")
+            self.experiment_session_saved = False
             self.device_state = "RECORDING"
             self.device_recording = True
             self._pet_event("experiment_start")
         elif line.startswith("OK,COMPLETE") or line.startswith("OK,STOP"):
             self.device_state = "COMPLETE"
             self.device_recording = False
+            self._finalize_experiment_session(False)
             self._pet_event("experiment_complete")
         elif line.startswith("OK,ABORT"):
             self.device_state = "ABORTED"
             self.device_recording = False
+            self._finalize_experiment_session(True)
             self._pet_event("experiment_abort")
         elif (line.startswith("ERR,") and not line.startswith("ERR,UPLOAD,PETBUBBLE")
               and time.monotonic() - self.last_pet_error_at > 8):
@@ -1500,7 +1920,8 @@ class Studio(tk.Tk):
         elif line == "PET,INPUT,NEXT_ACTION":
             self._set_pet_state("happy", "HELLO", "BOUNCE")
         if (line.startswith("STATUS,") or line.startswith("PONG,") or
-                line.startswith("GIF,") or line.startswith("PET,")):
+                line.startswith("GIF,") or line.startswith("PET,") or
+                line.startswith("NETWORK,") or line.startswith("TRANSPORT_JSON,")):
             self.device_status.insert("end", line + "\n")
             self.device_status.see("end")
         if line.startswith("DATA,"):
@@ -1560,6 +1981,7 @@ class Studio(tk.Tk):
                 self.last_handshake_at = now
                 self.send("PING")
                 self.send("STATUS")
+                self.send("IDENTITY")
             self.send(f"HOST,{cpu},{ram},{disk},{temperature}")
             if self.notification_enabled and now - self.last_notification_poll >= 5:
                 self.last_notification_poll = now
@@ -1631,7 +2053,7 @@ class Studio(tk.Tk):
             messagebox.showwarning("缺少媒体", "请先选择主媒体。")
             return
         if not self.link.connected:
-            messagebox.showwarning("未连接", "请先通过数据线连接设备。")
+            messagebox.showwarning("未连接", "请先通过 USB、局域网或 BLE 连接设备。")
             return
         self.media_state.configure(text="电脑端裁剪、解码与压缩中…")
         self.media_progress["value"] = 0
@@ -1645,7 +2067,7 @@ class Studio(tk.Tk):
                 result = build_media(**settings,
                     progress=lambda value: self.events.put(("progress", value)))
                 kind = "WALLPAPER" if result.frames == 1 and not self.pet_path else "CLIP"
-                self.events.put(("media_state", f"已压缩 {len(result.payload):,} B，USB 写入设备…"))
+                self.events.put(("media_state", f"已压缩 {len(result.payload):,} B，通过当前链路写入设备…"))
                 self.link.upload(kind, result.payload,
                                  lambda value: self.events.put(("progress", value)))
                 self.events.put(("media_done", (result, kind)))
@@ -1663,6 +2085,13 @@ class Studio(tk.Tk):
     def start_experiment(self):
         self.samples.clear()
         self.motion_chart.clear()
+        self.experiment_started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        self.experiment_session_saved = False
+        try:
+            self.device_rate = int(self.rate_var.get())
+            self.device_duration = int(self.duration_var.get())
+        except ValueError:
+            pass
         self.send("MODE,EXPERIMENT")
         self.send(f"START,{self.rate_var.get()},{self.duration_var.get()}")
 
@@ -1680,6 +2109,27 @@ class Studio(tk.Tk):
             writer.writerows(self.samples)
         messagebox.showinfo("导出完成", path)
 
+    def _finalize_experiment_session(self, aborted: bool):
+        if self.experiment_session_saved or not self.samples or not self.device_id:
+            return
+        self.experiment_session_saved = True
+        samples = [list(row) for row in self.samples]
+        summary = self.motion_chart.summary()
+        device_id = self.device_id
+        started_at = self.experiment_started_at
+        rate = self.device_rate
+        duration = self.device_duration
+
+        def worker():
+            try:
+                session = self.experiment_store.save(
+                    device_id, samples, rate, duration, started_at, aborted, summary)
+                self.events.put(("session_saved", session))
+            except Exception as error:
+                self.events.put(("session_save_error", str(error)))
+
+        threading.Thread(target=worker, daemon=True, name="experiment-save").start()
+
     def _pump(self):
         try:
             while True:
@@ -1693,10 +2143,24 @@ class Studio(tk.Tk):
                     self.connect_button.configure(text="断开" if state else "连接")
                     if state:
                         self.device_firmware_version = ""
+                        self.device_id = ""
+                        self.device_alias = ""
+                        self.device_character_id = ""
+                        self.device_pet_proxy = False
+                        self.device_sta_connected = False
+                        self.device_sta_ip = "0.0.0.0"
+                        self.memory_synced_device = ""
                         self.last_handshake_at = 0.0
                         self.pet_device_status.configure(text="设备桌宠：正在握手…")
                     else:
                         self.device_firmware_version = ""
+                        self.device_id = ""
+                        self.device_alias = ""
+                        self.device_character_id = ""
+                        self.device_pet_proxy = False
+                        self.device_sta_connected = False
+                        self.device_sta_ip = "0.0.0.0"
+                        self.memory_synced_device = ""
                         self.device_pet_enabled = False
                         self.pet_device_sync_active = False
                         self.pending_pet_device_reply = None
@@ -1713,6 +2177,29 @@ class Studio(tk.Tk):
                 elif kind == "media_error":
                     self.media_state.configure(text=f"失败：{payload}")
                     messagebox.showerror("媒体处理/上传失败", str(payload))
+                elif kind == "session_saved":
+                    session = payload
+                    self._pet_append(
+                        "event", f"实验已自动保存：{session['sampleCount']} 个样本 · "
+                                 f"{session['id']}")
+                    if self.pet_settings.memory_sync_enabled:
+                        self.memory_synced_device = ""
+                        self.sync_memory_now()
+                elif kind == "session_save_error":
+                    self._append_log(f"! 实验自动保存失败：{payload}")
+                elif kind == "live2d_proxy_done":
+                    self.avatar_download_active = False
+                    package, result, path = payload
+                    self._set_avatar_status(
+                        f"同一角色已同步：{result.frames} 帧 / {result.fps:g} FPS / "
+                        f"{len(result.payload) / 1024:.1f} KiB", 100)
+                    self.pet_device_status.configure(
+                        text=f"设备桌宠：{package.name} 代理已持久化，可脱离电脑播放")
+                    self._pet_append("event", f"{package.name} 的同源 Live2D 代理已写入设备：{path}")
+                elif kind == "live2d_proxy_error":
+                    self.avatar_download_active = False
+                    self._set_avatar_status(f"Live2D 设备代理失败：{payload}", 0)
+                    messagebox.showerror("Live2D 设备同步失败", str(payload))
                 elif kind == "notice":
                     self.notification_enabled = bool(payload)
                     self.notice_state.configure(text="系统通知镜像已启用" if payload else
@@ -1730,6 +2217,36 @@ class Studio(tk.Tk):
                         text=f"Claude：处理完成 · {float(payload):.1f} 秒 · 无工具权限")
                 elif kind == "claude_error":
                     self.claude_state_label.configure(text=f"Claude：转交失败 · {str(payload)[:70]}")
+                elif kind == "speech_uploading":
+                    self.speech_status.configure(
+                        text=f"麦克风：录音完成 {int(payload) / 1024:.0f} KiB，电脑正在转写…")
+                    self._set_pet_state("thinking", "TRANSCRIBING", "THINK")
+                elif kind == "speech_done":
+                    self.mic_button.state(["!disabled"])
+                    self.speech_status.configure(text=f"麦克风：识别为“{str(payload)[:48]}”")
+                    self.send_pet_message(str(payload))
+                elif kind == "speech_error":
+                    self.mic_button.state(["!disabled"])
+                    self.speech_status.configure(text=f"麦克风：失败 · {str(payload)[:100]}")
+                    self._set_pet_state("warning", "VOICE ERROR", "ALERT")
+                elif kind == "memory_sync_done":
+                    self.memory_sync_active = False
+                    snapshot = payload
+                    self.memory_revision = int(snapshot.get("revision", 0))
+                    self.memory_synced_device = self.device_id
+                    self.pet_runtime.memory.merge_facts(list(snapshot.get("facts", [])))
+                    remote_character = str(snapshot.get("characterId", ""))
+                    if remote_character and not self.device_character_id:
+                        self.device_character_id = remote_character
+                    self.memory_sync_status.configure(
+                        text=f"记忆同步：完成 · {self.device_id} · r{self.memory_revision} · "
+                             f"{len(snapshot.get('facts', []))} 条长期记忆")
+                    self._pet_append("event", "私有记忆已按硬件 ID 合并；API/Wi-Fi 密钥未上传。")
+                elif kind == "memory_sync_error":
+                    self.memory_sync_active = False
+                    self.memory_sync_status.configure(
+                        text=f"记忆同步：失败 · {str(payload)[:110]}")
+                    self._append_log(f"! 私有记忆同步失败：{payload}")
                 elif kind == "pet_device_progress":
                     self.pet_device_status.configure(text=f"设备桌宠：同步 {int(payload)}%")
                 elif kind == "pet_device_done":
@@ -1812,13 +2329,21 @@ if __name__ == "__main__":
             model_argument = sys.argv[marker + 1]
         except IndexError as error:
             raise SystemExit("缺少 Live2D model3.json 路径") from error
-        mode_argument = "overlay" if "--mode" in sys.argv and sys.argv[
-            sys.argv.index("--mode") + 1] == "overlay" else "stage"
+        mode_argument = "stage"
+        if "--mode" in sys.argv:
+            mode_argument = sys.argv[sys.argv.index("--mode") + 1]
         control_argument = None
         if "--control" in sys.argv:
             try:
                 control_argument = sys.argv[sys.argv.index("--control") + 1]
             except IndexError as error:
                 raise SystemExit("缺少 Live2D control.json 路径") from error
-        raise SystemExit(run_player_guarded(model_argument, mode_argument, control_argument))
+        capture_argument = None
+        if "--capture-output" in sys.argv:
+            try:
+                capture_argument = sys.argv[sys.argv.index("--capture-output") + 1]
+            except IndexError as error:
+                raise SystemExit("缺少 Live2D capture 输出路径") from error
+        raise SystemExit(run_player_guarded(model_argument, mode_argument, control_argument,
+                                            capture_argument))
     Studio().mainloop()

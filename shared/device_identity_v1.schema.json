@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/81823650800wzy-sketch/LabCapsule/shared/device_identity_v1.schema.json",
+  "title": "LabCapsule device identity v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "deviceId", "model", "firmware", "capabilities"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "deviceId": {"type": "string", "pattern": "^lc-[0-9a-f]{12}$"},
+    "alias": {"type": "string", "maxLength": 32},
+    "model": {"const": "LabCapsule-S3"},
+    "firmware": {"type": "string", "maxLength": 32},
+    "capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"enum": ["usb", "wifi", "ble", "mqtt", "display", "media", "pet-proxy", "offline-experiment", "i2c-sensors", "input-hub", "microphone-port"]}
+    }
+  }
+}

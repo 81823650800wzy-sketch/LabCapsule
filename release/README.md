@@ -1,52 +1,52 @@
-# LabCapsule 0.11.0 Alpha（实体桌宠 / AI / Claude）
+# LabCapsule 1.0.0 Alpha（统一随身实验助手）
 
-## 本次发布文件
+## 发布文件
 
-- `LabCapsule-Studio-0.11.0.exe` — Windows 10/11 单文件桌面工作室，83,458,533 字节。
-- `LabCapsule-0.11.0-ota.bin` — ESP32-S3 V0.11.0 应用 OTA 镜像，1,395,072 字节。
-- `LabCapsule-0.7.0.apk` — 兼容的 Android 8.0+ 简体中文控制器；完整 V0.11 桌宠 UI 当前先在电脑端提供。
+- `LabCapsule-Studio-1.0.0.exe` — Windows 10/11 单文件 Studio，85,841,923 字节。
+- `LabCapsule-1.0.0.apk` — Android 8.0+ 简体中文控制器，352,822 字节。
+- `LabCapsule-1.0.0-ota.bin` — ESP32-S3 V1.0.0 应用 OTA 镜像，1,398,704 字节。
 
 ## SHA-256
 
 ```text
-D8E725D116EB8E50D4BB892EDF22E4140671F39EB26F089AC86B689E7692EA87  LabCapsule-Studio-0.11.0.exe
-3772405BC1B689142D61E499119280D77713A90B51416FABF943885A6BBC500F  LabCapsule-0.11.0-ota.bin
+6CBEC60592639EF7463B7133DAD47CF4FF5EB661FBE25AAF37D7E4918F990C35  LabCapsule-Studio-1.0.0.exe
+4A6E96A8ECCC5569864AACCAB65911D10EF2446F47C9F3C0F21A62271D91F943  LabCapsule-1.0.0.apk
+675DA5103E6B53C496F9E6206883D56ED906375E0196C23EB7FB44FF710DF685  LabCapsule-1.0.0-ota.bin
 ```
 
-当前 EXE 没有 Authenticode 签名。请只从本仓库 GitHub Release 下载并核对 SHA-256；Windows SmartScreen 可能显示未知发布者。
+EXE 当前没有 Authenticode 签名，APK 为开发签名。请只从本仓库 GitHub Release 下载并核对 SHA-256；商业发行前需替换正式证书。
 
-## 更新与安装
+## 安装顺序
 
-1. 初次进入 V0.11 桌宠协议建议通过 USB 完整烧录：在 `firmware` 目录执行 `idf.py -p COM8 flash`。后续相同分区表版本可以使用 APK OTA 安装 `LabCapsule-0.11.0-ota.bin`。
-2. 完整烧录不会格式化独立媒体/离线实验分区；不要运行 `erase-flash`，除非确实要删除 Wi-Fi、壁纸和离线实验数据。
-3. 运行 `LabCapsule-Studio-0.11.0.exe`，选择 CH343/COM8 并连接。程序不会切换电脑 Wi-Fi，也不会连接设备的无网络热点。
-4. 自动握手应返回 `PONG,LABCAPSULE,0.11.0-alpha` 与 `STATUS,READY,MPU=OK`；固件会在 STATUS 阶段透明重试尚未稳定的 MPU6050。
-5. 进入“AI 桌宠”，点击“在 COM8 打开桌宠界面”。连接设备本身不会自动覆盖当前屏幕页面。
-6. 如需在线 AI，填写 OpenAI 兼容 Endpoint、模型和 Key；DeepSeek 官方 Endpoint 的默认模型为 `deepseek-v4-flash`。Key 由当前 Windows 用户 DPAPI 加密。
-7. Live2D 角色继续从用户目录加载。LabCapsule 不分发 Cubism Core、Hiyori 或其他第三方角色素材；首次使用须由素材权利人确认条款。
+1. 首次使用 V1 或分区表变化时，在 `firmware` 目录执行 `idf.py -p COM8 flash`；不要执行 `erase-flash`。
+2. Windows 运行 `LabCapsule-Studio-1.0.0.exe`；Android 安装 `LabCapsule-1.0.0.apk`。
+3. 保持手机/电脑在正常有网络连接上，优先用 USB 或 BLE 找到设备；不要长期连接恢复热点。
+4. 核对稳定设备 ID。COM8 本次实机为 `lc-000000000000`。
+5. Windows 已可从用户目录恢复 Hiyori Free。Android 需把完整 Hiyori 文件夹复制到手机并在 AI 页选择；模型不包含在发布包中。
+6. 如需跨端记忆，在双端配置用户自己的私有 GitHub 仓库和最小权限 Token。
 
 ## 重点变化
 
-- 设备新增独立桌宠界面、9 项动作白名单和底部 `216 × 64` 中文位图气泡。
-- 电脑承担 AI、中文排版、脱敏和气泡渲染；ESP32 只负责可靠接收、本地动画和显示。
-- 气泡使用 1728 字节、CRC32、64 字节节流分片；固件为中断上传加入 3 秒超时恢复。
-- AI 能回答电脑资源、COM8、固件、实验参数、样本和数据质量问题；无 Key/网络失败时安全回退。
-- 复杂任务可转交本机 Claude Code，但禁用全部工具、浏览器、MCP 和会话持久化，不能操作设备、网络或用户文件。
-- Live2D 舞台可接收安全情绪/动作事件；Hiyori Pro 已实测 WebGL、Flick 与 `HAPPY + BOUNCE → FlickUp`。
-- MPU6050 在启动窗口内尚未稳定时由正常 STATUS 握手自动恢复，不再要求普通用户手动进入诊断页。
+- Windows、Android、实体屏统一 Hiyori 内容 ID `live2d-000000000000`；旧 `local-*` 自动迁移。
+- Windows 增加 USB/LAN/BLE 三链路、语音转写、私有记忆、持久实验会话和简化导航。
+- Android 增加统一 Hiyori 对话、系统语音、Live2D 文件夹导入、私有记忆和真实 240:320 舞台。
+- 设备暴露稳定硬件身份、角色代理、STA 状态、传感器与 `MIC_PORT` 扩展能力。
+- GIF/Hiyori 代理一次写入设备本地并持续播放；AI 回答只同步安全动作和底部气泡。
+- 新增按需组件/设备上下文 Skill，防止 AI 为每次问题加载整个仓库。
+- 修复扩展 I²C 扫描对已启动 MPU 的争用；USB 和 BLE 均返回 MPU6050 0x68。
 
 ## 验证摘要
 
-- 43/43 Python 自动化测试通过；11 个桌面 Python 文件编译检查通过。
-- Live2D Web 生产构建通过；npm 生产依赖审计为 0 漏洞。
-- ESP-IDF 5.5.4 构建通过，应用为 `0x154980` 字节，3 MiB app 分区余 56%。
-- COM8 完整烧录的 bootloader、app、partition table 和 OTA data 均完成哈希校验。
-- 首次自动握手返回 `MPU=OK`；并发电脑心跳下中文气泡压力测试 50/50，0 CRC、0 协议错误。
-- 最终 EXE 已完成 COM8、实体桌宠、DeepSeek 电脑状态问答和气泡同步验证。
+- 54/54 Python 自动化测试通过。
+- Android versionCode 100 / versionName 1.0.0，APK v2/v3 签名通过，包内 Live2D 播放器资产完整。
+- ESP-IDF 5.5.4 构建通过，3 MiB app 分区剩余 56%；最终 OTA 镜像已写入 COM8 并通过哈希校验。
+- COM8 返回 V1 身份、MPU OK、传感器 count 1、Hiyori proxy ON。
+- Windows BLE 实机读取同一身份、角色、网络字段和传感器。
+- 源码与最终 EXE 均用用户现有 Hiyori Free 完成 24 帧、8 FPS 捕获；EXE 隐藏启动 20 秒保持运行。
+- 当前无 ADB 手机，故 Android 真机 Live2D WebView 仍需用户安装后执行指南中的首次导入验收。
 
-完整步骤：
+完整指南：`docs/V1.0.0_UNIFIED_ASSISTANT_GUIDE_ZH.md`
 
-- `docs/V0.11.0_DEVICE_PET_AI_CLAUDE_ZH.md`
-- `docs/V0.11.0_TEST_REPORT_ZH.md`
-- `docs/V0.10.0_UNIFIED_PET_PACKAGE_TEST_ZH.md`
-- `skills/labcapsule-pet-creator/SKILL.md`
+测试证据：`docs/V1.0.0_TEST_REPORT_ZH.md`
+
+按需上下文 Skill：`skills/labcapsule-context-access/SKILL.md`

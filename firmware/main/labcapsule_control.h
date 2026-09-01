@@ -6,8 +6,12 @@
 
 #include "esp_err.h"
 
-#define LABCAPSULE_VERSION "0.11.0-alpha"
+#define LABCAPSULE_VERSION "1.0.0-alpha"
 #define LABCAPSULE_MEDIA_MAX_FPS 8U
+#define LABCAPSULE_PET_BUBBLE_WIDTH 216U
+#define LABCAPSULE_PET_BUBBLE_HEIGHT 64U
+#define LABCAPSULE_PET_BUBBLE_BYTES \
+    (LABCAPSULE_PET_BUBBLE_WIDTH * LABCAPSULE_PET_BUBBLE_HEIGHT / 8U)
 
 typedef enum {
     LABCAPSULE_MEDIA_RAW565 = 0,
@@ -26,6 +30,15 @@ void labcapsule_build_status_json(char *buffer, size_t buffer_size);
 /** Build allocation-free device fragments for the constrained NimBLE host task. */
 void labcapsule_build_ble_device_json(char *buffer, size_t buffer_size);
 void labcapsule_build_hardware_json(char *buffer, size_t buffer_size);
+
+/** Stable public identifier derived from the base MAC, e.g. lc-001122aabbcc. */
+const char *labcapsule_device_id(void);
+
+/** Select the canonical character and whether current media is its device proxy. */
+esp_err_t labcapsule_set_character_identity(const char *character_id, bool proxy_enabled);
+
+/** Replace the 1-bit 216x64 dialogue mask shown by the pet scene. */
+esp_err_t labcapsule_set_pet_bubble(const uint8_t *payload, size_t payload_size);
 
 /** Select the persisted wallpaper after a successful upload. */
 void labcapsule_show_wallpaper(void);

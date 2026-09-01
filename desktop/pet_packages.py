@@ -89,11 +89,18 @@ def _inferred_package(folder: Path) -> PetPackage:
     live2d = inspect_live2d_model(model_files[0]) if model_files else None
     if images:
         inspect_local_avatar(images[0])
-    digest = hashlib.sha256(str(folder.resolve()).encode("utf-8")).hexdigest()[:12]
+    digest_source = model_files[0] if model_files else images[0]
+    digest = hashlib.sha256(digest_source.read_bytes()).hexdigest()[:12]
     persona_path = folder / "persona.txt"
     greeting_path = folder / "greeting.txt"
+    raw_name = folder.name[:24] or "本地桌宠"
+    inferred_name = {
+        "hiyori": "Hiyori",
+        "hiyori-free": "Hiyori Free",
+        "hiyori-pro": "Hiyori Pro",
+    }.get(raw_name.lower().replace("_", "-"), raw_name)
     persona = (
-        f"你是名为“{folder.name[:24] or '本地桌宠'}”的 LabCapsule 数字实验伙伴。"
+        f"你是名为“{inferred_name}”的 LabCapsule 数字实验伙伴。"
         "保持友善、严谨，不编造传感器数据，也不未经确认操作实验或设备。"
     )
     greeting = "链路就绪。今天想观察什么现象？"
@@ -102,7 +109,8 @@ def _inferred_package(folder: Path) -> PetPackage:
     if greeting_path.is_file():
         greeting = _read_text_file(folder, "greeting.txt", "greeting.txt")[:160]
     return PetPackage(
-        package_id=f"local-{digest}", name=folder.name[:24] or "本地桌宠",
+        package_id=f"{'live2d' if live2d else 'raster'}-{digest}",
+        name=inferred_name,
         folder=str(folder.resolve()), avatar_path=str(images[0].resolve()) if images else "",
         persona=persona, greeting=greeting, inferred=True,
         visual_kind="live2d" if live2d else "raster",
@@ -209,8 +217,14 @@ def selected_pet_package(selection_path: str | Path = PET_SELECTION_PATH) -> Pet
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
         package = load_pet_package(str(raw["folder"]))
-        if package.package_id != raw.get("id"):
+        saved_id = str(raw.get("id", ""))
+        if package.package_id != saved_id and not saved_id.startswith("local-"):
             return None
+        if package.package_id != saved_id:
+            # V0.x inferred packages used an absolute-path based ``local-*`` id.
+            # Replace it with the model-content id so Windows, Android and the
+            # physical display all address the same character on every host.
+            save_selected_pet(package, path)
         return package
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
         return None

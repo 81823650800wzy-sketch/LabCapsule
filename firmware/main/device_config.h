@@ -7,6 +7,8 @@
 #include "esp_err.h"
 
 typedef struct {
+    char device_alias[33];
+    char character_id[65];
     char wifi_ssid[33];
     char wifi_password[65];
     char mqtt_uri[129];
@@ -21,6 +23,7 @@ typedef struct {
     uint8_t hud_opacity;
     bool keep_recovery_ap;
     bool remote_enabled;
+    bool pet_proxy_enabled;
 } labcapsule_config_t;
 
 esp_err_t device_config_init(void);

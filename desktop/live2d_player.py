@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import mimetypes
@@ -53,6 +55,7 @@ def player_html() -> bytes:
     .overlay::before {{ display: none; }}
     .overlay #hud {{ opacity: .16; transition: opacity .2s; }}
     .overlay #hud:hover {{ opacity: 1; }}
+    .capture #hud, .capture #close-player {{ display: none; }}
     .pywebview-drag-region {{ -webkit-app-region: drag; }}
     button, #motion-bar {{ -webkit-app-region: no-drag; }}
   </style>
@@ -71,13 +74,14 @@ class PlayerServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, address, handler, model_path: Path, mode: str,
-                 control_path: Path | None = None):
+                 control_path: Path | None = None, capture_path: Path | None = None):
         super().__init__(address, handler)
         self.model_path = model_path
         self.model_root = model_path.parent.resolve()
         self.asset_root = resource_path("live2d_web", "dist").resolve()
         self.mode = mode
         self.control_path = control_path
+        self.capture_path = capture_path
         self.asset = inspect_live2d_model(model_path)
 
 
@@ -124,6 +128,9 @@ class PlayerHandler(BaseHTTPRequestHandler):
                 "motionCount": asset.motion_count,
                 "mode": self.server.mode,
                 "controlUrl": "/control.json" if self.server.control_path else "",
+                "capture": self.server.capture_path is not None,
+                "captureFrames": 24,
+                "captureIntervalMs": 125,
                 "officialFileGuide": OFFICIAL_FILE_GUIDE,
                 "officialLicense": OFFICIAL_LICENSE,
             }, ensure_ascii=False).encode("utf-8")
@@ -160,7 +167,8 @@ class PlayerHandler(BaseHTTPRequestHandler):
 
 
 def run_player(model_path: str | Path, mode: str = "stage",
-               control_path: str | Path | None = None) -> int:
+               control_path: str | Path | None = None,
+               capture_path: str | Path | None = None) -> int:
     model = Path(model_path).expanduser().resolve()
     asset = inspect_live2d_model(model)
     bundle = resource_path("live2d_web", "dist", "player.bundle.js")
@@ -171,26 +179,67 @@ def run_player(model_path: str | Path, mode: str = "stage",
     except ImportError as error:
         raise RuntimeError("缺少 pywebview；请安装桌面端 requirements.txt") from error
     control = Path(control_path).expanduser().resolve() if control_path else None
-    server = PlayerServer(("127.0.0.1", 0), PlayerHandler, model, mode, control)
+    capture = Path(capture_path).expanduser().resolve() if capture_path else None
+    if mode == "capture" and capture is None:
+        raise ValueError("capture 模式缺少输出文件夹")
+    if capture:
+        capture.mkdir(parents=True, exist_ok=True)
+    server = PlayerServer(("127.0.0.1", 0), PlayerHandler, model, mode, control, capture)
     thread = threading.Thread(target=server.serve_forever, daemon=True, name="live2d-http")
     thread.start()
     url = f"http://127.0.0.1:{server.server_port}/"
     window_ref = {}
 
     class PlayerApi:
+        def __init__(self):
+            self.frames = 0
+
         def close_player(self):
             player_window = window_ref.get("window")
             if player_window is not None:
                 player_window.destroy()
             return True
 
+        def save_capture_frame(self, data_url, index, duration_ms):
+            if capture is None or not isinstance(data_url, str) or not data_url.startswith(
+                    "data:image/png;base64,"):
+                return False
+            try:
+                frame_index = int(index)
+                duration = max(20, min(2000, int(duration_ms)))
+                encoded = data_url.split(",", 1)[1]
+                payload = base64.b64decode(encoded, validate=True)
+            except (ValueError, TypeError, binascii.Error):
+                return False
+            if frame_index < 0 or frame_index >= 240 or len(payload) > 2 * 1024 * 1024:
+                return False
+            target = capture / f"frame-{frame_index:03d}.png"
+            target.write_bytes(payload)
+            self.frames = max(self.frames, frame_index + 1)
+            (capture / "capture.json").write_text(json.dumps({
+                "schemaVersion": 1, "model": str(model), "frames": self.frames,
+                "durationMs": duration, "complete": False,
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+            return True
+
+        def complete_capture(self, frame_count, duration_ms):
+            if capture is None or int(frame_count) != self.frames or self.frames < 2:
+                return False
+            (capture / "capture.json").write_text(json.dumps({
+                "schemaVersion": 1, "model": str(model), "frames": self.frames,
+                "durationMs": max(20, min(2000, int(duration_ms))), "complete": True,
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+            threading.Timer(0.25, self.close_player).start()
+            return True
+
     api = PlayerApi()
     try:
         window = webview.create_window(
             f"LabCapsule Live2D · {asset.name}", url=url,
-            width=420 if mode == "overlay" else 520,
-            height=600 if mode == "overlay" else 720,
-            min_size=(300, 420), frameless=mode == "overlay",
+            width=240 if mode == "capture" else (420 if mode == "overlay" else 520),
+            height=320 if mode == "capture" else (600 if mode == "overlay" else 720),
+            min_size=(240, 320) if mode == "capture" else (300, 420),
+            frameless=mode in {"overlay", "capture"},
             on_top=mode == "overlay", transparent=mode == "overlay",
             background_color="#000000" if mode == "overlay" else "#080c12",
             js_api=api,
@@ -207,9 +256,10 @@ def run_player(model_path: str | Path, mode: str = "stage",
 
 
 def run_player_guarded(model_path: str | Path, mode: str = "stage",
-                       control_path: str | Path | None = None) -> int:
+                       control_path: str | Path | None = None,
+                       capture_path: str | Path | None = None) -> int:
     try:
-        return run_player(model_path, mode, control_path)
+        return run_player(model_path, mode, control_path, capture_path)
     except Exception as error:
         try:
             import tkinter as tk
@@ -227,10 +277,12 @@ def run_player_guarded(model_path: str | Path, mode: str = "stage",
 def main() -> int:
     parser = argparse.ArgumentParser(description="LabCapsule local Live2D stage")
     parser.add_argument("model")
-    parser.add_argument("--mode", choices=("stage", "overlay"), default="stage")
+    parser.add_argument("--mode", choices=("stage", "overlay", "capture"), default="stage")
     parser.add_argument("--control", default="")
+    parser.add_argument("--capture-output", default="")
     args = parser.parse_args()
-    return run_player_guarded(args.model, args.mode, args.control or None)
+    return run_player_guarded(args.model, args.mode, args.control or None,
+                              args.capture_output or None)
 
 
 if __name__ == "__main__":

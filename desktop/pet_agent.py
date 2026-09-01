@@ -27,10 +27,13 @@ from urllib.parse import urlparse
 
 from PIL import Image, ImageTk
 
+from context_access import compact_ai_context
+
 
 APP_DIR = Path(os.environ.get("APPDATA", Path.home())) / "LabCapsule"
 CONFIG_PATH = APP_DIR / "pet_config.json"
 MEMORY_PATH = APP_DIR / "pet_memory.json"
+MEMORY_DEVICE_DIR = APP_DIR / "memory" / "devices"
 EMOTIONS = {"idle", "happy", "curious", "thinking", "speaking", "experiment",
             "success", "warning", "sleeping"}
 SECRET_PATTERN = re.compile(
@@ -107,6 +110,13 @@ class PetSettings:
     claude_model: str = "sonnet"
     avatar_url: str = ""
     avatar_source_name: str = "内置矢量形象"
+    memory_sync_enabled: bool = False
+    memory_repository: str = ""
+    memory_branch: str = "main"
+    memory_token: str = ""
+    speech_endpoint: str = "https://api.openai.com/v1"
+    speech_model: str = "gpt-4o-mini-transcribe"
+    speech_api_key: str = ""
     profile: CharacterProfile = field(default_factory=CharacterProfile)
 
     def validate(self) -> None:
@@ -118,6 +128,14 @@ class PetSettings:
             raise ValueError("公网 AI Endpoint 必须使用 HTTPS；HTTP 仅允许 localhost")
         if not self.model.strip():
             raise ValueError("模型名称不能为空")
+        if self.speech_api_key:
+            speech = urlparse(self.speech_endpoint.strip())
+            if speech.scheme not in {"http", "https"} or not speech.hostname:
+                raise ValueError("语音 Endpoint 必须是有效的 http(s) 地址")
+            if speech.scheme != "https" and speech.hostname not in local_hosts:
+                raise ValueError("公网语音 Endpoint 必须使用 HTTPS")
+            if not self.speech_model.strip():
+                raise ValueError("语音转写模型不能为空")
 
     @classmethod
     def load(cls) -> "PetSettings":
@@ -139,6 +157,14 @@ class PetSettings:
             key = ""
             if raw.get("api_key_dpapi"):
                 key = _dpapi(base64.b64decode(raw["api_key_dpapi"]), False).decode("utf-8")
+            memory_token = ""
+            if raw.get("memory_token_dpapi"):
+                memory_token = _dpapi(base64.b64decode(
+                    raw["memory_token_dpapi"]), False).decode("utf-8")
+            speech_key = ""
+            if raw.get("speech_api_key_dpapi"):
+                speech_key = _dpapi(base64.b64decode(
+                    raw["speech_api_key_dpapi"]), False).decode("utf-8")
             return cls(endpoint=endpoint, model=model, api_key=key,
                        temperature=float(raw.get("temperature", .65)),
                        remember=bool(raw.get("remember", True)),
@@ -148,6 +174,15 @@ class PetSettings:
                        claude_model=str(raw.get("claude_model", "sonnet"))[:80] or "sonnet",
                        avatar_url=str(raw.get("avatar_url", ""))[:2048],
                        avatar_source_name=str(raw.get("avatar_source_name", "内置矢量形象"))[:80],
+                       memory_sync_enabled=bool(raw.get("memory_sync_enabled", False)),
+                       memory_repository=str(raw.get("memory_repository", ""))[:201],
+                       memory_branch=str(raw.get("memory_branch", "main"))[:120] or "main",
+                       memory_token=memory_token,
+                       speech_endpoint=str(raw.get(
+                           "speech_endpoint", "https://api.openai.com/v1"))[:2048],
+                       speech_model=str(raw.get(
+                           "speech_model", "gpt-4o-mini-transcribe"))[:120],
+                       speech_api_key=speech_key,
                        profile=profile)
         except Exception:
             return cls()
@@ -158,9 +193,21 @@ class PetSettings:
         protected = ""
         if self.api_key:
             protected = base64.b64encode(_dpapi(self.api_key.encode("utf-8"), True)).decode("ascii")
+        memory_protected = ""
+        if self.memory_token:
+            memory_protected = base64.b64encode(
+                _dpapi(self.memory_token.encode("utf-8"), True)).decode("ascii")
+        speech_protected = ""
+        if self.speech_api_key:
+            speech_protected = base64.b64encode(
+                _dpapi(self.speech_api_key.encode("utf-8"), True)).decode("ascii")
         payload = asdict(self)
         payload.pop("api_key", None)
+        payload.pop("memory_token", None)
+        payload.pop("speech_api_key", None)
         payload["api_key_dpapi"] = protected
+        payload["memory_token_dpapi"] = memory_protected
+        payload["speech_api_key_dpapi"] = speech_protected
         temporary = CONFIG_PATH.with_suffix(".tmp")
         temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(CONFIG_PATH)
@@ -169,15 +216,40 @@ class PetSettings:
 class PetMemory:
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
+        self.device_id = ""
+        self.path = MEMORY_PATH
         self.messages: list[dict[str, str]] = []
         self.facts: list[str] = []
         self.load()
 
+    def bind_device(self, device_id: str) -> None:
+        """Switch to the stable hardware-scoped memory file.
+
+        A one-time copy of the legacy machine-wide memory preserves upgrades,
+        while subsequent devices remain isolated from one another.
+        """
+        if not re.fullmatch(r"lc-[0-9a-f]{12}", device_id):
+            raise ValueError("设备 ID 无效")
+        target = MEMORY_DEVICE_DIR / device_id / "snapshot.json"
+        if self.device_id == device_id and self.path == target:
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists() and MEMORY_PATH.exists():
+            try:
+                target.write_text(MEMORY_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+            except OSError:
+                pass
+        self.device_id = device_id
+        self.path = target
+        self.messages = []
+        self.facts = []
+        self.load()
+
     def load(self):
-        if not self.enabled or not MEMORY_PATH.exists():
+        if not self.enabled or not self.path.exists():
             return
         try:
-            raw = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
             self.messages = list(raw.get("messages", []))[-40:]
             self.facts = [str(item)[:160] for item in raw.get("facts", [])][-20:]
         except Exception:
@@ -199,17 +271,27 @@ class PetMemory:
     def save(self):
         if not self.enabled:
             return
-        APP_DIR.mkdir(parents=True, exist_ok=True)
-        temporary = MEMORY_PATH.with_suffix(".tmp")
-        temporary.write_text(json.dumps({"messages": self.messages, "facts": self.facts},
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"schemaVersion": 1,
+                                         "deviceId": self.device_id,
+                                         "messages": self.messages, "facts": self.facts},
                                         ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(MEMORY_PATH)
+        temporary.replace(self.path)
 
     def clear(self):
         self.messages.clear()
         self.facts.clear()
-        if MEMORY_PATH.exists():
-            MEMORY_PATH.unlink()
+        if self.path.exists():
+            self.path.unlink()
+
+    def merge_facts(self, values: list[str]) -> None:
+        for value in values:
+            clean = _redact_secrets(str(value).strip())[:160]
+            if clean and clean not in self.facts:
+                self.facts.append(clean)
+        self.facts = self.facts[-80:]
+        self.save()
 
 
 @dataclass
@@ -263,7 +345,8 @@ class PetAgentRuntime:
             "当前实验问题由你直接回答；只有需要多步骤推理、长报告、代码/文件分析的请求才设置"
             "delegate_to_claude=true。"
         )
-        context = json.dumps(device_context, ensure_ascii=False, separators=(",", ":"))
+        selected_context = compact_ai_context(clean, device_context)
+        context = json.dumps(selected_context, ensure_ascii=False, separators=(",", ":"))
         facts = "；".join(self.memory.facts[-8:]) or "无"
         messages = [{"role": "system", "content": system},
                     {"role": "system", "content": f"设备上下文：{context}\n长期偏好：{facts}"}]

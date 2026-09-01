@@ -5,3 +5,5 @@ imageio>=2.34,<3
 imageio-ffmpeg>=0.5,<1
 winsdk>=1.0.0b10; platform_system == "Windows"
 pywebview>=5,<7; platform_system == "Windows"
+bleak>=1.1,<4; platform_system == "Windows"
+sounddevice>=0.5,<1; platform_system == "Windows"

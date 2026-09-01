@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/81823650800wzy-sketch/LabCapsule/shared/character_manifest_v2.schema.json",
+  "title": "LabCapsule unified character package v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "id", "name", "live2dModel", "actions"],
+  "properties": {
+    "schemaVersion": {"const": 2},
+    "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
+    "name": {"type": "string", "minLength": 1, "maxLength": 32},
+    "live2dModel": {"type": "string", "minLength": 1},
+    "deviceProxy": {"type": "string", "description": "Optional pre-rendered LCG clip derived from this exact model."},
+    "fallbackPoster": {"type": "string"},
+    "personaFile": {"type": "string"},
+    "greeting": {"type": "string", "maxLength": 160},
+    "author": {"type": "string", "maxLength": 80},
+    "license": {"type": "string", "maxLength": 160},
+    "homepage": {"type": "string", "format": "uri"},
+    "actions": {
+      "type": "object",
+      "additionalProperties": {"type": "string", "maxLength": 64},
+      "required": ["IDLE", "TALK", "THINK", "EXPERIMENT", "SUCCESS", "WARNING"]
+    }
+  }
+}

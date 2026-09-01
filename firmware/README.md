@@ -1,4 +1,4 @@
-# LabCapsule ESP-IDF Firmware 0.6.0-alpha
+# LabCapsule ESP-IDF Firmware 1.0.0-alpha
 
 目标硬件：ESP32-S3，16 MiB Flash、8 MiB Octal PSRAM、ESP-IDF 5.5.4。
 
@@ -11,11 +11,11 @@ idf.py build
 idf.py -p COM8 flash monitor
 ```
 
-首次安装、从 0.4.x 及更早分区表升级时必须执行一次完整 `flash`，写入 `offline` 分区。0.5.0 可直接使用 `LabCapsule-0.6.0-ota.bin` 经 Wi-Fi/BLE 更新。不要为普通升级运行 `erase-flash`，它会清除 NVS 配置、持久壁纸和离线实验。
+首次安装、从旧分区表升级时必须执行一次完整 `flash`，写入 `offline` 分区；同分区表版本可使用 V1 OTA bin 经 Wi-Fi/BLE 更新。不要为普通升级运行 `erase-flash`，它会清除 NVS 配置、持久角色/壁纸和离线实验。
 
 ## 分区与内存
 
-- `ota_0` / `ota_1`：各 3 MiB；当前固件 1,377,664 字节，余量约 56%。
+- `ota_0` / `ota_1`：各 3 MiB；V1.0.0 固件约 1.40 MiB，余量约 56%。
 - `wallpaper`：256 KiB，使用双槽提交头，完整校验后才切换。
 - `offline`：8 MiB 磨损均衡 FAT。每个 `LCB1` 会话使用 32 字节头和每条 16 字节的时间戳/六轴定点样本；临时文件完成后再改名，异常断电时可恢复。
 - 两张显示帧缓冲、独立动态媒体画布和最大 153,600 字节媒体接收区位于 PSRAM。GIF 差分只修改干净媒体画布，随后重新合成 HUD，避免把上一帧文字写进动画底图。
@@ -56,6 +56,7 @@ idf.py -p COM8 flash monitor
 | POST | `/api/offline` | 清空已完成的离线会话 |
 | POST | `/api/media/frame?duration=100&enc=delta332&x=0&y=0&w=240&h=320` | 临时整帧/局部差分帧，不写 Flash |
 | POST | `/api/wallpaper` | 持久 RGB565 壁纸，固定 153600 字节 |
+| POST | `/api/pet/bubble` | 写入 Hiyori 底部 216×64 单色回答气泡 |
 | POST | `/api/ota` | ESP-IDF 应用 bin，验证后切换 OTA 槽并重启 |
 
 网络配置 JSON 示例：
@@ -85,7 +86,7 @@ idf.py -p COM8 flash monitor
 | `0003` | status | 状态读取/通知 |
 | `0004` | OTA control | `BEGIN:size`、`END`、`ABORT` |
 | `0005` | OTA data | 固件分片 |
-| `0006` | file control | 媒体开始、结束、CRC32 |
+| `0006` | file control | 媒体/桌宠气泡开始、结束、CRC32 |
 | `0007` | file data | RGB565 分片 |
 | `0008` | experiment data | 在线样本通知及离线会话分片读取 |
 
@@ -127,7 +128,10 @@ BLE GATT 回调栈不再生成大状态后再用 cJSON 二次解析，而是直�
 
 ```text
 PING
+IDENTITY
 STATUS
+NETWORK
+SENSORS
 START[,RATE,DURATION]
 STOP
 ABORT
@@ -135,6 +139,7 @@ MOCK,ON|OFF
 DISPLAY[,DEV|TEST|WALLPAPER|SETTINGS|HOME|INVERT|BL,ON|OFF]
 MODE,IDLE|EXPERIMENT
 NOTICE,TITLE,MESSAGE
+PET,SHOW|HIDE|STATUS|STATE,<emotion>,<action>|IDENTITY,<id>,PROXY|CLEAR
 HELP
 ```
 

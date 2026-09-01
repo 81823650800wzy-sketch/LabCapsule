@@ -76,7 +76,7 @@ class Live2DModelTests(unittest.TestCase):
         make_live2d(self.root / "hiyori_pro", "pro", 4)
         packages, errors = discover_pet_packages(self.root)
         self.assertEqual(errors, [])
-        self.assertEqual([package.name for package in packages], ["hiyori_free", "hiyori_pro"])
+        self.assertEqual([package.name for package in packages], ["Hiyori Free", "Hiyori Pro"])
         self.assertTrue(all(package.visual_kind == "live2d" for package in packages))
         self.assertEqual([package.live2d_motion_count for package in packages], [3, 4])
 

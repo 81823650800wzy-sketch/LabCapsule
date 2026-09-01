@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-08-31T00:00:00+08:00",
+  "items": [
+    {
+      "id": "esp32-s3",
+      "kind": "controller",
+      "keywords": ["esp32", "主控", "芯片", "psram", "flash", "算力"],
+      "summary": "ESP32-S3 负责采样、显示、缓存和连接；AI、语音识别、Live2D 骨骼渲染与媒体预处理由连接的电脑或手机承担。",
+      "detail": "knowledge/components/esp32-s3.md"
+    },
+    {
+      "id": "mpu6050",
+      "kind": "sensor",
+      "keywords": ["mpu6050", "加速度", "陀螺仪", "六轴", "振动", "运动"],
+      "summary": "MPU6050 通过 GPIO8/9 的 I2C 采集 AX/AY/AZ 与 GX/GY/GZ；INT 预留 GPIO2。",
+      "detail": "knowledge/components/mpu6050.md"
+    },
+    {
+      "id": "st7789",
+      "kind": "display",
+      "keywords": ["st7789", "屏幕", "显示", "240", "320", "gif", "live2d", "角色"],
+      "summary": "ST7789 为 240×320 SPI 屏；使用双缓冲和局部刷新。设备播放同一 Live2D 角色的预渲染代理，不直接运行 moc3。",
+      "detail": "knowledge/components/st7789.md"
+    },
+    {
+      "id": "transport",
+      "kind": "connection",
+      "keywords": ["usb", "串口", "wifi", "wi-fi", "蓝牙", "ble", "mqtt", "远程", "连接"],
+      "summary": "控制与实验数据可经 USB、局域网 HTTP、BLE GATT 或 MQTT；连接选择按 USB→局域网→BLE→远程的优先级自动回退。",
+      "detail": "knowledge/transports.md"
+    },
+    {
+      "id": "input-hub",
+      "kind": "input",
+      "keywords": ["按键", "摇杆", "输入", "扩展", "gpio"],
+      "summary": "输入中心统一处理 6 个低电平按键，并为摇杆、编码器和后续输入驱动保留注册接口。",
+      "detail": "knowledge/components/input-hub.md"
+    },
+    {
+      "id": "sensor-expansion",
+      "kind": "sensor",
+      "keywords": ["传感器", "i2c", "扩展", "扫描", "元件"],
+      "summary": "传感器中心按驱动描述符发现设备；AI 只按问题载入命中的元件条目与实时扫描结果。",
+      "detail": "knowledge/sensor-expansion.md"
+    }
+  ]
+}

@@ -68,9 +68,12 @@ def write_live2d_action(emotion: str, action: str,
 def player_command(model_path: str | Path, mode: str, desktop_root: str | Path,
                    executable: str | Path | None = None,
                    frozen: bool | None = None,
-                   control_path: str | Path | None = None) -> list[str]:
-    if mode not in {"stage", "overlay"}:
+                   control_path: str | Path | None = None,
+                   capture_path: str | Path | None = None) -> list[str]:
+    if mode not in {"stage", "overlay", "capture"}:
         raise ValueError("Live2D 播放模式无效")
+    if mode == "capture" and not capture_path:
+        raise ValueError("Live2D capture 模式缺少输出文件夹")
     is_frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
     program = str(executable or sys.executable)
     model = str(Path(model_path).expanduser().resolve())
@@ -81,4 +84,6 @@ def player_command(model_path: str | Path, mode: str, desktop_root: str | Path,
                    model, "--mode", mode]
     if control_path:
         command.extend(("--control", str(Path(control_path).expanduser().resolve())))
+    if capture_path:
+        command.extend(("--capture-output", str(Path(capture_path).expanduser().resolve())))
     return command

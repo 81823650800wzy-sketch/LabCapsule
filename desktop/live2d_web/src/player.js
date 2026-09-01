@@ -27,9 +27,12 @@ function setStatus(message, error = false) {
 }
 
 async function boot() {
-  const response = await fetch("/config.json", { cache: "no-store" });
-  if (!response.ok) throw new Error(`配置读取失败：HTTP ${response.status}`);
-  const config = await response.json();
+  let config = window.LABCAPSULE_CONFIG;
+  if (!config) {
+    const response = await fetch("/config.json", { cache: "no-store" });
+    if (!response.ok) throw new Error(`配置读取失败：HTTP ${response.status}`);
+    config = await response.json();
+  }
   document.title = `LabCapsule Live2D · ${config.name}`;
 
   const app = new PIXI.Application({
@@ -39,6 +42,7 @@ async function boot() {
     antialias: true,
     autoDensity: true,
     resolution: Math.min(window.devicePixelRatio || 1, 2),
+    preserveDrawingBuffer: Boolean(config.capture),
   });
   const model = await Live2DModel.from(config.modelUrl, { autoInteract: true });
   app.stage.addChild(model);
@@ -47,7 +51,7 @@ async function boot() {
 
   function fitModel() {
     model.scale.set(1);
-    const chromeHeight = config.mode === "overlay" ? 20 : 92;
+    const chromeHeight = config.capture ? 0 : (config.mode === "overlay" ? 20 : 92);
     const usableHeight = Math.max(200, window.innerHeight - chromeHeight);
     const factor = Math.min(
       (window.innerWidth * 0.92) / Math.max(1, model.width),
@@ -78,6 +82,10 @@ async function boot() {
     document.documentElement.classList.add("overlay");
     document.body.classList.add("overlay");
   }
+  if (config.capture) {
+    document.documentElement.classList.add("capture");
+    document.body.classList.add("capture");
+  }
   setStatus(`${config.name} · ${config.motionCount} 个动作 · WebGL 就绪`);
 
   let controlRevision = 0;
@@ -98,6 +106,11 @@ async function boot() {
       || config.motionGroups.find((group) => group !== "Idle")
       || config.motionGroups[0];
   };
+  window.labcapsulePetAction = (emotion, action) => {
+    const group = pickMotionGroup(String(action || "TALK").toUpperCase());
+    if (group) model.motion(group);
+    setStatus(`${config.name} · ${emotion || "SPEAKING"} · ${group || "IDLE"}`);
+  };
   const pollControl = async () => {
     if (!config.controlUrl) return;
     try {
@@ -113,6 +126,26 @@ async function boot() {
     }
   };
   if (config.controlUrl) window.setInterval(pollControl, 300);
+
+  if (config.capture) {
+    const wait = (milliseconds) => new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+    const idleGroup = config.motionGroups.includes("Idle") ? "Idle" : config.motionGroups[0];
+    if (idleGroup) model.motion(idleGroup);
+    await wait(700);
+    for (let index = 0; index < config.captureFrames; index += 1) {
+      await wait(config.captureIntervalMs);
+      app.render();
+      const dataUrl = canvas.toDataURL("image/png");
+      const saved = await window.pywebview?.api?.save_capture_frame(
+        dataUrl, index, config.captureIntervalMs,
+      );
+      if (!saved) throw new Error(`设备代理第 ${index + 1} 帧保存失败`);
+    }
+    const complete = await window.pywebview?.api?.complete_capture(
+      config.captureFrames, config.captureIntervalMs,
+    );
+    if (!complete) throw new Error("设备代理收尾失败");
+  }
 }
 
 boot().catch((error) => {

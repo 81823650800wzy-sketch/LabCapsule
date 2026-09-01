@@ -2,7 +2,21 @@
 
 > Ask a question. Run an experiment.
 
-LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前版本为 **V0.11.0 Alpha / Device Pet + AI + Claude（Desktop First）**，已经打通“自然语言问题 → 实验协议 → 六轴采集 → 在线直传或离线缓存 → CSV/分析”，并把统一桌宠扩展到 COM8 实体屏、电脑状态/实验上下文问答、受限 Claude 复杂任务转交和 Live2D 动作联动。Android V0.7 继续兼容 V0.11 固件；完整 V0.11 桌宠交互当前先在 Windows 端提供。
+LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前版本为 **V1.0.0 Alpha / Unified Portable Experiment Assistant**：同一个稳定硬件身份和 Hiyori 角色贯通 240×320 实体屏、Windows EXE 与 Android APK；USB、局域网和 BLE 共用实验、媒体、AI、私有记忆和传感器扩展协议。
+
+## V1.0.0 新增
+
+- 从 ESP32-S3 eFuse MAC 派生稳定 `deviceId`，不再用易变的 COM 号或 IP 区分用户设备；COM8 实机为 `lc-000000000000`。
+- Windows、Android 和实体屏统一使用模型内容 ID。现有 Hiyori Free 为 `live2d-000000000000`；旧版按路径生成的 `local-*` 会自动迁移。
+- Windows Studio 支持 USB、不会切换电脑网络的局域网 HTTP，以及完整 BLE 控制/状态/实验/媒体；默认导航精简为“实验助手 / 实验数据 / 设置”。
+- Android V1 增加 Hiyori 对话、系统语音入口、设备身份、私有记忆同步和 Live2D 完整文件夹导入；设备/屏幕/固件继续位于默认折叠的设置区。
+- 记忆使用用户自己的私有 GitHub 仓库，按 `memory/devices/<deviceId>/snapshot.json` 跨电脑和手机合并；Token/API Key 分别由 DPAPI 和 Android Keystore 加密，公开仓库被拒绝。
+- 设备本地保存并循环播放当前 Hiyori 代理或 GIF，退出 APK 后不停止；AI 只发送有界动作与 216×64 气泡，不向 ESP32 逐帧推 Live2D。
+- 新增按需上下文 Skill 和机器可读设备/记忆/角色 Schema。AI 只取相关组件、连接、实验和最多 12 条记忆，避免把整个仓库装入提示。
+- 修复活动 MPU 与扩展 I²C 探测争用；COM8 和 BLE 均返回 1 个 0x68 传感器。纯 5 GHz 下明确显示 `staConnected=false / staIp=0.0.0.0`，USB/BLE/离线实验仍正常。
+- Windows 麦克风支持 16 kHz 转写；Android 使用系统语音识别。硬件声明 `MIC_PORT` 扩展契约，后续 I²S 麦克风由连接端承担转写和 AI 算力。
+
+完整步骤见 [V1.0 统一随身实验助手指南](docs/V1.0.0_UNIFIED_ASSISTANT_GUIDE_ZH.md)，构建与实机证据见 [V1.0 测试报告](docs/V1.0.0_TEST_REPORT_ZH.md)。
 
 ## V0.11.0 新增
 
@@ -125,7 +139,7 @@ V0.4.0 的界面与媒体能力继续保留：
    idf.py -p COM8 flash monitor
    ```
 
-2. Windows 端运行 GitHub Release 中的 `LabCapsule-Studio-0.11.0.exe`；Android 端仍可安装兼容的 `LabCapsule-0.7.0.apk`。手机首次进入“设置 → 设备与连接”时，推荐选择：
+2. Windows 端运行 GitHub Release 中的 `LabCapsule-Studio-1.0.0.exe`；Android 端安装 `LabCapsule-1.0.0.apk`。手机首次进入“设置 → 设备与连接”时，推荐选择：
 
    - BLE：点击扫描并允许“附近设备”权限；连接成功后直接点“蓝牙一键配网”；
    - 恢复热点：只在排障时连接 `LabCapsule-XXXX`，密码 `labcapsule`，地址 `http://192.168.4.1`。
@@ -134,7 +148,7 @@ V0.4.0 的界面与媒体能力继续保留：
 
 4. 在“AI”页填写 API Endpoint、模型和 Key，生成协议后点击“发送并开始实验”。Key 由 Android Keystore 加密，仅在手机端使用。
 
-完整操作见 [V0.11.0 实体桌宠、AI 与 Claude 指南](docs/V0.11.0_DEVICE_PET_AI_CLAUDE_ZH.md)、[V0.7.0 本地媒体与桌面工作室指南](docs/V0.7.0_LOCAL_MEDIA_DESKTOP_GUIDE_ZH.md)、[V0.6.0 工作模式与通知指南](docs/V0.6.0_IDLE_GIF_MODE_GUIDE_ZH.md)、[V0.5.0 离线实验与硬件扩展指南](docs/V0.5.0_OFFLINE_HARDWARE_GUIDE_ZH.md) 和 [V0.3.3 蓝牙配网与连接排障](docs/V0.3.3_BLE_WIFI_QUICKSTART_ZH.md)。
+完整操作见 [V1.0 统一随身实验助手指南](docs/V1.0.0_UNIFIED_ASSISTANT_GUIDE_ZH.md)、[V0.7.0 本地媒体与桌面工作室指南](docs/V0.7.0_LOCAL_MEDIA_DESKTOP_GUIDE_ZH.md) 和 [V0.3.3 蓝牙配网与连接排障](docs/V0.3.3_BLE_WIFI_QUICKSTART_ZH.md)。
 
 ## 冻结引脚
 
@@ -168,19 +182,22 @@ desktop/                 Windows 可视化控制器、媒体处理器与 EXE 构
 firmware/                ESP-IDF 5.5 固件、分区表和默认配置
 docs/                    架构、使用指南和开发日志
 release/                 可发布 APK、OTA bin 与校验值
-skills/                  可复用的桌宠角色包制作与验收 Skill
+knowledge/               可按需检索的组件、传感器与连接知识库
+shared/                  设备身份、角色和记忆 JSON Schema
+skills/                  桌宠创建及设备上下文访问 Skills
 SPEC_V0.1.md             初始产品规格（历史基线）
 ```
 
 ## 当前实机状态
 
-2026-08-31 已在 COM8 的 ESP32-S3 rev 0.2 / 16 MiB Flash / 8 MiB Octal PSRAM 上完成 V0.11.0 完整烧录和实机验证，串口标识为 `PONG,LABCAPSULE,0.11.0-alpha`，自动握手最终返回 `STATUS,READY,MPU=OK`。实体桌宠独立界面、中文 AI 气泡、电脑/实验上下文、DeepSeek、受限 Claude 和 Hiyori Live2D 动作链均通过；并发电脑心跳下气泡上传压力测试为 50/50、0 错误。本轮未连接设备无网络热点、未启动实验、未擦除媒体或离线实验。纯 5 GHz 网络仍无法被 ESP32-S3 Station 使用，BLE、USB 和离线实验不受影响。
+2026-09-01 已在 COM8 的 ESP32-S3 rev 0.2 / 16 MiB Flash / 8 MiB Octal PSRAM 上完成 V1.0.0 完整烧录和重启验收。串口返回 `PONG,LABCAPSULE,1.0.0-alpha,DEVICE=lc-000000000000`，MPU OK、扩展列表 count 1、Hiyori 代理开启；Windows BLE 也读到同一身份、角色和传感器。当前网络只有 5 GHz，因此状态如实为 `staConnected=false / staIp=0.0.0.0`，测试期间未连接无网络恢复热点。
 
 ## 安全边界
 
 - APK 中的 API Key、Wi-Fi 和 MQTT 密码使用 Android Keystore 加密保存。
 - 设备状态接口不回传密码；MQTT 支持 `mqtts://` 并使用 ESP-IDF CA 证书包。
-- 恢复热点与局域网 HTTP API 面向受信任本地网络，V0.7.0 尚未提供逐设备 HTTP 登录或托管云端中继服务。
+- 恢复热点与局域网 HTTP API 面向受信任本地网络，V1.0 尚未提供逐设备 HTTP 登录或托管云端中继服务。
+- 记忆同步只允许用户配置的私有 GitHub 仓库；硬件、仓库和状态接口都不保存或回传 GitHub Token/API Key。
 - 手机通知读取必须由用户在 Android 系统设置中单独授权；通知正文只在闲置模式下发送到所选设备通道，可随时关闭或启用只显示应用名的隐私模式。
 - Android 系统不允许普通应用静默安装 APK；自动更新会检查并下载，最终安装仍需用户确认。
 
