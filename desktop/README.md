@@ -38,7 +38,7 @@ pyinstaller --noconfirm --clean LabCapsule-Studio-1.3.0.spec
 
 ## 使用现有 Hiyori
 
-选择 `<Live2D模型目录>\hiyori_free` 父文件夹即可自动发现 runtime 模型和 8 组动作。模型内容 ID 为 `live2d-000000000000`；旧版 `local-*` 选择会迁移。应用不复制或分发模型，启动时重新校验源文件。
+选择 `<Live2D模型目录>\hiyori_free` 父文件夹即可自动发现 runtime 模型和 8 组动作。公开文档使用 `live2d-000000000000` 作为合成示例；实际内容 ID 由本地模型生成。旧版 `local-*` 选择会迁移。应用不复制或分发模型，启动时重新校验源文件。
 
 首次运行须由用户确认适用的 Live2D/Cubism 条款。Cubism Core 从 Live2D 官方固定地址加载，模型只通过本机回环服务提供给播放器。
 
