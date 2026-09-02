@@ -9,9 +9,17 @@ Thumbs.db
 # ===== 密钥（禁止提交 API Key）=====
 *.key
 *.jks
+*.keystore
+*.pem
+*.p12
+*.pfx
+.secrets/
 .env*
 secrets.json
 config.secret.*
+credentials.*
+!*.example
+local.properties
 
 # ===== Python（desktop / analysis / experiment_engine）=====
 __pycache__/
@@ -39,6 +47,7 @@ sdkconfig.old
 *.elf
 release/*.apk
 release/*.exe
+release/*.bin
 
 # ===== IDE =====
 .vscode/

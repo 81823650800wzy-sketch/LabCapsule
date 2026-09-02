@@ -14,6 +14,8 @@ LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前双端�
 
 完整操作见 [V1.3 AI 真实实验使用指南](docs/V1.3.0_AI_EXPERIMENT_GUIDE_ZH.md)。
 
+项目结构、生成文件边界和发布规则见 [项目结构说明](docs/PROJECT_STRUCTURE_ZH.md)；凭据保存方式、提交前检查及漏洞报告方式见 [安全策略](SECURITY.md)。发布二进制只放在 [GitHub Releases](https://github.com/81823650800wzy-sketch/LabCapsule/releases)，不提交到源码历史。
+
 ## V1.2.0 双端新增
 
 - APK 更新显示真实字节与百分比，退出再进入可继续追踪系统下载任务。
@@ -37,8 +39,8 @@ LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前双端�
 
 ## V1.0.0 新增
 
-- 从 ESP32-S3 eFuse MAC 派生稳定 `deviceId`，不再用易变的 COM 号或 IP 区分用户设备；COM8 实机为 `lc-000000000000`。
-- Windows、Android 和实体屏统一使用模型内容 ID。现有 Hiyori Free 为 `live2d-000000000000`；旧版按路径生成的 `local-*` 会自动迁移。
+- 从 ESP32-S3 eFuse MAC 派生稳定 `deviceId`，不再用易变的 COM 号或 IP 区分用户设备；文档和测试只使用合成示例 ID。
+- Windows、Android 和实体屏统一使用模型内容 ID；旧版按路径生成的 `local-*` 会自动迁移。真实设备与角色 ID 不写入仓库。
 - Windows Studio 支持 USB、不会切换电脑网络的局域网 HTTP，以及完整 BLE 控制/状态/实验/媒体；默认导航精简为“实验助手 / 实验数据 / 设置”。
 - Android V1 增加 Hiyori 对话、系统语音入口、设备身份、私有记忆同步和 Live2D 完整文件夹导入；设备/屏幕/固件继续位于默认折叠的设置区。
 - 记忆使用用户自己的私有 GitHub 仓库，按 `memory/devices/<deviceId>/snapshot.json` 跨电脑和手机合并；Token/API Key 分别由 DPAPI 和 Android Keystore 加密，公开仓库被拒绝。
@@ -164,8 +166,8 @@ V0.4.0 的界面与媒体能力继续保留：
 1. 首次安装或分区表发生变化时，用 USB 完整烧录：
 
    ```powershell
-   . 'D:\Espressif\frameworks\esp-idf-v5.5.4\export.ps1'
-   cd <仓库目录>\firmware
+   # 在 ESP-IDF PowerShell 中进入克隆后的仓库
+   cd .\LabCapsule\firmware
    idf.py build
    idf.py -p COM8 flash monitor
    ```
@@ -212,7 +214,7 @@ android/                 无 Gradle 依赖的原生 Android 客户端与构建�
 desktop/                 Windows 可视化控制器、媒体处理器与 EXE 构建脚本
 firmware/                ESP-IDF 5.5 固件、分区表和默认配置
 docs/                    架构、使用指南和开发日志
-release/                 可发布 APK、OTA bin 与校验值
+release/                 发布索引；APK、EXE、OTA bin 统一由 GitHub Releases 托管
 knowledge/               可按需检索的组件、传感器与连接知识库
 shared/                  设备身份、角色和记忆 JSON Schema
 skills/                  桌宠创建及设备上下文访问 Skills
@@ -221,7 +223,7 @@ SPEC_V0.1.md             初始产品规格（历史基线）
 
 ## 当前实机状态
 
-2026-09-01 已在 COM8 的 ESP32-S3 rev 0.2 / 16 MiB Flash / 8 MiB Octal PSRAM 上完成 V1.0.0 完整烧录和重启验收。串口返回 `PONG,LABCAPSULE,1.0.0-alpha,DEVICE=lc-000000000000`，MPU OK、扩展列表 count 1、Hiyori 代理开启；Windows BLE 也读到同一身份、角色和传感器。当前网络只有 5 GHz，因此状态如实为 `staConnected=false / staIp=0.0.0.0`，测试期间未连接无网络恢复热点。
+V1.3.0 已在 ESP32-S3、ST7789 与 MPU 六轴模块上完成烧录、100 点真实采样、终止实验和本地动画恢复验收。公开报告已隐藏 MAC、设备 ID、个人目录和角色内容哈希，详见 [V1.3.0 测试报告](docs/V1.3.0_TEST_REPORT_ZH.md)。
 
 ## 安全边界
 
@@ -234,4 +236,4 @@ SPEC_V0.1.md             初始产品规格（历史基线）
 
 ## License
 
-TBD
+尚未选择许可证；使用或分发前请先联系项目维护者。
