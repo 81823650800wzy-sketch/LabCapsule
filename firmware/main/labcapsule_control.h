@@ -6,7 +6,7 @@
 
 #include "esp_err.h"
 
-#define LABCAPSULE_VERSION "1.0.0-alpha"
+#define LABCAPSULE_VERSION "1.3.0-alpha"
 #define LABCAPSULE_MEDIA_MAX_FPS 8U
 #define LABCAPSULE_PET_BUBBLE_WIDTH 216U
 #define LABCAPSULE_PET_BUBBLE_HEIGHT 64U

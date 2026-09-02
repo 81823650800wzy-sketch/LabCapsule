@@ -59,6 +59,17 @@ class AndroidV13AiExperimentTests(unittest.TestCase):
         self.assertIn("if (!s_scan_enabled)", SENSOR_HUB)
         self.assertIn("xSemaphoreTake(s_bus_mutex", SENSOR_HUB)
 
+    def test_firmware_preflight_uses_a_real_sample_and_recovers_error_state(self):
+        self.assertIn("mpu_health_check_and_recover", FIRMWARE)
+        self.assertIn("mpu_read_sample(&probe_sample)", FIRMWARE)
+        self.assertIn("ERR,MPU_NOT_READY", FIRMWARE)
+        self.assertIn("get_state() == STATE_ERROR) set_state(STATE_READY)", FIRMWARE)
+
+    def test_gif_refresh_is_paused_while_experiment_owns_display(self):
+        self.assertIn("get_state() == STATE_RECORDING", FIRMWARE)
+        self.assertIn("get_state() != STATE_RECORDING", FIRMWARE)
+        self.assertIn("persisted clip marked as playing", FIRMWARE)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -394,7 +394,9 @@ static esp_err_t mpu_probe_and_configure_unlocked(void)
         ESP_LOGW(TAG, "Unexpected MPU6050 WHO_AM_I: 0x%02X", who_am_i);
     }
     s_mpu_ready = true;
-    return mpu_set_sample_rate_unlocked(DEFAULT_SAMPLE_RATE_HZ);
+    esp_err_t rate_result = mpu_set_sample_rate_unlocked(DEFAULT_SAMPLE_RATE_HZ);
+    if (rate_result != ESP_OK) s_mpu_ready = false;
+    return rate_result;
 }
 
 static esp_err_t mpu_probe_and_configure(void)
@@ -469,6 +471,16 @@ static esp_err_t mpu_read_sample(motion_sample_t *sample)
     sample->gy = (float)gy / 65.5f;
     sample->gz = (float)gz / 65.5f;
     return ESP_OK;
+}
+
+static esp_err_t mpu_health_check_and_recover(void)
+{
+    motion_sample_t probe_sample;
+    esp_err_t result = s_mpu_ready ? mpu_read_sample(&probe_sample)
+                                   : ESP_ERR_INVALID_STATE;
+    if (result != ESP_OK) result = mpu_probe_and_configure();
+    sensor_hub_set_primary_ready("mpu6050", s_mpu_ready && result == ESP_OK);
+    return result;
 }
 
 static void make_mock_sample(int64_t timestamp_us, motion_sample_t *sample)
@@ -1222,13 +1234,19 @@ static esp_err_t start_recording(uint32_t rate_hz, uint32_t duration_seconds)
                     (unsigned long)rate_hz, (unsigned long)duration_seconds);
         return ESP_ERR_INVALID_ARG;
     }
-    if (!s_mpu_ready && !s_mock_enabled) {
-        serial_emit("ERR,MPU_NOT_FOUND,USE_MOCK_ON_OR_CHECK_WIRING");
-        return ESP_ERR_NOT_FOUND;
-    }
     if (get_state() == STATE_RECORDING) {
         serial_emit("ERR,ALREADY_RECORDING");
         return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_mock_enabled) {
+        esp_err_t health_result = mpu_health_check_and_recover();
+        if (health_result != ESP_OK) {
+            set_state(STATE_ERROR);
+            display_request_refresh();
+            serial_emit("ERR,MPU_NOT_READY,%s,USE_MOCK_ON_OR_CHECK_WIRING",
+                        esp_err_to_name(health_result));
+            return health_result;
+        }
     }
     if (s_mpu_ready && mpu_set_sample_rate(rate_hz) != ESP_OK) {
         serial_emit("ERR,MPU_CONFIG_FAILED");
@@ -1516,11 +1534,11 @@ static void handle_command(char *line, serial_source_t source)
          * STATUS is part of every desktop/mobile handshake, so use it as a
          * transparent recovery point instead of requiring the user to open
          * the diagnostic page and issue SENSORS manually. */
-        if (!s_mpu_ready) {
-            esp_err_t recovery_result = mpu_probe_and_configure();
-            sensor_hub_set_primary_ready("mpu6050", s_mpu_ready);
+        if (!s_mpu_ready || get_state() == STATE_ERROR) {
+            esp_err_t recovery_result = mpu_health_check_and_recover();
             if (recovery_result == ESP_OK) {
                 ESP_LOGI(TAG, "MPU6050 recovered during STATUS handshake");
+                if (get_state() == STATE_ERROR) set_state(STATE_READY);
                 display_request_refresh();
             }
         }
@@ -1689,9 +1707,9 @@ static void handle_command(char *line, serial_source_t source)
             serial_emit("ERR,UPLOAD,EXPECTED=UPLOAD,CLIP|WALLPAPER,SIZE,CRC32,%s",
                         esp_err_to_name(result));
     } else if (strcmp(command, "SENSORS") == 0 || strcmp(command, "SCAN") == 0) {
-        esp_err_t result = s_mpu_ready ? ESP_OK : mpu_probe_and_configure();
+        esp_err_t result = mpu_health_check_and_recover();
         size_t found = sensor_hub_discover();
-        sensor_hub_set_primary_ready("mpu6050", s_mpu_ready);
+        if (result == ESP_OK && get_state() == STATE_ERROR) set_state(STATE_READY);
         display_request_refresh();
         serial_emit("SENSORS,COUNT=%u,MPU=%s,ADDRESS=0x%02X,RESULT=%s",
                     (unsigned)found, s_mpu_ready ? "OK" : "MISSING", s_mpu_address,
@@ -2386,6 +2404,13 @@ static void media_playback_task(void *argument)
 {
     (void)argument;
     while (true) {
+        /* Recording owns the display while samples are collected.  Keep the
+         * persisted clip marked as playing, but pause frame decoding/painting;
+         * the task will reopen it automatically when the experiment ends. */
+        if (get_state() == STATE_RECORDING) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
         if (!s_media_clip_playing || !media_store_clip_available()) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
@@ -2405,6 +2430,7 @@ static void media_playback_task(void *argument)
                 s_media_receive_buffer, WALLPAPER_PAYLOAD_BYTES);
         bool bootstrap = true;
         while (result == ESP_OK && s_media_clip_playing &&
+               get_state() != STATE_RECORDING &&
                generation == s_media_clip_generation) {
             int64_t started = esp_timer_get_time();
             result = display_stored_media_frame(&frame, s_media_receive_buffer);
@@ -2419,7 +2445,8 @@ static void media_playback_task(void *argument)
                                              WALLPAPER_PAYLOAD_BYTES);
         }
         media_store_reader_close(&reader);
-        if (result != ESP_OK && generation == s_media_clip_generation) {
+        if (result != ESP_OK && get_state() != STATE_RECORDING &&
+            generation == s_media_clip_generation) {
             s_media_clip_playing = false;
             serial_emit("ERR,GIF,PLAYBACK=%s", esp_err_to_name(result));
         }

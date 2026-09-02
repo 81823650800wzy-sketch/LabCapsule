@@ -1,4 +1,4 @@
-# LabCapsule ESP-IDF Firmware 1.0.0-alpha
+# LabCapsule ESP-IDF Firmware 1.3.0-alpha
 
 目标硬件：ESP32-S3，16 MiB Flash、8 MiB Octal PSRAM、ESP-IDF 5.5.4。
 
@@ -15,7 +15,7 @@ idf.py -p COM8 flash monitor
 
 ## 分区与内存
 
-- `ota_0` / `ota_1`：各 3 MiB；V1.0.0 固件约 1.40 MiB，余量约 56%。
+- `ota_0` / `ota_1`：各 3 MiB；V1.3.0 固件约 1.40 MiB，余量约 55%。
 - `wallpaper`：256 KiB，使用双槽提交头，完整校验后才切换。
 - `offline`：8 MiB 磨损均衡 FAT。每个 `LCB1` 会话使用 32 字节头和每条 16 字节的时间戳/六轴定点样本；临时文件完成后再改名，异常断电时可恢复。
 - 两张显示帧缓冲、独立动态媒体画布和最大 153,600 字节媒体接收区位于 PSRAM。GIF 差分只修改干净媒体画布，随后重新合成 HUD，避免把上一帧文字写进动画底图。
