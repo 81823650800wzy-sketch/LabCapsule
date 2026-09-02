@@ -16,6 +16,8 @@ static const char *TAG = "SensorHub";
 static sensor_slot_t s_slots[MAX_SENSOR_DRIVERS];
 static size_t s_slot_count;
 static i2c_master_bus_handle_t s_i2c_bus;
+static SemaphoreHandle_t s_bus_mutex;
+static volatile bool s_scan_enabled = true;
 
 static const sensor_driver_t s_known_sensors[] = {
     {.id="mpu6050", .display_name="MPU6050", .bus=SENSOR_BUS_I2C, .address=0x68,
@@ -41,15 +43,21 @@ esp_err_t sensor_hub_register(const sensor_driver_t *driver)
     return ESP_OK;
 }
 
-esp_err_t sensor_hub_init(i2c_master_bus_handle_t i2c_bus)
+esp_err_t sensor_hub_init(i2c_master_bus_handle_t i2c_bus, SemaphoreHandle_t bus_mutex)
 {
     s_i2c_bus = i2c_bus;
+    s_bus_mutex = bus_mutex;
     s_slot_count = 0;
     for (size_t i = 0; i < sizeof(s_known_sensors) / sizeof(s_known_sensors[0]); ++i) {
         sensor_hub_register(&s_known_sensors[i]);
     }
     sensor_hub_discover();
     return ESP_OK;
+}
+
+void sensor_hub_set_scan_enabled(bool enabled)
+{
+    s_scan_enabled = enabled;
 }
 
 void sensor_hub_set_primary_ready(const char *id, bool ready)
@@ -62,6 +70,12 @@ void sensor_hub_set_primary_ready(const char *id, bool ready)
 size_t sensor_hub_discover(void)
 {
     size_t found = 0;
+    if (!s_scan_enabled) {
+        for (size_t i = 0; i < s_slot_count; ++i)
+            if (s_slots[i].detected) ++found;
+        return found;
+    }
+    if (s_bus_mutex) xSemaphoreTake(s_bus_mutex, portMAX_DELAY);
     for (size_t i = 0; i < s_slot_count; ++i) {
         sensor_slot_t *slot = &s_slots[i];
         if (slot->driver.bus != SENSOR_BUS_I2C || !s_i2c_bus) continue;
@@ -83,6 +97,7 @@ size_t sensor_hub_discover(void)
                      slot->driver.address);
         }
     }
+    if (s_bus_mutex) xSemaphoreGive(s_bus_mutex);
     return found;
 }
 

@@ -57,7 +57,7 @@ import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
 
 public class MainActivity extends Activity {
-    private static final String APP_VERSION = "1.2.0";
+    private static final String APP_VERSION = "1.3.0";
     private static final int DEVICE_MAX_GIF_FPS = 8;
     private static final int DEVICE_MAX_CLIP_BYTES = 6 * 1024 * 1024;
     private static final String DEFAULT_AI_PERSONA = "你是 Hiyori，机敏、温和、严谨的随身实验助手。"
@@ -75,8 +75,8 @@ public class MainActivity extends Activity {
             "/blob/main/docs/V1.0.0_UNIFIED_ASSISTANT_GUIDE_ZH.md";
     private static final String V11_GUIDE_URL = "https://github.com/" + REPOSITORY +
             "/blob/main/docs/V1.1.0_AI_MEASUREMENT_GUIDE_ZH.md";
-    private static final String V12_GUIDE_URL = "https://github.com/" + REPOSITORY +
-            "/blob/main/docs/V1.2.0_ROLECARD_COLLAB_GUIDE_ZH.md";
+    private static final String V13_GUIDE_URL = "https://github.com/" + REPOSITORY +
+            "/blob/main/docs/V1.3.0_AI_EXPERIMENT_GUIDE_ZH.md";
     private static final int REQUEST_FIRMWARE = 1001, REQUEST_MEDIA = 1002,
             REQUEST_BLE_PERMISSIONS = 1003, REQUEST_NOTIFICATION_PERMISSION = 1004,
             REQUEST_CSV = 1005, REQUEST_SPEECH = 1006, REQUEST_LIVE2D_FOLDER = 1007,
@@ -111,8 +111,8 @@ public class MainActivity extends Activity {
             analysisResultView, offlineStoreState, operationModeState, hardwareUsageState,
             assistantReply, assistantConversationView, memorySyncState, identityState,
             connectionStateView, chartPointView, updateProgressText, roleCardState,
-            computerBridgeState;
-    private ProgressBar globalProgress;
+            computerBridgeState, experimentElapsedView, experimentPlanView;
+    private ProgressBar globalProgress, experimentProgressBar;
     private EditText deviceUrlInput, wifiSsid, wifiPassword, mqttUri, mqttUser, mqttPassword,
             mqttTopic, brightnessInput, aiEndpoint, aiModel, aiKey, aiQuestion,
             experimentRateInput, experimentDurationInput, idleTitleInput, idleMessageInput,
@@ -144,8 +144,10 @@ public class MainActivity extends Activity {
     private volatile boolean gifStreaming;
     private String latestApkUrl, latestFirmwareUrl, latestReleaseTag = "";
     private String currentProtocol;
+    private JSONObject pendingBleExperimentProtocol;
     private String activeDeviceId = "", activeCharacterId = "hiyori-free";
-    private boolean memorySyncActive, aiExperimentActive, latestRawAvailable;
+    private boolean memorySyncActive, aiExperimentActive, aiExperimentPlanning,
+            experimentRunning, experimentAbortRequested, latestRawAvailable;
     private String activeExperimentId = "", aiExperimentQuestion = "";
     private long activeExperimentStartedAt;
     private int activeExperimentDuration;
@@ -158,6 +160,13 @@ public class MainActivity extends Activity {
     private final Runnable styleSyncRunnable = () -> sendVisualStyle(false);
     private long apkDownloadId = -1;
     private final Runnable apkDownloadPollRunnable = this::pollApkDownload;
+    private final Runnable experimentClockRunnable = new Runnable() {
+        @Override public void run() {
+            updateExperimentProgressUi();
+            if (experimentRunning || aiExperimentPlanning || experimentAbortRequested)
+                mainHandler.postDelayed(this, 250L);
+        }
+    };
 
     private BluetoothAdapter bluetoothAdapter;
     private BluetoothLeScanner bleScanner;
@@ -571,8 +580,22 @@ public class MainActivity extends Activity {
         ScrollView page = page("数据", "实时曲线、测量点、日期归档、检索与导出");
         LinearLayout root = pageRoot(page);
         LinearLayout live = card(root, new int[]{PANEL, Color.rgb(18, 30, 32)});
-        section(live, aiExperimentActive ? "实验采集中" : "当前 / 最近实验",
+        section(live, experimentRunning ? "实验采集中" :
+                        (aiExperimentPlanning ? "AI 正在规划实验" : "当前 / 最近实验"),
                 "双指缩放、左右拖动；点击曲线查看该测量点六轴数值");
+        experimentElapsedView = label("实验状态：等待任务", 15,
+                experimentRunning ? GREEN : MUTED, true);
+        live.addView(experimentElapsedView, matchWrap(dp(4)));
+        experimentProgressBar = new ProgressBar(this, null,
+                android.R.attr.progressBarStyleHorizontal);
+        experimentProgressBar.setMax(1000);
+        live.addView(experimentProgressBar, matchWrap(dp(5)));
+        experimentPlanView = label(preferences.getString("last_ai_experiment_plan_summary",
+                "尚无 AI 实验规划。"), 12, MUTED, false);
+        experimentPlanView.setTextIsSelectable(true);
+        live.addView(experimentPlanView, matchWrap(dp(4)));
+        live.addView(row(button("刷新传感器", false, v -> fetchSensors()),
+                button("终止实验", false, v -> abortActiveExperiment())), matchWrap(dp(5)));
         motionChart = new MotionChartView(this);
         synchronized (liveMotionPoints) { motionChart.setPoints(liveMotionPoints); }
         live.addView(motionChart, new LinearLayout.LayoutParams(-1, dp(260)));
@@ -621,7 +644,108 @@ public class MainActivity extends Activity {
         analysis.addView(analysisResultView);
         analysis.addView(row(button("导入 CSV 并分析", true, v -> chooseCsv()),
                 button("分享分析", false, v -> shareAnalysis())), matchWrap(dp(7)));
+        updateExperimentProgressUi();
         return page;
+    }
+
+    private static String clockText(long milliseconds) {
+        long seconds = Math.max(0, milliseconds / 1000L);
+        return String.format(Locale.CHINA, "%02d:%02d", seconds / 60L, seconds % 60L);
+    }
+
+    private void updateExperimentProgressUi() {
+        if (experimentElapsedView == null || experimentProgressBar == null) return;
+        if (aiExperimentPlanning) {
+            experimentElapsedView.setText("AI 正在分析传感器、时长、采样率和参考资料需求…");
+            experimentElapsedView.setTextColor(BLUE);
+            experimentProgressBar.setIndeterminate(true);
+            return;
+        }
+        experimentProgressBar.setIndeterminate(false);
+        if (!experimentRunning && !experimentAbortRequested) {
+            experimentElapsedView.setText("实验状态：等待任务 · 最近样本 " +
+                    preferences.getInt("last_live_samples", 0));
+            experimentElapsedView.setTextColor(MUTED);
+            experimentProgressBar.setProgress(0);
+            return;
+        }
+        long elapsed = Math.max(0, System.currentTimeMillis() - activeExperimentStartedAt);
+        long total = Math.max(1, activeExperimentDuration) * 1000L;
+        int samples;
+        synchronized (this) { samples = liveCaptureSamples; }
+        int expectedRate = 0;
+        try {
+            if (currentProtocol != null)
+                expectedRate = new JSONObject(currentProtocol).optInt("sample_rate_hz", 0);
+        } catch (Exception ignored) { }
+        int expected = Math.max(0, expectedRate * Math.max(0, activeExperimentDuration));
+        int progress = (int)Math.max(0, Math.min(1000, elapsed * 1000L / total));
+        experimentProgressBar.setProgress(progress);
+        String state = experimentAbortRequested ? "正在终止" :
+                (elapsed > total + 5_000L ? "等待设备完成回包" : "采集中");
+        experimentElapsedView.setText(state + " · " + clockText(elapsed) + " / " +
+                clockText(total) + " · 样本 " + samples +
+                (expected > 0 ? " / 预计 " + expected : ""));
+        experimentElapsedView.setTextColor(experimentAbortRequested ? RED : GREEN);
+    }
+
+    private void startExperimentClock() {
+        mainHandler.removeCallbacks(experimentClockRunnable);
+        mainHandler.post(experimentClockRunnable);
+    }
+
+    private void finishExperimentClock(boolean aborted) {
+        experimentRunning = false;
+        aiExperimentPlanning = false;
+        experimentAbortRequested = false;
+        mainHandler.removeCallbacks(experimentClockRunnable);
+        if (experimentElapsedView != null) {
+            long elapsed = Math.max(0, System.currentTimeMillis() - activeExperimentStartedAt);
+            experimentElapsedView.setText((aborted ? "实验已终止" : "实验已完成") + " · " +
+                    clockText(elapsed) + " · 样本 " + liveCaptureSamples);
+            experimentElapsedView.setTextColor(aborted ? RED : GREEN);
+        }
+        if (experimentProgressBar != null) {
+            experimentProgressBar.setIndeterminate(false);
+            experimentProgressBar.setProgress(aborted ? experimentProgressBar.getProgress() : 1000);
+        }
+    }
+
+    private void abortActiveExperiment() {
+        if (!experimentRunning && !aiExperimentPlanning && pendingBleExperimentProtocol == null) {
+            status("当前没有正在进行的实验", false); return;
+        }
+        if (!experimentRunning && pendingBleExperimentProtocol != null) {
+            experimentAbortRequested = true;
+            appendConversation("assistant", "START 正在等待 BLE 确认；确认回调到达后会立即发送 ABORT，"
+                    + "不会把任务标记为正常实验。" );
+            status("正在取消待确认的 BLE 实验…", true);
+            return;
+        }
+        if (aiExperimentPlanning && !experimentRunning) {
+            aiExperimentPlanning = false;
+            aiExperimentActive = false;
+            mainHandler.removeCallbacks(experimentClockRunnable);
+            appendConversation("assistant", "已取消尚未下发到设备的实验规划。" );
+            updateExperimentProgressUi();
+            status("AI 实验规划已取消", true);
+            return;
+        }
+        experimentAbortRequested = true;
+        if (selectedTransport() == 1) writeBleCommand("ABORT");
+        else {
+            sendAction("abort");
+            mainHandler.postDelayed(this::syncOfflineData, 1_500L);
+        }
+        appendConversation("assistant", "已向 LabCapsule 发送 ABORT；正在收尾并保留已采集的数据。" );
+        status("正在终止实验…", true);
+        startExperimentClock();
+        mainHandler.postDelayed(() -> {
+            if (experimentAbortRequested && liveCaptureOutput == null) {
+                aiExperimentActive = false;
+                finishExperimentClock(true);
+            }
+        }, selectedTransport() == 1 ? 2_500L : 12_000L);
     }
 
     private String buildConversationText() {
@@ -1179,15 +1303,14 @@ public class MainActivity extends Activity {
             return true;
         }
         boolean measurement = lower.contains("测量") || lower.contains("测试") ||
-                lower.contains("采集") || lower.contains("记录");
+                lower.contains("采集") || lower.contains("记录") ||
+                lower.contains("实验");
         boolean motion = lower.contains("震动") || lower.contains("振动") ||
                 lower.contains("运动") || lower.contains("摇晃") || lower.contains("冲击") ||
-                lower.contains("加速度") || lower.contains("陀螺") || lower.contains("mpu6050");
-        if (measurement && motion) {
-            int duration = extractInteger(q, "([0-9]{1,4})\\s*(?:秒|s)", 10);
-            int rate = extractInteger(q, "([0-9]{2,3})\\s*(?:hz|Hz|赫兹)", 200);
-            startAiMeasurement(q, Math.max(1, Math.min(3600, duration)),
-                    Math.max(10, Math.min(500, rate)));
+                lower.contains("加速度") || lower.contains("陀螺") || lower.contains("mpu6050") ||
+                lower.contains("传感器");
+        if (measurement) {
+            planExperimentWithAi(q);
             return true;
         }
         return false;
@@ -1200,47 +1323,344 @@ public class MainActivity extends Activity {
         catch (Exception ignored) { return fallback; }
     }
 
-    private void startAiMeasurement(String question, int duration, int rate) {
-        if (aiExperimentActive) {
+    private void planExperimentWithAi(String question) {
+        if (experimentRunning || aiExperimentActive || aiExperimentPlanning) {
             appendConversation("assistant", "当前实验仍在采集中，请等待完成或先中止。" );
             status("已有实验正在运行", false); return;
         }
-        if (!isDeviceConnected()) {
-            appendConversation("assistant", "这项任务需要 MPU6050，但设备尚未连接。请使用页面顶部的 BLE 或局域网按钮连接后再次发送。" );
-            renderConnectionBanner(); status("请先连接 LabCapsule", false); return;
-        }
-        if (bleReady) preferences.edit().putInt("transport", 1).apply();
-        activeExperimentId = "android-" + System.currentTimeMillis();
-        activeExperimentStartedAt = System.currentTimeMillis();
-        activeExperimentDuration = duration;
-        aiExperimentQuestion = question;
-        aiExperimentActive = true;
-        synchronized (liveMotionPoints) { liveMotionPoints.clear(); }
-        appendConversation("assistant", "已识别为运动/振动测量，选择 MPU6050 六轴传感器。"
-                + "将以 " + rate + " Hz 采集 " + duration + " 秒；正在扫描传感器并启动。" );
-        syncAssistantReply("已选择 MPU6050，马上开始测量。", "EXPERIMENT", "SCAN");
+        aiExperimentPlanning = true;
+        final long generation = System.currentTimeMillis();
+        preferences.edit().putLong("experiment_plan_generation", generation).apply();
+        appendConversation("assistant", "正在由 AI 分析实验目标、传感器、采样率、时长、分析方法，"
+                + "以及是否需要电脑端 Claude 或联网参考；尚未向设备下发 START。" );
         navigateSection(1);
-        fetchSensors();
-        mainHandler.postDelayed(() -> {
+        startExperimentClock();
+        String endpoint = preferences.getString("ai_endpoint",
+                "https://api.deepseek.com/chat/completions").trim();
+        String key = secureStore.get("ai_key").trim();
+        String model = preferences.getString("ai_model", "deepseek-chat").trim();
+        if (endpoint.isEmpty() || key.isEmpty() || model.isEmpty() || !isInternetAvailable()) {
+            JSONObject fallback = safeFallbackExperimentPlan(question,
+                    endpoint.isEmpty() || key.isEmpty() || model.isEmpty()
+                            ? "AI 未配置" : "当前网络不可用");
+            appendConversation("assistant", "无法调用在线 AI；已明确切换到经过边界校验的本地运动实验模板。" );
+            acceptExperimentPlan(fallback, question, generation);
+            return;
+        }
+        worker.execute(() -> {
             try {
-                currentProtocol = new JSONObject().put("id", activeExperimentId)
-                        .put("name", inferExperimentName(question))
-                        .put("sensor", "mpu6050").put("sample_rate_hz", rate)
-                        .put("duration_seconds", duration)
-                        .put("groups", new JSONArray().put("当前实验组"))
-                        .put("analysis", new JSONArray().put("RMS").put("Peak").put("FFT"))
-                        .put("source", "ai_intent").toString(2);
-                executeProtocol(currentProtocol);
-                if (selectedTransport() == 0) {
-                    appendConversation("assistant", "局域网模式会先由设备本地缓存，采集结束后自动回传到 APK。" );
-                    mainHandler.postDelayed(this::syncOfflineData,
-                            duration * 1000L + 2_000L);
-                }
+                String inventory = preferences.getString("sensor_inventory_json", "[]");
+                if (inventory.length() > 4000) inventory = inventory.substring(0, 4000);
+                String system = "你是 LabCapsule 实验规划器。必须认真分析用户目标并只输出单个 JSON 对象，"
+                        + "不得输出 Markdown。设备当前真正可执行的采集驱动只有 mpu6050 六轴；"
+                        + "规划字段：intent=experiment|clarify，reply，name，sensor_ids 字符串数组，"
+                        + "sample_rate_hz 整数10到500，duration_seconds整数1到1800，"
+                        + "analysis 数组（只能 rms,peak,fft,dominant_frequency），"
+                        + "reference_mode=none|computer_claude|computer_web，reference_query，"
+                        + "parameter_rationale，safety_notes 字符串数组。"
+                        + "只有当问题依赖最新标准、材料参数、产品规格或外部事实时选 computer_web；"
+                        + "需要复杂推理但无需最新资料时选 computer_claude；普通振动测量选 none。"
+                        + "不要假装不存在的传感器可采集；信息不足且无法安全默认时 intent=clarify。"
+                        + "当前连接上下文：" + assistantDeviceContext() +
+                        "；最近扫描传感器：" + inventory;
+                JSONObject body = new JSONObject().put("model", model).put("temperature", .15)
+                        .put("messages", new JSONArray()
+                                .put(new JSONObject().put("role", "system").put("content", system))
+                                .put(new JSONObject().put("role", "user").put("content", question)));
+                JSONObject plan = callAssistantJson(endpoint, key, body);
+                plan.put("source", "ai_model").put("planner_model", model)
+                        .put("planned_at", isoNow());
+                runOnUiThread(() -> acceptExperimentPlan(plan, question, generation));
             } catch (Exception error) {
-                aiExperimentActive = false;
-                appendConversation("assistant", "实验启动失败：" + error.getMessage());
+                JSONObject fallback = safeFallbackExperimentPlan(question,
+                        "AI 调用失败：" + safeError(error));
+                runOnUiThread(() -> {
+                    appendConversation("assistant", "AI 规划失败（" + safeError(error) +
+                            "）；为避免异常，已切换到本地安全模板并继续做真实传感器预检。" );
+                    acceptExperimentPlan(fallback, question, generation);
+                });
             }
-        }, 450L);
+        });
+    }
+
+    private JSONObject callAssistantJson(String endpoint, String key, JSONObject body)
+            throws Exception {
+        HttpURLConnection connection = (HttpURLConnection) new URL(endpoint).openConnection();
+        try {
+            connection.setRequestMethod("POST"); connection.setConnectTimeout(10000);
+            connection.setReadTimeout(70000); connection.setDoOutput(true);
+            connection.setRequestProperty("Content-Type", "application/json");
+            connection.setRequestProperty("Authorization", "Bearer " + key);
+            byte[] encoded = body.toString().getBytes(StandardCharsets.UTF_8);
+            connection.setFixedLengthStreamingMode(encoded.length);
+            try (OutputStream output = connection.getOutputStream()) { output.write(encoded); }
+            int code = connection.getResponseCode();
+            InputStream stream = code >= 200 && code < 300 ? connection.getInputStream()
+                    : connection.getErrorStream();
+            String raw = new String(readAllLimited(stream, 1024 * 1024L),
+                    StandardCharsets.UTF_8);
+            if (code < 200 || code >= 300) throw new IOException("AI HTTP " + code);
+            String content = new JSONObject(raw).getJSONArray("choices").getJSONObject(0)
+                    .getJSONObject("message").getString("content").trim();
+            if (content.startsWith("```")) {
+                int first = content.indexOf('\n'), last = content.lastIndexOf("```");
+                if (first >= 0 && last > first) content = content.substring(first + 1, last).trim();
+            }
+            int start = content.indexOf('{'), end = content.lastIndexOf('}');
+            if (start < 0 || end <= start) throw new IOException("AI 未返回实验 JSON");
+            return new JSONObject(content.substring(start, end + 1));
+        } finally { connection.disconnect(); }
+    }
+
+    private JSONObject safeFallbackExperimentPlan(String question, String reason) {
+        try {
+            String lower = question == null ? "" : question.toLowerCase(Locale.ROOT);
+            boolean motion = lower.contains("震动") || lower.contains("振动") ||
+                    lower.contains("运动") || lower.contains("摇晃") || lower.contains("冲击") ||
+                    lower.contains("加速度") || lower.contains("陀螺") ||
+                    lower.contains("mpu6050") || lower.contains("桌面");
+            if (!motion) return new JSONObject().put("intent", "clarify")
+                    .put("reply", "在线 AI 当前不可用，且本地无法安全判断该实验是否属于 MPU6050 "
+                            + "运动/振动测量。请明确要测量震动、运动、冲击、姿态或六轴数据；"
+                            + "其他物理量需要先接入对应传感器驱动。")
+                    .put("source", "local_safe_fallback");
+            int duration = extractInteger(question, "([0-9]{1,4})\\s*(?:秒|s)", 10);
+            int rate = extractInteger(question, "([0-9]{2,3})\\s*(?:hz|Hz|赫兹)", 200);
+            return new JSONObject().put("intent", "experiment")
+                    .put("reply", "使用本地安全运动实验模板")
+                    .put("name", inferExperimentName(question))
+                    .put("sensor_ids", new JSONArray().put("mpu6050"))
+                    .put("sample_rate_hz", Math.max(10, Math.min(500, rate)))
+                    .put("duration_seconds", Math.max(1, Math.min(1800, duration)))
+                    .put("analysis", new JSONArray().put("rms").put("peak")
+                            .put("fft").put("dominant_frequency"))
+                    .put("reference_mode", "none").put("reference_query", "")
+                    .put("parameter_rationale", reason + "；采用 200 Hz/用户指定值和短时采集模板")
+                    .put("safety_notes", new JSONArray().put("启动前必须确认 MPU6050 实际在线"))
+                    .put("source", "local_safe_fallback").put("planned_at", isoNow());
+        } catch (Exception impossible) { return new JSONObject(); }
+    }
+
+    private void acceptExperimentPlan(JSONObject rawPlan, String question, long generation) {
+        if (!aiExperimentPlanning || preferences.getLong("experiment_plan_generation", -1)
+                != generation) return;
+        try {
+            JSONObject plan = validateExperimentPlan(rawPlan);
+            if ("clarify".equals(plan.optString("intent"))) {
+                aiExperimentPlanning = false;
+                mainHandler.removeCallbacks(experimentClockRunnable);
+                appendConversation("assistant", plan.optString("reply",
+                        "实验条件不足，请补充要测量的对象、现象和期望时长。"));
+                updateExperimentProgressUi();
+                return;
+            }
+            aiExperimentQuestion = question;
+            String summary = experimentPlanSummary(plan);
+            preferences.edit().putString("last_ai_experiment_plan", plan.toString())
+                    .putString("last_ai_experiment_plan_summary", summary).apply();
+            if (experimentPlanView != null) experimentPlanView.setText(summary);
+            appendConversation("assistant", summary + "\n正在执行参考资料步骤和传感器预检；预检通过后才会真正启动。" );
+            runExperimentReferenceStep(plan, question, generation);
+        } catch (Exception error) {
+            aiExperimentPlanning = false;
+            mainHandler.removeCallbacks(experimentClockRunnable);
+            appendConversation("assistant", "AI 实验规划未通过安全校验，因此没有启动：" +
+                    safeError(error));
+            updateExperimentProgressUi();
+            status("实验规划被安全校验拦截", false);
+        }
+    }
+
+    private JSONObject validateExperimentPlan(JSONObject plan) throws Exception {
+        String intent = plan.optString("intent", "experiment").toLowerCase(Locale.ROOT);
+        if (!"experiment".equals(intent) && !"clarify".equals(intent))
+            throw new IOException("intent 只能是 experiment 或 clarify");
+        if ("clarify".equals(intent)) return new JSONObject().put("intent", "clarify")
+                .put("reply", plan.optString("reply", "请补充实验条件。"));
+        JSONArray requested = plan.optJSONArray("sensor_ids");
+        if (requested == null || requested.length() != 1 ||
+                !"mpu6050".equalsIgnoreCase(requested.optString(0)))
+            throw new IOException("当前真实采集驱动只支持 MPU6050；AI 请求了不支持的传感器");
+        int rate = plan.optInt("sample_rate_hz", 0), duration = plan.optInt("duration_seconds", 0);
+        if (rate < 10 || rate > 500) throw new IOException("AI 采样率超出 10–500 Hz");
+        if (duration < 1 || duration > 1800) throw new IOException("AI 时长超出 1–1800 秒安全范围");
+        long expected = (long)rate * duration;
+        if (expected > 500_000L) throw new IOException("预计样本超过 500000，请降低采样率或时长");
+        String reference = plan.optString("reference_mode", "none").toLowerCase(Locale.ROOT);
+        if (!("none".equals(reference) || "computer_claude".equals(reference) ||
+                "computer_web".equals(reference))) throw new IOException("reference_mode 无效");
+        JSONArray cleanAnalysis = new JSONArray(), source = plan.optJSONArray("analysis");
+        if (source != null) for (int i = 0; i < source.length(); ++i) {
+            String value = source.optString(i).toLowerCase(Locale.ROOT);
+            if (("rms".equals(value) || "peak".equals(value) || "fft".equals(value) ||
+                    "dominant_frequency".equals(value)) &&
+                    !cleanAnalysis.toString().contains("\"" + value + "\""))
+                cleanAnalysis.put(value);
+        }
+        if (cleanAnalysis.length() == 0) cleanAnalysis.put("rms").put("peak").put("fft");
+        JSONArray cleanSafetyNotes = new JSONArray();
+        JSONArray rawSafetyNotes = plan.optJSONArray("safety_notes");
+        if (rawSafetyNotes != null) for (int i = 0; i < rawSafetyNotes.length() && i < 8; ++i) {
+            String note = rawSafetyNotes.optString(i, "").trim();
+            if (!note.isEmpty()) cleanSafetyNotes.put(
+                    note.substring(0, Math.min(240, note.length())));
+        }
+        String name = plan.optString("name", inferExperimentName(aiExperimentQuestion)).trim();
+        if (name.isEmpty()) name = "AI 六轴运动测量";
+        JSONObject clean = new JSONObject().put("intent", "experiment")
+                .put("name", name.substring(0, Math.min(80, name.length())))
+                .put("sensor", "mpu6050").put("sensor_ids", new JSONArray().put("mpu6050"))
+                .put("sample_rate_hz", rate).put("duration_seconds", duration)
+                .put("estimated_samples", expected).put("analysis", cleanAnalysis)
+                .put("groups", new JSONArray().put("当前实验组"))
+                .put("reference_mode", reference).put("reference_query",
+                        plan.optString("reference_query", "").substring(0,
+                                Math.min(1000, plan.optString("reference_query", "").length())))
+                .put("parameter_rationale", plan.optString("parameter_rationale", "")
+                        .substring(0, Math.min(1200,
+                                plan.optString("parameter_rationale", "").length())))
+                .put("safety_notes", cleanSafetyNotes)
+                .put("source", plan.optString("source", "ai_model"))
+                .put("planner_model", plan.optString("planner_model", ""))
+                .put("planned_at", plan.optString("planned_at", isoNow()));
+        return clean;
+    }
+
+    private String experimentPlanSummary(JSONObject plan) {
+        String reference = plan.optString("reference_mode", "none");
+        String referenceText = "computer_web".equals(reference) ? "电脑联网检索" :
+                "computer_claude".equals(reference) ? "电脑 Claude 推理" : "不需要外部参考";
+        return "AI 实验规划：" + plan.optString("name") + "\n传感器：MPU6050 六轴" +
+                " · " + plan.optInt("sample_rate_hz") + " Hz · " +
+                plan.optInt("duration_seconds") + " 秒 · 预计 " +
+                plan.optLong("estimated_samples") + " 点\n分析：" +
+                plan.optJSONArray("analysis") + "\n参考：" + referenceText +
+                "\n参数理由：" + plan.optString("parameter_rationale", "未提供");
+    }
+
+    private void runExperimentReferenceStep(JSONObject plan, String question, long generation) {
+        String mode = plan.optString("reference_mode", "none");
+        if ("none".equals(mode)) { beginExperimentPreflight(plan, question, generation); return; }
+        if (secureStore.get("computer_bridge_token").trim().isEmpty()) {
+            aiExperimentPlanning = false;
+            appendConversation("assistant", "AI 判断本实验需要" +
+                    ("computer_web".equals(mode) ? "电脑联网参考" : "电脑 Claude 复杂推理") +
+                    "，但尚未获得电脑权限，所以没有启动。请先在设置中完成 Studio 配对。" );
+            updateExperimentProgressUi(); return;
+        }
+        String query = plan.optString("reference_query", "").trim();
+        if (query.isEmpty()) query = question;
+        final String referenceQuery = query;
+        worker.execute(() -> {
+            try {
+                String path = "computer_web".equals(mode) ? "/v1/research" : "/v1/ask";
+                JSONObject response = computerBridgeRequest("POST", path,
+                        new JSONObject().put("question", referenceQuery), true, 200000);
+                JSONObject result = response.optJSONObject("result");
+                String reply = result == null ? "" : result.optString("reply", "").trim();
+                if (reply.isEmpty()) throw new IOException("电脑端没有返回参考结果");
+                plan.put("reference_summary", reply.substring(0, Math.min(2400, reply.length())));
+                runOnUiThread(() -> {
+                    if (!aiExperimentPlanning) return;
+                    appendConversation("assistant", "实验参考步骤已完成：" + reply);
+                    beginExperimentPreflight(plan, question, generation);
+                });
+            } catch (Exception error) {
+                runOnUiThread(() -> {
+                    aiExperimentPlanning = false;
+                    appendConversation("assistant", "实验所需参考步骤失败，因此没有启动：" +
+                            safeError(error));
+                    updateExperimentProgressUi();
+                });
+            }
+        });
+    }
+
+    private void beginExperimentPreflight(JSONObject plan, String question, long generation) {
+        if (!aiExperimentPlanning) return;
+        if (!isDeviceConnected()) {
+            aiExperimentPlanning = false;
+            appendConversation("assistant", "实验规划已完成，但 LabCapsule 未连接，因此没有下发 START。" );
+            renderConnectionBanner(); updateExperimentProgressUi(); return;
+        }
+        long lastHttpSeen = preferences.getLong("last_http_seen_ms", 0);
+        boolean recentHttp = System.currentTimeMillis() - lastHttpSeen < 20_000L;
+        if (selectedTransport() == 0 && !recentHttp && bleReady) {
+            preferences.edit().putInt("transport", 1).apply();
+            if (transportSpinner != null) transportSpinner.setSelection(1);
+        } else if (selectedTransport() == 1 && !bleReady && recentHttp) {
+            preferences.edit().putInt("transport", 0).apply();
+            if (transportSpinner != null) transportSpinner.setSelection(0);
+        }
+        if ((selectedTransport() == 1 && !bleReady) ||
+                (selectedTransport() == 0 && !recentHttp)) {
+            aiExperimentPlanning = false;
+            appendConversation("assistant", "设备看似曾经在线，但当前所选传输通道已经失效，"
+                    + "所以没有启动实验。请重新连接 BLE 或检测局域网设备。" );
+            updateExperimentProgressUi(); status("实验通道预检失败", false); return;
+        }
+        status("正在真实扫描 I²C 并确认 MPU6050…", true);
+        long preflightStartedAt = System.currentTimeMillis();
+        fetchSensors();
+        mainHandler.postDelayed(() -> completeExperimentPreflight(plan, question,
+                generation, preflightStartedAt, 0), 700L);
+    }
+
+    private void completeExperimentPreflight(JSONObject plan, String question,
+                                             long generation, long preflightStartedAt,
+                                             int attempt) {
+        if (!aiExperimentPlanning || preferences.getLong("experiment_plan_generation", -1)
+                != generation) return;
+        long scannedAt = preferences.getLong("sensor_inventory_ms", 0);
+        boolean fresh = scannedAt >= preflightStartedAt &&
+                System.currentTimeMillis() - scannedAt < 15_000L;
+        if ((!fresh || !isDetectedSensor("mpu6050")) && attempt < 5) {
+            mainHandler.postDelayed(() -> completeExperimentPreflight(plan, question,
+                    generation, preflightStartedAt, attempt + 1), 650L);
+            return;
+        }
+        if (!fresh || !isDetectedSensor("mpu6050")) {
+            aiExperimentPlanning = false;
+            appendConversation("assistant", "真实 I²C 预检未发现 MPU6050，因此没有启动实验。"
+                    + "请检查 SDA=GPIO8、SCL=GPIO9、3V3 和 GND 后重试。" );
+            updateExperimentProgressUi(); status("MPU6050 预检失败", false); return;
+        }
+        startExperimentFromPlan(plan, question);
+    }
+
+    private boolean isDetectedSensor(String sensorId) {
+        try {
+            JSONArray values = new JSONArray(preferences.getString("detected_sensor_ids", "[]"));
+            for (int i = 0; i < values.length(); ++i)
+                if (sensorId.equalsIgnoreCase(values.optString(i))) return true;
+        } catch (Exception ignored) { }
+        return false;
+    }
+
+    private void startExperimentFromPlan(JSONObject plan, String question) {
+        try {
+            aiExperimentPlanning = false;
+            aiExperimentActive = true;
+            aiExperimentQuestion = question;
+            currentProtocol = plan.put("id", "android-" + System.currentTimeMillis())
+                    .toString(2);
+            activeExperimentId = plan.getString("id");
+            appendConversation("assistant", "I²C 预检通过，正在向真实设备下发 START。" );
+            syncAssistantReply("实验参数已验证，开始真实采集。", "EXPERIMENT", "SCAN");
+            executeProtocol(currentProtocol);
+        } catch (Exception error) {
+            failExperimentStart("实验启动失败：" + safeError(error));
+        }
+    }
+
+    private void startAiMeasurement(String question, int duration, int rate) {
+        JSONObject fallback = safeFallbackExperimentPlan(question, "显式本地回退调用");
+        try { fallback.put("duration_seconds", duration).put("sample_rate_hz", rate); }
+        catch (Exception ignored) { }
+        aiExperimentPlanning = true;
+        long generation = System.currentTimeMillis();
+        preferences.edit().putLong("experiment_plan_generation", generation).apply();
+        acceptExperimentPlan(fallback, question, generation);
     }
 
     private static String inferExperimentName(String question) {
@@ -1481,22 +1901,117 @@ public class MainActivity extends Activity {
             int rate = protocol.getInt("sample_rate_hz");
             int duration = protocol.getInt("duration_seconds");
             String name = protocol.optString("name", "未命名实验");
+            String sensor = protocol.optString("sensor", "mpu6050").toLowerCase(Locale.ROOT);
+            if (experimentRunning) throw new Exception("已有实验正在运行，请先终止或等待完成");
+            if (!"mpu6050".equals(sensor))
+                throw new Exception("当前固件只允许启动 MPU6050 真实采集");
             if (rate < 10 || rate > 500 || duration < 1 || duration > 3600)
                 throw new Exception("协议采样率或时长超出安全范围");
-            recordExperiment(protocol);
-            preferences.edit().putString("last_protocol_name", name)
-                    .putString("last_protocol_json", protocol.toString(2))
-                    .putString("operation_mode", "experiment").apply();
-            if (activeProtocolView != null) activeProtocolView.setText(protocol.toString(2));
+            if ((long)rate * duration > 500_000L)
+                throw new Exception("预计样本超过 500000，请降低采样率或时长");
             status("正在下发实验协议：" + name, true);
             if (selectedTransport() == 1) {
-                writeBleCommand("START:" + rate + ":" + duration);
+                if (!bleReady) throw new Exception("所选 BLE 通道尚未连接");
+                pendingBleExperimentProtocol = new JSONObject(protocol.toString());
+                if (!writeBleCommand("START:" + rate + ":" + duration))
+                    throw new Exception("BLE START 未进入发送队列");
+                status("BLE START 已发送，等待设备确认…", true);
             } else {
-                http("POST", "/api/experiment?rate=" + rate + "&duration=" + duration,
-                        new byte[0], "application/octet-stream",
-                        result -> status("实验已启动：" + name, true));
+                final JSONObject acceptedProtocol = new JSONObject(protocol.toString());
+                final String endpoint = baseUrl() + "/api/experiment?rate=" + rate +
+                        "&duration=" + duration;
+                worker.execute(() -> {
+                    try {
+                        String result = httpBlocking("POST", endpoint, new byte[0],
+                                "application/octet-stream", 15000);
+                        JSONObject response = new JSONObject(result);
+                        if (!response.optBoolean("ok", false))
+                            throw new IOException(response.optString("error", "设备拒绝实验"));
+                        runOnUiThread(() -> markExperimentStarted(acceptedProtocol));
+                    } catch (Exception error) {
+                        runOnUiThread(() -> failExperimentStart(
+                                "设备未接受实验 START：" + safeError(error)));
+                    }
+                });
             }
-        } catch (Exception error) { status("协议无法执行：" + error.getMessage(), false); }
+        } catch (Exception error) { failExperimentStart("协议无法执行：" + safeError(error)); }
+    }
+
+    private void markExperimentStarted(JSONObject protocol) {
+        pendingBleExperimentProtocol = null;
+        if (experimentAbortRequested) {
+            if (selectedTransport() == 1) writeBleCommand("ABORT", true);
+            else sendAction("abort");
+            aiExperimentActive = false;
+            activeExperimentId = "";
+            finishExperimentClock(true);
+            return;
+        }
+        try {
+            String name = protocol.optString("name", "未命名实验");
+            if (activeExperimentId.isEmpty())
+                activeExperimentId = protocol.optString("id",
+                        "android-" + System.currentTimeMillis());
+            activeExperimentStartedAt = System.currentTimeMillis();
+            activeExperimentDuration = protocol.getInt("duration_seconds");
+            synchronized (this) { liveCaptureSamples = 0; }
+            synchronized (liveMotionPoints) { liveMotionPoints.clear(); }
+            currentProtocol = protocol.toString(2);
+            recordExperiment(protocol);
+            preferences.edit().putString("last_protocol_name", name)
+                    .putString("last_protocol_json", currentProtocol)
+                    .putString("operation_mode", "experiment").apply();
+            if (activeProtocolView != null) activeProtocolView.setText(currentProtocol);
+            experimentRunning = true;
+            experimentAbortRequested = false;
+            startExperimentClock();
+            navigateSection(1);
+            status("实验已真实启动：" + name, true);
+            appendConversation("assistant", "设备已接受 START，正在真实采集；数据页会实时显示用时、进度和样本数。" );
+            if (selectedTransport() == 0) {
+                appendConversation("assistant", "局域网模式由设备本地缓存，完成后自动回传到 APK。" );
+                mainHandler.postDelayed(() -> {
+                    if (experimentRunning || aiExperimentActive) syncOfflineData();
+                }, activeExperimentDuration * 1000L + 2_500L);
+            }
+        } catch (Exception error) {
+            failExperimentStart("已收到设备确认，但本地状态初始化失败：" + safeError(error));
+        }
+    }
+
+    private void failExperimentStart(String message) {
+        pendingBleExperimentProtocol = null;
+        experimentRunning = false;
+        experimentAbortRequested = false;
+        aiExperimentPlanning = false;
+        aiExperimentActive = false;
+        mainHandler.removeCallbacks(experimentClockRunnable);
+        if (experimentProgressBar != null) {
+            experimentProgressBar.setIndeterminate(false);
+            experimentProgressBar.setProgress(0);
+        }
+        if (experimentElapsedView != null) {
+            experimentElapsedView.setText("实验未启动 · " + message);
+            experimentElapsedView.setTextColor(RED);
+        }
+        appendConversation("assistant", message + "；未把本次任务标记为成功。" );
+        status(message, false);
+    }
+
+    private void failExperimentRun(String message) {
+        experimentRunning = false;
+        experimentAbortRequested = false;
+        aiExperimentPlanning = false;
+        aiExperimentActive = false;
+        mainHandler.removeCallbacks(experimentClockRunnable);
+        if (experimentProgressBar != null) experimentProgressBar.setIndeterminate(false);
+        if (experimentElapsedView != null) {
+            long elapsed = Math.max(0, System.currentTimeMillis() - activeExperimentStartedAt);
+            experimentElapsedView.setText("实验异常 · " + clockText(elapsed) + " · " + message);
+            experimentElapsedView.setTextColor(RED);
+        }
+        appendConversation("assistant", "实验异常结束：" + message + "。未将本次任务标记为成功。" );
+        status(message, false);
     }
 
     private void recordExperiment(JSONObject protocol) {
@@ -1518,7 +2033,8 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) { }
     }
 
-    private void updateActiveExperimentRecord(String file, int samples, String analysis) {
+    private void updateActiveExperimentRecord(String file, int samples, String analysis,
+                                              String outcome) {
         try {
             JSONArray history = new JSONArray(preferences.getString("experiment_history", "[]"));
             for (int i = 0; i < history.length(); ++i) {
@@ -1527,7 +2043,8 @@ public class MainActivity extends Activity {
                     item.put("file", file == null ? "" : file).put("samples", samples)
                             .put("finishedAt", System.currentTimeMillis())
                             .put("analysis", analysis == null ? "" : analysis)
-                            .put("summary", summarizeAnalysis(analysis));
+                            .put("summary", summarizeAnalysis(analysis))
+                            .put("outcome", outcome == null ? "complete" : outcome);
                     break;
                 }
             }
@@ -1694,7 +2211,7 @@ public class MainActivity extends Activity {
 
     private void addComputerBridgeSettingsGroup(LinearLayout root) {
         LinearLayout body = collapsedGroup(root, "电脑与 Claude 权限",
-                "一次性配对授权；读取电脑/实验状态，复杂问题转给电脑端 Claude");
+                "一次性配对授权；读取电脑/实验状态，复杂问题或实验参考交给电脑端 Claude");
         computerBridgeUrlInput = input(preferences.getString("computer_bridge_url", ""),
                 "Studio 地址，例如 http://192.168.1.20:8765", false);
         computerBridgeCodeInput = input("", "电脑端显示的 6 位一次性配对码", false);
@@ -1706,15 +2223,17 @@ public class MainActivity extends Activity {
         body.addView(row(button("申请电脑权限", true, v -> confirmComputerPairing()),
                 button("读取电脑状态", false, v -> fetchComputerStatus(false)),
                 button("撤销本机授权", false, v -> revokeComputerBridge())), matchWrap(dp(5)));
-        body.addView(label("授权范围：computer.status、labcapsule.context、claude.delegate。"
-                + "不开放 Shell、任意文件或未经确认的设备写操作；Token 由 Android Keystore 加密。",
+        body.addView(label("授权范围：computer.status、labcapsule.context、claude.delegate、"
+                + "reference.web。联网参考只允许 WebSearch/WebFetch；不开放 Shell、任意文件或"
+                + "未经确认的设备写操作；Token 由 Android Keystore 加密。",
                 12, MUTED, false), matchWrap(dp(5)));
     }
 
     private void confirmComputerPairing() {
         new AlertDialog.Builder(this).setTitle("允许手机访问这台电脑？")
                 .setMessage("配对后，本 APK 可以读取 Studio 提供的电脑硬件状态、LabCapsule 实验上下文，"
-                        + "并把复杂问题交给电脑端 Claude。电脑必须显示相同的一次性配对码。"
+                        + "把复杂问题交给电脑端 Claude，并为确有需要的实验检索联网参考。"
+                        + "电脑必须显示相同的一次性配对码。"
                         + "不会获得 Shell、任意文件或自动修改设备的权限。")
                 .setNegativeButton("取消", null)
                 .setPositiveButton("确认并申请", (dialog, which) -> pairComputerBridge()).show();
@@ -1785,7 +2304,7 @@ public class MainActivity extends Activity {
                 String token = result.optString("token", "");
                 if (token.length() < 32) throw new IOException("Studio 未返回有效授权 Token");
                 secureStore.put("computer_bridge_token", token);
-                String message = "电脑权限：已授权 · 状态/实验上下文/Claude 委托";
+                String message = "电脑权限：已授权 · 状态/实验上下文/Claude 委托/联网参考";
                 preferences.edit().putString("computer_bridge_status", message).apply();
                 runOnUiThread(() -> {
                     if (computerBridgeCodeInput != null) computerBridgeCodeInput.setText("");
@@ -2008,11 +2527,12 @@ public class MainActivity extends Activity {
     private void addAboutSettingsGroup(LinearLayout root) {
         LinearLayout about = collapsedGroup(root, "关于与使用说明",
                 "版本、协议、屏幕规格、仓库与完整指南");
-        about.addView(label("LabCapsule V1.2 · Role Card Collaboration\n默认语言：简体中文\n"
+        about.addView(label("LabCapsule V1.3 · AI Experiment Orchestrator\n默认语言：简体中文\n"
+                + "真实 AI 规划 + I²C 预检 + 终止/实时进度\n"
                 + "协议：USB + HTTP + MQTT + BLE GATT\n屏幕：240×320 RGB565 双缓冲\n仓库：github.com/"
                 + REPOSITORY, 13, MUTED, false));
-        about.addView(button("查看完整使用指南", false,
-                v -> openUrl(V12_GUIDE_URL)), matchWrap(dp(7)));
+        about.addView(button("查看 V1.3 完整使用指南", false,
+                v -> openUrl(V13_GUIDE_URL)), matchWrap(dp(7)));
     }
 
     private void addMemorySettingsGroup(LinearLayout root) {
@@ -2724,6 +3244,7 @@ public class MainActivity extends Activity {
         worker.execute(() -> {
             try {
                 String result = httpBlocking("GET", endpoint, null, null, 8000);
+                preferences.edit().putLong("last_http_seen_ms", System.currentTimeMillis()).apply();
                 runOnUiThread(() -> handleStatusPayload(result, quiet));
             } catch (Exception error) {
                 runOnUiThread(() -> {
@@ -2800,6 +3321,7 @@ public class MainActivity extends Activity {
                         operationModeState.setTextColor(idle ? BLUE : GREEN);
                     }
                 }
+                handleDeviceExperimentState(device.optString("state", ""));
             }
             if (device != null && device.has("offlineSessions")) {
                 JSONObject offline = new JSONObject()
@@ -2846,6 +3368,27 @@ public class MainActivity extends Activity {
             }
         } catch (Exception error) {
             if (!quiet) status("设备在线，但状态格式无法解析：" + error.getMessage(), false);
+        }
+    }
+
+    private void handleDeviceExperimentState(String rawState) {
+        if (!experimentRunning || rawState == null) return;
+        String state = rawState.toUpperCase(Locale.ROOT);
+        if ("ABORTED".equals(state)) {
+            experimentAbortRequested = true;
+            boolean hasCapture;
+            synchronized (this) { hasCapture = liveCaptureOutput != null; }
+            if (!hasCapture) {
+                aiExperimentActive = false;
+                finishExperimentClock(true);
+            } else status("设备已确认终止，正在保存已接收数据…", true);
+        } else if ("ERROR".equals(state)) {
+            boolean hasCapture;
+            synchronized (this) { hasCapture = liveCaptureOutput != null; }
+            if (hasCapture) {
+                experimentAbortRequested = true;
+                status("设备报告传感器采集错误，正在保留已收到的数据", false);
+            } else failExperimentRun("设备报告传感器采集错误；请检查 MPU6050 线路");
         }
     }
     private void renderExternalWifi(boolean configured, boolean connected, String ip,
@@ -2921,16 +3464,24 @@ public class MainActivity extends Activity {
             JSONArray sensors = source.optJSONArray("sensors");
             StringBuilder result = new StringBuilder("I²C 扫描完成");
             int found = root.optInt("count", -1);
+            JSONArray detectedIds = new JSONArray();
             if (sensors != null) {
                 if (found < 0) {
                     found = 0;
-                    for (int i = 0; i < sensors.length(); ++i)
-                        if (sensors.getJSONObject(i).optBoolean("detected")) ++found;
+                    for (int i = 0; i < sensors.length(); ++i) {
+                        JSONObject sensor = sensors.getJSONObject(i);
+                        // The compact BLE payload contains detected devices only and omits
+                        // the `detected` flag; the HTTP registry includes both true and false.
+                        if (hub == null || sensor.optBoolean("detected", true)) ++found;
+                    }
                 }
                 result.append(" · 发现 ").append(found).append(" 个响应设备");
                 for (int i = 0; i < sensors.length(); ++i) {
                     JSONObject sensor = sensors.getJSONObject(i);
-                    if (hub != null && !sensor.optBoolean("detected")) continue;
+                    boolean detected = hub == null || sensor.optBoolean("detected", true);
+                    if (!detected) continue;
+                    String id = sensor.optString("id", "").trim().toLowerCase(Locale.ROOT);
+                    if (!id.isEmpty()) detectedIds.put(id);
                     String address = sensor.optString("address", "?");
                     if (hub != null && sensor.has("address"))
                         address = String.format(Locale.US, "0x%02X",
@@ -2940,6 +3491,10 @@ public class MainActivity extends Activity {
                 }
             }
             if (found == 0) result.append("\n请检查 SDA=GPIO8、SCL=GPIO9、3V3 与共地。");
+            preferences.edit().putString("sensor_inventory_json",
+                            sensors == null ? "[]" : sensors.toString())
+                    .putString("detected_sensor_ids", detectedIds.toString())
+                    .putLong("sensor_inventory_ms", System.currentTimeMillis()).apply();
             if (sensorResult != null) {
                 sensorResult.setText(result.toString());
                 sensorResult.setTextColor(found > 0 ? GREEN : RED);
@@ -3873,12 +4428,18 @@ public class MainActivity extends Activity {
         final File file = offlineSyncFile;
         final long bytes = offlineSyncBytes;
         final boolean wasAiExperiment = aiExperimentActive;
+        final boolean wasAborted = experimentAbortRequested;
         final String originalQuestion = aiExperimentQuestion;
         if (file == null || bytes == 0) {
             closeOfflineSync(true);
             aiExperimentActive = false;
             runOnUiThread(() -> {
-                status("设备中没有可同步的离线实验", false);
+                if (wasAborted) {
+                    finishExperimentClock(true);
+                    status("实验已终止，设备没有可回传的部分数据", false);
+                } else {
+                    failExperimentRun("设备没有返回本次局域网实验数据");
+                }
                 appendConversation("assistant", "设备没有返回本次局域网实验数据，请检查设备是否仍在记录或改用 BLE 实时采集。" );
             });
             return;
@@ -3890,26 +4451,32 @@ public class MainActivity extends Activity {
                 int samples = preferences.getInt("last_live_samples", 0);
                 preferences.edit().putString("last_analysis", result)
                         .putString("last_offline_file", file.getAbsolutePath()).apply();
-                updateActiveExperimentRecord(csvPath, samples, result);
+                updateActiveExperimentRecord(csvPath, samples, result,
+                        wasAborted ? "aborted" : "complete");
                 aiExperimentActive = false;
-                activeExperimentId = "";
                 runOnUiThread(() -> {
                     if (analysisResultView != null) {
                         analysisResultView.setText(result);
                         analysisResultView.setTextColor(INK);
                     }
                     showProgress(100);
-                    status("离线数据已同步并分析 · " + formatBytes(bytes), true);
+                    finishExperimentClock(wasAborted);
+                    status((wasAborted ? "已终止实验的部分数据已保存并分析 · " :
+                            "离线数据已同步并分析 · ") + formatBytes(bytes), true);
                     loadChartFile(csvPath);
-                    if (wasAiExperiment) queryAssistantApi(originalQuestion,
+                    if (wasAiExperiment && !wasAborted) queryAssistantApi(originalQuestion,
                             "以下是设备回传 CSV 的真实计算结果，不得编造：\n" + result, false);
+                    else if (wasAborted) appendConversation("assistant",
+                            "实验已按要求终止；已保留并分析终止前收到的 " + samples + " 个测量点。" );
+                    activeExperimentId = "";
                     if (isInternetAvailable() && preferences.getBoolean(
                             "memory_sync_enabled", false))
                         mainHandler.postDelayed(() -> syncMemoryNow(true), 2_000L);
                 });
             } catch (Exception error) {
                 aiExperimentActive = false;
-                runOnUiThread(() -> status("离线数据格式错误：" + error.getMessage(), false));
+                runOnUiThread(() -> failExperimentRun(
+                        "离线数据格式错误：" + safeError(error)));
             }
         });
     }
@@ -5703,11 +6270,12 @@ public class MainActivity extends Activity {
                 bleReady = false;
                 boolean hadCapture;
                 synchronized (MainActivity.this) { hadCapture = liveCaptureOutput != null; }
-                if (hadCapture) mainHandler.post(MainActivity.this::finishLiveCaptureAfterIdle);
-                else if (aiExperimentActive) {
-                    aiExperimentActive = false;
-                    runOnUiThread(() -> appendConversation("assistant",
-                            "BLE 在收到实验数据前断开，本次任务未生成有效结果。请重新连接后再试。" ));
+                if (hadCapture) {
+                    experimentAbortRequested = true;
+                    mainHandler.post(MainActivity.this::finishLiveCaptureAfterIdle);
+                } else if (aiExperimentActive || experimentRunning) {
+                    runOnUiThread(() -> failExperimentRun(
+                            "BLE 在收到实验数据前断开；请重新连接后再试"));
                 }
                 if ("offline_open".equals(bleTransferPhase) ||
                         "offline_read".equals(bleTransferPhase)) {
@@ -5898,6 +6466,7 @@ public class MainActivity extends Activity {
         final int completedSamples;
         final String completedFile = preferences.getString("last_live_file", "");
         final boolean wasAiExperiment = aiExperimentActive;
+        final boolean wasAborted = experimentAbortRequested;
         final String originalQuestion = aiExperimentQuestion;
         synchronized (this) {
             if (liveCaptureOutput == null) return;
@@ -5919,26 +6488,35 @@ public class MainActivity extends Activity {
                 String analysis = analyzeCsv(new String(readFile(file),
                         StandardCharsets.UTF_8), file.getName());
                 preferences.edit().putString("last_analysis", analysis).apply();
-                updateActiveExperimentRecord(completedFile, completedSamples, analysis);
+                updateActiveExperimentRecord(completedFile, completedSamples, analysis,
+                        wasAborted ? "aborted" : "complete");
                 aiExperimentActive = false;
-                activeExperimentId = "";
                 runOnUiThread(() -> {
-                    status("实验完成 · " + completedSamples + " 点已保存并分析", true);
+                    finishExperimentClock(wasAborted);
+                    status((wasAborted ? "实验已终止 · " : "实验完成 · ") +
+                            completedSamples + " 点已保存并分析", true);
                     if (analysisResultView != null) analysisResultView.setText(analysis);
-                    if (wasAiExperiment) analyzeFileWithAssistant(completedFile,
+                    if (wasAiExperiment && !wasAborted) analyzeFileWithAssistant(completedFile,
                             originalQuestion + "。现在请根据实际测量结果给出结论");
-                    else appendConversation("assistant", "实验已完成，保存 " +
-                            completedSamples + " 个测量点。可在数据页查看或导出。" );
+                    else appendConversation("assistant", wasAborted
+                            ? "实验已按要求终止，终止前的 " + completedSamples +
+                                    " 个测量点已保留，可在数据页查看或导出。"
+                            : "实验已完成，保存 " + completedSamples +
+                                    " 个测量点。可在数据页查看或导出。" );
+                    activeExperimentId = "";
                     if (isInternetAvailable() && preferences.getBoolean(
                             "memory_sync_enabled", false))
                         mainHandler.postDelayed(() -> syncMemoryNow(true), 2_000L);
                 });
             } catch (Exception error) {
                 aiExperimentActive = false;
-                activeExperimentId = "";
-                updateActiveExperimentRecord(completedFile, completedSamples, "");
-                runOnUiThread(() -> status("实验已保存，但自动分析失败：" +
-                        error.getMessage(), false));
+                updateActiveExperimentRecord(completedFile, completedSamples, "",
+                        wasAborted ? "aborted_analysis_failed" : "analysis_failed");
+                runOnUiThread(() -> {
+                    finishExperimentClock(wasAborted);
+                    activeExperimentId = "";
+                    status("实验已保存，但自动分析失败：" + safeError(error), false);
+                });
             }
         });
     }
@@ -5975,21 +6553,22 @@ public class MainActivity extends Activity {
             runOnUiThread(() -> status("BLE 离线同步中断：" + error.getMessage(), false));
         }
     }
-    private void writeBleCommand(String command) {
-        writeBleCommand(command, false);
+    private boolean writeBleCommand(String command) {
+        return writeBleCommand(command, false);
     }
-    private void writeBleCommand(String command, boolean quiet) {
+    private boolean writeBleCommand(String command, boolean quiet) {
         if (!bleReady || !"idle".equals(bleTransferPhase)) {
             if (!quiet) status("BLE 未连接或正在传输", false);
-            return;
+            return false;
         }
         blePendingQuiet = quiet;
         blePendingCommand = command;
         String wireCommand = command.startsWith("WIFI:")
                 ? command : command.toUpperCase(Locale.ROOT);
-        if (!writeCharacteristic(commandCharacteristic,
-                wireCommand.getBytes(StandardCharsets.UTF_8)) && !quiet)
-            status("BLE 指令发送失败", false);
+        boolean queued = writeCharacteristic(commandCharacteristic,
+                wireCommand.getBytes(StandardCharsets.UTF_8));
+        if (!queued && !quiet) status("BLE 指令发送失败", false);
+        return queued;
     }
     private boolean writeCharacteristic(BluetoothGattCharacteristic characteristic,
                                         byte[] value) {
@@ -6045,12 +6624,30 @@ public class MainActivity extends Activity {
     }
     private void handleBleWrite(BluetoothGattCharacteristic characteristic, int code) {
         if (code != BluetoothGatt.GATT_SUCCESS) {
+            final String failedCommand = blePendingCommand;
+            pendingBleExperimentProtocol = null;
+            blePendingCommand = "";
+            blePendingQuiet = false;
             bleTransferPhase = "idle";
             gifStreaming = false;
-            runOnUiThread(() -> status("BLE 写入失败：" + code, false));
+            runOnUiThread(() -> {
+                if (failedCommand.startsWith("START:"))
+                    failExperimentStart("设备拒绝 BLE START（GATT " + code + "）");
+                else if ("ABORT".equalsIgnoreCase(failedCommand)) {
+                    experimentAbortRequested = false;
+                    status("BLE 终止指令失败（GATT " + code + "），实验可能仍在运行", false);
+                } else status("BLE 写入失败：" + code, false);
+            });
             return;
         }
         UUID uuid = characteristic.getUuid();
+        if ("idle".equals(bleTransferPhase) && uuid.equals(COMMAND_UUID) &&
+                blePendingCommand.startsWith("START:") &&
+                pendingBleExperimentProtocol != null) {
+            final JSONObject acceptedProtocol = pendingBleExperimentProtocol;
+            pendingBleExperimentProtocol = null;
+            runOnUiThread(() -> markExperimentStarted(acceptedProtocol));
+        }
         if ("ota_begin".equals(bleTransferPhase) && uuid.equals(OTA_CONTROL_UUID)) {
             bleTransferPhase = "ota_data"; writeNextBleChunk(otaDataCharacteristic);
         } else if ("ota_data".equals(bleTransferPhase) && uuid.equals(OTA_DATA_UUID)) {
@@ -6171,6 +6768,7 @@ public class MainActivity extends Activity {
         stopScreenMonitorSilently();
         mainHandler.removeCallbacks(periodicRepositorySyncRunnable);
         mainHandler.removeCallbacks(apkDownloadPollRunnable);
+        mainHandler.removeCallbacks(experimentClockRunnable);
         // Device-local media removes the need for a phone playback service. Cancel unfinished
         // preprocessing/upload work when the UI is destroyed; completed clips keep playing
         // autonomously on LabCapsule.

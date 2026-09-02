@@ -165,6 +165,7 @@ static volatile uint8_t s_pet_phase;
 
 static bool s_usb_serial_ready = false;
 static bool s_mpu_ready = false;
+static SemaphoreHandle_t s_mpu_mutex;
 static bool s_display_ready = false;
 static bool s_display_inverted = false;
 static bool s_backlight_commanded_on = false;
@@ -266,6 +267,7 @@ static void set_state(device_state_t state)
     portENTER_CRITICAL(&s_state_lock);
     s_state = state;
     portEXIT_CRITICAL(&s_state_lock);
+    sensor_hub_set_scan_enabled(state != STATE_RECORDING);
 }
 
 static void serial_emit(const char *format, ...)
@@ -336,7 +338,7 @@ static esp_err_t mpu_read_registers(uint8_t reg, uint8_t *data, size_t length)
     return i2c_master_transmit_receive(s_mpu, &reg, 1, data, length, 100);
 }
 
-static esp_err_t mpu_set_sample_rate(uint32_t rate_hz)
+static esp_err_t mpu_set_sample_rate_unlocked(uint32_t rate_hz)
 {
     if (!s_mpu_ready) {
         return ESP_ERR_INVALID_STATE;
@@ -349,7 +351,7 @@ static esp_err_t mpu_set_sample_rate(uint32_t rate_hz)
     return mpu_write_register(MPU6050_REG_SMPLRT_DIV, (uint8_t)divider);
 }
 
-static esp_err_t mpu_probe_and_configure(void)
+static esp_err_t mpu_probe_and_configure_unlocked(void)
 {
     if (!s_i2c_bus) return ESP_ERR_INVALID_STATE;
     s_mpu_ready = false;
@@ -392,7 +394,25 @@ static esp_err_t mpu_probe_and_configure(void)
         ESP_LOGW(TAG, "Unexpected MPU6050 WHO_AM_I: 0x%02X", who_am_i);
     }
     s_mpu_ready = true;
-    return mpu_set_sample_rate(DEFAULT_SAMPLE_RATE_HZ);
+    return mpu_set_sample_rate_unlocked(DEFAULT_SAMPLE_RATE_HZ);
+}
+
+static esp_err_t mpu_probe_and_configure(void)
+{
+    if (!s_mpu_mutex) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_mpu_mutex, portMAX_DELAY);
+    esp_err_t result = mpu_probe_and_configure_unlocked();
+    xSemaphoreGive(s_mpu_mutex);
+    return result;
+}
+
+static esp_err_t mpu_set_sample_rate(uint32_t rate_hz)
+{
+    if (!s_mpu_mutex) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_mpu_mutex, portMAX_DELAY);
+    esp_err_t result = mpu_set_sample_rate_unlocked(rate_hz);
+    xSemaphoreGive(s_mpu_mutex);
+    return result;
 }
 
 static esp_err_t mpu_init(void)
@@ -407,6 +427,8 @@ static esp_err_t mpu_init(void)
     };
     ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_config, &s_i2c_bus), TAG,
                         "I2C bus init failed");
+    if (!s_mpu_mutex) s_mpu_mutex = xSemaphoreCreateMutex();
+    if (!s_mpu_mutex) return ESP_ERR_NO_MEM;
     esp_err_t result = ESP_ERR_NOT_FOUND;
     for (unsigned attempt = 0; attempt < 5 && result != ESP_OK; ++attempt) {
         if (attempt > 0) vTaskDelay(pdMS_TO_TICKS(250));
@@ -418,8 +440,20 @@ static esp_err_t mpu_init(void)
 static esp_err_t mpu_read_sample(motion_sample_t *sample)
 {
     uint8_t raw[14];
-    ESP_RETURN_ON_ERROR(mpu_read_registers(MPU6050_REG_ACCEL_XOUT_H, raw, sizeof(raw)),
-                        TAG, "MPU6050 sample read failed");
+    if (!sample || !s_mpu_mutex) return ESP_ERR_INVALID_ARG;
+    esp_err_t result = ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_mpu_mutex, portMAX_DELAY);
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        result = s_mpu ? mpu_read_registers(MPU6050_REG_ACCEL_XOUT_H, raw, sizeof(raw))
+                       : ESP_ERR_INVALID_STATE;
+        if (result == ESP_OK) break;
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    xSemaphoreGive(s_mpu_mutex);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "MPU sample read retries failed: %s", esp_err_to_name(result));
+        return result;
+    }
 
     int16_t ax = (int16_t)((raw[0] << 8) | raw[1]);
     int16_t ay = (int16_t)((raw[2] << 8) | raw[3]);
@@ -1218,6 +1252,7 @@ static esp_err_t start_recording(uint32_t rate_hz, uint32_t duration_seconds)
     s_recording_started_us = esp_timer_get_time();
     s_state = STATE_RECORDING;
     portEXIT_CRITICAL(&s_state_lock);
+    sensor_hub_set_scan_enabled(false);
     s_display_view = DISPLAY_VIEW_STATUS;
     display_request_refresh();
     serial_emit("OK,START,RATE=%lu,DURATION=%lu,SOURCE=%s",
@@ -1781,11 +1816,13 @@ static void sampling_task(void *argument)
     (void)argument;
     TickType_t last_wake = xTaskGetTickCount();
     device_state_t prior_state = STATE_BOOT;
+    unsigned consecutive_read_failures = 0;
 
     while (true) {
         device_state_t state = get_state();
         if (state != STATE_RECORDING) {
             prior_state = state;
+            consecutive_read_failures = 0;
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
@@ -1814,6 +1851,7 @@ static void sampling_task(void *argument)
         }
 
         if (result == ESP_OK) {
+            consecutive_read_failures = 0;
             ++s_sample_count;
             serial_emit("DATA,%lld,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f",
                         (long long)elapsed_us, sample.ax, sample.ay, sample.az,
@@ -1823,7 +1861,25 @@ static void sampling_task(void *argument)
             if (!streamed) offline_store_enqueue((uint32_t)elapsed_us,
                     sample.ax, sample.ay, sample.az, sample.gx, sample.gy, sample.gz);
         } else {
+            ++consecutive_read_failures;
+            if (consecutive_read_failures <= 2) {
+                uint32_t requested_rate = s_sample_rate_hz;
+                esp_err_t recovery = mpu_probe_and_configure();
+                if (recovery == ESP_OK) recovery = mpu_set_sample_rate(requested_rate);
+                if (recovery == ESP_OK) {
+                    serial_emit("WARN,MPU_READ_RETRY,ATTEMPT=%u,CAUSE=%s",
+                                consecutive_read_failures, esp_err_to_name(result));
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                    continue;
+                }
+                serial_emit("WARN,MPU_RECOVERY_FAILED,ATTEMPT=%u,CAUSE=%s",
+                            consecutive_read_failures, esp_err_to_name(recovery));
+            }
             set_state(STATE_ERROR);
+            esp_err_t storage_result = offline_store_finish(true);
+            if (storage_result != ESP_OK && storage_result != ESP_ERR_INVALID_STATE)
+                serial_emit("WARN,OFFLINE_FINALIZE_FAILED,%s",
+                            esp_err_to_name(storage_result));
             serial_emit("ERR,MPU_READ_FAILED,%s", esp_err_to_name(result));
             continue;
         }
@@ -2740,7 +2796,7 @@ void app_main(void)
         ESP_LOGW(TAG, "MPU6050 not ready: %s", esp_err_to_name(mpu_result));
         serial_emit("WARN,MPU6050_NOT_FOUND,SDA=8,SCL=9");
     }
-    ESP_ERROR_CHECK(sensor_hub_init(s_i2c_bus));
+    ESP_ERROR_CHECK(sensor_hub_init(s_i2c_bus, s_mpu_mutex));
     sensor_hub_set_primary_ready("mpu6050", s_mpu_ready);
 
     ESP_ERROR_CHECK(input_hub_init(handle_input_action, NULL));

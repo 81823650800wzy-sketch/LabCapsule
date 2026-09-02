@@ -1,4 +1,4 @@
-# LabCapsule Studio 1.2.0
+# LabCapsule Studio 1.3.0
 
 Windows 可视化实验与 Hiyori 助手，支持 USB、局域网 HTTP 和 Bluetooth LE。应用不会切换电脑 Wi-Fi，也不会主动加入设备的无网络恢复热点。
 
@@ -8,6 +8,7 @@ Windows 可视化实验与 Hiyori 助手，支持 USB、局域网 HTTP 和 Bluet
 
 - 与 Android 共用私有角色卡协议：Live2D、人设、静态预览和语音包打成校验 ZIP；横向角色库可按形象/人设/语音包局部替换并离线缓存。
 - 可手动开启手机桥，显示 10 分钟有效的一次性配对码。已授权手机只能读取白名单电脑/设备上下文并调用受限 Claude；服务默认关闭。
+- AI 实验规划可请求电脑端复杂推理或当前资料检索；后者只给 Claude 开放 WebSearch/WebFetch，不开放本机文件、Shell、MCP 或任意设备写操作。
 
 - 顶部选择 USB / 局域网 WiFi / BLE；三条链路统一显示稳定 `deviceId`、角色、STA 和传感器状态。
 - 默认页面为“实验助手 / 实验数据 / 设置”；设备、屏幕工作室和诊断在设置中默认折叠。
@@ -30,10 +31,10 @@ python -m pip install -r requirements.txt
 
 ```powershell
 cd <仓库目录>
-pyinstaller --noconfirm --clean LabCapsule-Studio-1.2.0.spec
+pyinstaller --noconfirm --clean LabCapsule-Studio-1.3.0.spec
 ```
 
-输出为 `dist\LabCapsule-Studio-1.2.0.exe`。商业发行前应增加 Windows 代码签名。
+输出为 `dist\LabCapsule-Studio-1.3.0.exe`。商业发行前应增加 Windows 代码签名。
 
 ## 使用现有 Hiyori
 
@@ -51,6 +52,6 @@ pyinstaller --noconfirm --clean LabCapsule-Studio-1.2.0.spec
 
 ## AI 与记忆
 
-OpenAI 兼容 Endpoint、聊天模型、转写模型和 Key 均可配置。复杂任务自动转交 Claude 时，子进程固定为单轮只读、禁用工具/MCP/浏览器和会话持久化。
+OpenAI 兼容 Endpoint、聊天模型、转写模型和 Key 均可配置。普通复杂任务转交 Claude 时禁用全部工具；仅 `/v1/research` 实验参考路径允许 WebSearch/WebFetch，并继续禁用本机工具、MCP、Chrome 与会话持久化。
 
 记忆仓库必须是私有仓库，Token 应为只允许该仓库 Contents 读写的细粒度 Token。同步文件为 `memory/devices/<deviceId>/snapshot.json`；不要把 Token、API Key、密码或原始音频提交仓库。

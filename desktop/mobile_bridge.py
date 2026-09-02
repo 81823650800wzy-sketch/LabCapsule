@@ -23,7 +23,7 @@ from typing import Callable
 MAX_REQUEST_BYTES = 32 * 1024
 MAX_QUESTION_CHARS = 12_000
 PAIR_TTL_SECONDS = 10 * 60
-SCOPES = ("computer.status", "labcapsule.context", "claude.delegate")
+SCOPES = ("computer.status", "labcapsule.context", "claude.delegate", "reference.web")
 
 
 def _json_safe(value):
@@ -48,11 +48,14 @@ class BridgeInfo:
 
 class MobileBridgeServer:
     def __init__(self, storage_path: Path, status_provider: Callable[[], dict],
-                 ask_provider: Callable[[str], dict], host: str = "0.0.0.0",
+                 ask_provider: Callable[[str], dict],
+                 research_provider: Callable[[str], dict] | None = None,
+                 host: str = "0.0.0.0",
                  port: int = 8765):
         self.storage_path = Path(storage_path)
         self.status_provider = status_provider
         self.ask_provider = ask_provider
+        self.research_provider = research_provider
         self.host = host
         self.port = int(port)
         self.httpd: ThreadingHTTPServer | None = None
@@ -207,7 +210,7 @@ class MobileBridgeServer:
                     self._reply(200, {"ok": True, "token": token, "scopes": list(SCOPES),
                                       "warning": "只读状态与受限 Claude 分析权限"})
                     return
-                if self.path != "/v1/ask":
+                if self.path not in ("/v1/ask", "/v1/research"):
                     self._reply(404, {"error": "not_found"})
                     return
                 auth = self._authorized()
@@ -219,8 +222,15 @@ class MobileBridgeServer:
                     self._reply(400, {"error": "question_invalid"})
                     return
                 try:
-                    result = _json_safe(owner.ask_provider(question))
-                    self._reply(200, {"ok": True, "source": "computer-claude",
+                    provider = (owner.research_provider if self.path == "/v1/research"
+                                else owner.ask_provider)
+                    if provider is None:
+                        self._reply(503, {"error": "research_provider_unavailable"})
+                        return
+                    result = _json_safe(provider(question))
+                    source = ("computer-web" if self.path == "/v1/research"
+                              else "computer-claude")
+                    self._reply(200, {"ok": True, "source": source,
                                       "result": result})
                 except Exception as error:
                     self._reply(500, {"error": str(error)[:200]})

@@ -6,6 +6,8 @@
 
 #include "driver/i2c_master.h"
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 typedef enum {
     SENSOR_BUS_I2C,
@@ -26,9 +28,10 @@ typedef struct {
     esp_err_t (*sample_json)(char *buffer, size_t buffer_size);
 } sensor_driver_t;
 
-esp_err_t sensor_hub_init(i2c_master_bus_handle_t i2c_bus);
+esp_err_t sensor_hub_init(i2c_master_bus_handle_t i2c_bus, SemaphoreHandle_t bus_mutex);
 esp_err_t sensor_hub_register(const sensor_driver_t *driver);
 void sensor_hub_set_primary_ready(const char *id, bool ready);
+void sensor_hub_set_scan_enabled(bool enabled);
 size_t sensor_hub_discover(void);
 void sensor_hub_build_json(char *buffer, size_t buffer_size);
 void sensor_hub_build_ble_json(char *buffer, size_t buffer_size);

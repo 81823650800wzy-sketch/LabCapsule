@@ -1,8 +1,15 @@
-# LabCapsule Android Remote 1.2.0
+# LabCapsule Android Remote 1.3.0
 
 原生 Java Android 8.0+ 控制器，不依赖 Gradle 或第三方 Android 运行库。默认简体中文，采用“首页 / 数据 / 桌面 / 设置”四分区液态导航。首页只显示统一 Live2D 形象和 AI 对话；Live2D、AI、实验参数、连接、屏幕、网络、记忆和固件全部位于可模糊搜索且默认折叠的设置区。
 
-完整用户步骤见 [V1.2 角色卡与手机电脑协同指南](../docs/V1.2.0_ROLECARD_COLLAB_GUIDE_ZH.md)。
+完整用户步骤见 [V1.3 AI 真实实验使用指南](../docs/V1.3.0_AI_EXPERIMENT_GUIDE_ZH.md)。
+
+## V1.3 新增
+
+- 测量请求由真实在线 AI 规划传感器、采样率、时长、分析与参考资料需求，再通过本地白名单校验。
+- START 前必须得到新鲜 I²C 扫描中的 MPU6050；设备真正接受 START 后才显示采集中。
+- 数据页显示实时用时、进度、样本数与预计样本，并可随时终止；部分数据保留并标记为 aborted。
+- 配对 Studio 后可使用受限 Claude 推理，或仅通过 WebSearch/WebFetch 查找实验参考。
 
 ## V1.2 新增
 
@@ -40,7 +47,7 @@ cd <仓库目录>\android
 .\build-apk.ps1
 ```
 
-输出 `dist\LabCapsule-1.2.0.apk`。脚本执行 aapt2、javac、D8、zipalign 和 apksigner。仓库里的 keystore 仅用于开发测试；商业发布必须更换正式私钥。
+输出 `dist\LabCapsule-1.3.0.apk`。脚本执行 aapt2、javac、D8、zipalign 和 apksigner。仓库里的 keystore 仅用于开发测试；商业发布必须更换正式私钥。
 
 ## 推荐连接流程
 

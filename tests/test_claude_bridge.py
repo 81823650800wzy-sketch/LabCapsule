@@ -33,6 +33,15 @@ class ClaudeBridgeTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("Claude", result.error)
 
+    def test_research_command_allows_only_bounded_web_tools(self):
+        bridge = ClaudeBridge(executable=Path(__file__))
+        command = bridge._command("system", "query", tools="WebSearch,WebFetch",
+                                  max_turns=4, max_budget_usd="0.40")
+        self.assertEqual("WebSearch,WebFetch", command[command.index("--tools") + 1])
+        self.assertNotIn("Bash", command)
+        self.assertNotIn("Read", command)
+        self.assertEqual("4", command[command.index("--max-turns") + 1])
+
 
 if __name__ == "__main__":
     unittest.main()

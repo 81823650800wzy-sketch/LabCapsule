@@ -56,7 +56,7 @@ from speech_input import record_wav, transcribe_wav
 from experiment_store import ExperimentStore
 
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 BAUD_RATE = 460800
 ROOT = Path(__file__).resolve().parent
 
@@ -801,7 +801,7 @@ class Studio(tk.Tk):
                         variable=self.pet_sync_var).pack(anchor="w")
         ttk.Checkbutton(settings_card, text="自动响应连接/实验完成/错误事件",
                         variable=self.pet_auto_var).pack(anchor="w")
-        ttk.Checkbutton(settings_card, text="复杂任务自动转交本机 Claude（只读安全模式）",
+        ttk.Checkbutton(settings_card, text="复杂任务转交 Claude；实验参考仅开放 WebSearch/WebFetch",
                         variable=self.pet_delegate_var).pack(anchor="w")
         claude_row = tk.Frame(settings_card, bg=self.PANEL)
         claude_row.pack(fill="x", pady=(5, 0))
@@ -1946,7 +1946,8 @@ class Studio(tk.Tk):
                 "sampleCount": len(self.samples),
                 "latestSample": self.last_sample,
             },
-            "permissions": ["computer.status", "labcapsule.context", "claude.delegate"],
+            "permissions": ["computer.status", "labcapsule.context", "claude.delegate",
+                            "reference.web"],
         }
 
     def _mobile_bridge_ask(self, question: str) -> dict:
@@ -1955,6 +1956,13 @@ class Studio(tk.Tk):
             raise RuntimeError(result.error or "电脑端 Claude 没有返回回答")
         return {"reply": result.text, "elapsedSeconds": round(result.elapsed_s, 2),
                 "model": self.claude_bridge.model}
+
+    def _mobile_bridge_research(self, question: str) -> dict:
+        result = self.claude_bridge.research(question, self._mobile_bridge_context())
+        if not result.ok:
+            raise RuntimeError(result.error or "电脑端 Claude 联网检索没有返回结果")
+        return {"reply": result.text, "elapsedSeconds": round(result.elapsed_s, 2),
+                "model": self.claude_bridge.model, "tools": ["WebSearch", "WebFetch"]}
 
     def toggle_mobile_bridge(self):
         if self.mobile_bridge is not None:
@@ -1966,7 +1974,8 @@ class Studio(tk.Tk):
             return
         try:
             server = MobileBridgeServer(APP_DIR / "mobile_bridge_authorized.json",
-                                        self._mobile_bridge_context, self._mobile_bridge_ask)
+                                        self._mobile_bridge_context, self._mobile_bridge_ask,
+                                        self._mobile_bridge_research)
             info = server.start()
             self.mobile_bridge = server
             self.mobile_bridge_status.configure(

@@ -5,7 +5,7 @@ if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed with exit code 
 python -m pip install "pyinstaller>=6,<7"
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller installation failed with exit code $LASTEXITCODE" }
 python -m PyInstaller --noconfirm --clean --windowed --onefile `
-  --name "LabCapsule-Studio-1.2.0" `
+  --name "LabCapsule-Studio-1.3.0" `
   --collect-all imageio_ffmpeg `
   --add-data "$(Join-Path $DesktopRoot 'live2d_web\dist');live2d_web\dist" `
   --add-data "$(Join-Path $DesktopRoot 'live2d_web\THIRD_PARTY_NOTICES.md');live2d_web" `
@@ -20,4 +20,4 @@ python -m PyInstaller --noconfirm --clean --windowed --onefile `
   --exclude-module matplotlib `
   (Join-Path $DesktopRoot "labcapsule_desktop.py")
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed with exit code $LASTEXITCODE" }
-Write-Host "EXE: $(Join-Path (Get-Location) 'dist\LabCapsule-Studio-1.2.0.exe')"
+Write-Host "EXE: $(Join-Path (Get-Location) 'dist\LabCapsule-Studio-1.3.0.exe')"

@@ -72,9 +72,12 @@ class AndroidV11MeasurementTests(unittest.TestCase):
         self.assertIn("震动", intent)
         self.assertIn("振动", intent)
         runner = method_body("void startAiMeasurement", "String inferExperimentName")
-        self.assertIn('.put("sensor", "mpu6050")', runner)
-        self.assertIn("executeProtocol(currentProtocol)", runner)
-        self.assertIn("duration * 1000L", runner)
+        self.assertIn("safeFallbackExperimentPlan", runner)
+        self.assertIn('put("duration_seconds", duration)', runner)
+        self.assertIn("acceptExperimentPlan", runner)
+        planner = method_body("JSONObject validateExperimentPlan", "String experimentPlanSummary")
+        self.assertIn('put("sensor", "mpu6050")', planner)
+        self.assertIn("estimated_samples", planner)
 
     def test_calibration_is_applied_before_csv_storage(self):
         calibration = method_body("double[] applyCalibration", "String buildCalibrationSummary")
@@ -105,9 +108,9 @@ class AndroidV11MeasurementTests(unittest.TestCase):
         self.assertIn("15L * 60L * 1000L", SOURCE)
 
     def test_build_metadata_is_v11(self):
-        self.assertRegex(BUILD, r"--version-code\s+120")
-        self.assertIn("--version-name '1.2.0'", BUILD)
-        self.assertIn("LabCapsule-1.2.0.apk", BUILD)
+        self.assertRegex(BUILD, r"--version-code\s+130")
+        self.assertIn("--version-name '1.3.0'", BUILD)
+        self.assertIn("LabCapsule-1.3.0.apk", BUILD)
 
 
 if __name__ == "__main__":

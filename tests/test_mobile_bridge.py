@@ -28,6 +28,7 @@ class MobileBridgeTests(unittest.TestCase):
             server = MobileBridgeServer(Path(temporary) / "bridge.json",
                                         lambda: {"computer": {"cpu": 17}, "connected": True},
                                         lambda question: {"reply": "Claude:" + question},
+                                        lambda question: {"reply": "Web:" + question},
                                         host="127.0.0.1", port=0)
             info = server.start()
             base = f"http://127.0.0.1:{info.port}"
@@ -46,6 +47,12 @@ class MobileBridgeTests(unittest.TestCase):
                                        {"question": "分析当前实验"}, token)
                 self.assertEqual(200, code)
                 self.assertEqual("Claude:分析当前实验", result["result"]["reply"])
+                code, research = request(base + "/v1/research", "POST",
+                                         {"question": "查找振动标准"}, token)
+                self.assertEqual(200, code)
+                self.assertEqual("computer-web", research["source"])
+                self.assertEqual("Web:查找振动标准", research["result"]["reply"])
+                self.assertIn("reference.web", paired["scopes"])
             finally:
                 server.stop()
 

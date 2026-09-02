@@ -2,7 +2,17 @@
 
 > Ask a question. Run an experiment.
 
-LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前双端版本为 **V1.2.0 Alpha / Role Card Collaboration**：在 V1.1 自然语言测量闭环上，新增可搜索多会话、带进度更新、私有完整角色卡同步，以及经一次性配对授权的手机—电脑—Claude 协同。
+LabCapsule 是基于 ESP32-S3 的便携式 AI 辅助实验组件。当前双端版本为 **V1.3.0 Alpha / AI Experiment Orchestrator**：用户用自然语言提出实验后，在线 AI 会真实规划传感器、采样率、时长、分析方法和参考资料需求；APK 在 I²C 与传输预检通过、设备确认 START 后才进入采集，并实时显示用时、样本和终止状态。
+
+## V1.3.0 双端新增
+
+- 所有测量类输入先进入 OpenAI 兼容 AI 规划，输出经过严格 JSON 白名单校验；AI 未配置或离线时明确显示本地安全回退。
+- 当前只允许真实执行 MPU6050 六轴驱动，采样率 10–500 Hz、时长 1–1800 秒（手工协议最高 3600 秒）、单次最多 500000 点；不支持的物理量会要求澄清。
+- 启动前刷新 I²C 扫描并确认 MPU6050 在线；HTTP 必须收到 `ok=true`，BLE 必须成功写入 START，才开始计时和记录历史。
+- 数据页实时显示 `已用时间 / 计划时间 / 当前样本 / 预计样本`，提供“终止实验”；终止前的数据继续保存、分析并标为 `aborted`。
+- AI 可选择无需参考、电脑 Claude 推理或电脑联网检索；联网检索仅开放 `WebSearch/WebFetch`，不开放 Shell、文件读写或本机控制。
+
+完整操作见 [V1.3 AI 真实实验使用指南](docs/V1.3.0_AI_EXPERIMENT_GUIDE_ZH.md)。
 
 ## V1.2.0 双端新增
 
@@ -160,7 +170,7 @@ V0.4.0 的界面与媒体能力继续保留：
    idf.py -p COM8 flash monitor
    ```
 
-2. Windows 端运行 GitHub Release 中的 `LabCapsule-Studio-1.2.0.exe`；Android 端安装 `LabCapsule-1.2.0.apk`。手机首次进入“设置 → 设备与连接”时，推荐选择：
+2. Windows 端运行 GitHub Release 中的 `LabCapsule-Studio-1.3.0.exe`；Android 端安装 `LabCapsule-1.3.0.apk`。手机首次进入“设置 → 设备与连接”时，推荐选择：
 
    - BLE：点击扫描并允许“附近设备”权限；连接成功后直接点“蓝牙一键配网”；
    - 恢复热点：只在排障时连接 `LabCapsule-XXXX`，密码 `labcapsule`，地址 `http://192.168.4.1`。
